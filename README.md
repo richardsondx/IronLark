@@ -24,21 +24,7 @@ Use IronLark when you want AI that feels natural inside an SSH session:
 
 IronLark is intentionally opinionated toward terminal and server workflows, not IDE-first workflows.
 
-## Choosing A Setup
-
-| Option | Best for | Runs directly in SSH | Remote server diagnosis | Approval flow for shell and file actions | Easy Linux server install | Broad IDE / desktop / browser surface |
-| --- | --- | --- | --- | --- | --- | --- |
-| IronLark | AI inside a terminal on a server | Yes | Yes | Yes | Yes | No |
-| Claude Code | Broader coding workflows across terminal and other surfaces | Yes | Partly | Yes | Yes | Yes |
-| Web chat assistant | Asking questions and pasting output manually | No | No | No | Yes | No |
-| IDE coding assistant | Local editor-based development | Usually no | No | Varies | Usually no | Yes |
-
-Reference for Claude Code capabilities:
-
-- [Claude Code overview](https://code.claude.com/docs/en/overview)
-- [Claude Code setup](https://code.claude.com/docs/en/setup)
-- [Claude Code common workflows](https://code.claude.com/docs/en/common-workflows)
-
+IronLark is intentionally lightweight: a single Go binary that runs entirely inside the terminal, with no browser, IDE, or desktop dependencies. The policy system is focused on safe shell and file operations, and installing is just downloading the binary into `~/.local/bin` (no daemon or service required).
 ## Quick Start
 
 ### Local machine
@@ -46,7 +32,7 @@ Reference for Claude Code capabilities:
 Install IronLark:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/richardson/lark-term/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/richardsondx/IronLark/main/install.sh | sh
 ```
 
 Add your API key:
@@ -77,7 +63,7 @@ ssh root@your-server-ip
 Install IronLark on that server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/richardson/lark-term/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/richardsondx/IronLark/main/install.sh | sh
 ```
 
 If `~/.local/bin` is not on the remote `PATH`, add it:
@@ -118,7 +104,7 @@ On a fresh Ubuntu droplet, this is usually enough:
 
 ```bash
 ssh root@your-droplet-ip
-curl -fsSL https://raw.githubusercontent.com/richardson/lark-term/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/richardsondx/IronLark/main/install.sh | sh
 mkdir -p ~/.config/lark
 cat > ~/.config/lark/.env <<'EOF'
 OPENAI_API_KEY=your_key_here

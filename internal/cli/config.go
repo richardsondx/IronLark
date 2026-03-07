@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	cfgpkg "github.com/richardson/lark/internal/config"
+	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 )
 
 func newConfigCommand(flags *rootFlags) *cobra.Command {

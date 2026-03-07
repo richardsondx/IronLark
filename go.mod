@@ -1,4 +1,4 @@
-module github.com/richardson/lark
+module github.com/richardsondx/IronLark
 
 go 1.25
 

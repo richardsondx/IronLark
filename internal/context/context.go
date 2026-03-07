@@ -12,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	cfgpkg "github.com/richardson/lark/internal/config"
-	"github.com/richardson/lark/internal/redact"
-	"github.com/richardson/lark/internal/state"
+	cfgpkg "github.com/richardsondx/IronLark/internal/config"
+	"github.com/richardsondx/IronLark/internal/redact"
+	"github.com/richardsondx/IronLark/internal/state"
 )
 
 type Snapshot struct {

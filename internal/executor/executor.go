@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/richardson/lark/internal/checkpoints"
-	"github.com/richardson/lark/internal/core"
-	"github.com/richardson/lark/internal/patches"
-	"github.com/richardson/lark/internal/policy"
-	"github.com/richardson/lark/internal/redact"
-	"github.com/richardson/lark/internal/search"
+	"github.com/richardsondx/IronLark/internal/checkpoints"
+	"github.com/richardsondx/IronLark/internal/core"
+	"github.com/richardsondx/IronLark/internal/patches"
+	"github.com/richardsondx/IronLark/internal/policy"
+	"github.com/richardsondx/IronLark/internal/redact"
+	"github.com/richardsondx/IronLark/internal/search"
 )
 
 type Executor struct {

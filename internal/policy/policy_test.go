@@ -3,7 +3,7 @@ package policy
 import (
 	"testing"
 
-	"github.com/richardson/lark/internal/core"
+	"github.com/richardsondx/IronLark/internal/core"
 )
 
 func TestClassifySafeReadCommand(t *testing.T) {

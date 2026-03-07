@@ -12,12 +12,12 @@ import (
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
 
-	"github.com/richardson/lark/internal/app"
-	cfgpkg "github.com/richardson/lark/internal/config"
-	ctxpkg "github.com/richardson/lark/internal/context"
-	"github.com/richardson/lark/internal/core"
-	"github.com/richardson/lark/internal/provider"
-	"github.com/richardson/lark/internal/state"
+	"github.com/richardsondx/IronLark/internal/app"
+	cfgpkg "github.com/richardsondx/IronLark/internal/config"
+	ctxpkg "github.com/richardsondx/IronLark/internal/context"
+	"github.com/richardsondx/IronLark/internal/core"
+	"github.com/richardsondx/IronLark/internal/provider"
+	"github.com/richardsondx/IronLark/internal/state"
 )
 
 type rootFlags struct {

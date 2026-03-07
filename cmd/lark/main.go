@@ -6,7 +6,7 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/richardson/lark/internal/cli"
+	"github.com/richardsondx/IronLark/internal/cli"
 )
 
 func main() {

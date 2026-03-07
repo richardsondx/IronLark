@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/richardson/lark/internal/core"
+	"github.com/richardsondx/IronLark/internal/core"
 	"mvdan.cc/sh/v3/syntax"
 )
 

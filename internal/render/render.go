@@ -8,11 +8,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/richardson/lark/internal/checkpoints"
-	ctxpkg "github.com/richardson/lark/internal/context"
-	"github.com/richardson/lark/internal/core"
-	"github.com/richardson/lark/internal/patches"
-	"github.com/richardson/lark/internal/sessions"
+	"github.com/richardsondx/IronLark/internal/checkpoints"
+	ctxpkg "github.com/richardsondx/IronLark/internal/context"
+	"github.com/richardsondx/IronLark/internal/core"
+	"github.com/richardsondx/IronLark/internal/patches"
+	"github.com/richardsondx/IronLark/internal/sessions"
 	"golang.org/x/term"
 )
 

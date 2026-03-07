@@ -5,8 +5,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/richardson/lark/internal/config"
-	"github.com/richardson/lark/internal/core"
+	"github.com/richardsondx/IronLark/internal/config"
+	"github.com/richardsondx/IronLark/internal/core"
 )
 
 type Runtime struct {

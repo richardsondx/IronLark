@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/richardson/lark/internal/core"
+	"github.com/richardsondx/IronLark/internal/core"
 )
 
 type OpenAICompatibleClient struct {
