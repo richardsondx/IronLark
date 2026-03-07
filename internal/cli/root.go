@@ -13,11 +13,13 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/richardsondx/IronLark/internal/app"
+	"github.com/richardsondx/IronLark/internal/buildinfo"
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/update"
 )
 
 type rootFlags struct {
@@ -32,9 +34,10 @@ type rootFlags struct {
 func NewRootCommand() *cobra.Command {
 	flags := &rootFlags{}
 	cmd := &cobra.Command{
-		Use:   "lark [task]",
-		Short: "Lark is an SSH-first AI CLI for server and repo operations",
-		Args:  cobra.ArbitraryArgs,
+		Use:     "lark [task]",
+		Short:   "Lark is an SSH-first AI CLI for server and repo operations",
+		Args:    cobra.ArbitraryArgs,
+		Version: buildinfo.Version,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			application, err := buildApp(flags)
 			if err != nil {
@@ -71,11 +74,50 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newUndoCommand(flags))
 	cmd.AddCommand(newRestoreCommand(flags))
 	cmd.AddCommand(newInitCommand(flags))
+	cmd.AddCommand(newUpdateCommand())
+	cmd.AddCommand(newVersionCommand())
 	cmd.AddCommand(newModelsCommand(flags))
 	cmd.AddCommand(newModelCommand(flags))
 	cmd.AddCommand(newConfigCommand(flags))
 	cmd.AddCommand(newDoctorCommand(flags))
 	return cmd
+}
+
+func newVersionCommand() *cobra.Command {
+	var verbose bool
+	cmd := &cobra.Command{
+		Use:   "version",
+		Short: "Show the installed version",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if verbose {
+				fmt.Fprintln(cmd.OutOrStdout(), buildinfo.Summary())
+				return nil
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), buildinfo.Version)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&verbose, "verbose", false, "show build metadata")
+	return cmd
+}
+
+func newUpdateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "update",
+		Short: "Update IronLark to the latest GitHub release",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			executable, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			releaseTag, err := update.Client{RepoSlug: buildinfo.RepoSlug}.UpdateExecutable(cmd.Context(), executable)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "Updated to %s\n", releaseTag)
+			return nil
+		},
+	}
 }
 
 func newChatCommand(flags *rootFlags) *cobra.Command {

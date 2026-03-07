@@ -58,4 +58,6 @@ esac
 echo
 echo "Quick start:"
 echo "  $INSTALL_DIR/lk init"
+echo "  $INSTALL_DIR/lk version"
+echo "  $INSTALL_DIR/lk update"
 echo "  lk \"what can you help me do on this server?\""

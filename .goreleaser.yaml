@@ -19,6 +19,10 @@ builds:
       - arm64
     ldflags:
       - -s -w
+      - -X github.com/richardsondx/IronLark/internal/buildinfo.Version={{ .Version }}
+      - -X github.com/richardsondx/IronLark/internal/buildinfo.Commit={{ .Commit }}
+      - -X github.com/richardsondx/IronLark/internal/buildinfo.Date={{ .Date }}
+      - -X github.com/richardsondx/IronLark/internal/buildinfo.RepoSlug=richardsondx/IronLark
 
 archives:
   - id: default

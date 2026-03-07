@@ -48,6 +48,7 @@ Verify it works:
 
 ```bash
 lk init
+lk version
 lk model
 lk config test
 lk "hello"
@@ -83,6 +84,7 @@ lk init
 Test it:
 
 ```bash
+lk version
 lk model
 lk config test
 lk "what can you help me do on this server?"
@@ -126,6 +128,8 @@ lk "summarize this machine"
 lk inspect
 lk chat
 lk history
+lk version
+lk update
 lk model
 lk model openai-codex/gpt-5.3-codex
 lk edit ./README.md "rewrite the first sentence to be clearer"
@@ -143,6 +147,8 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk restore <checkpoint-id>`: restore a saved checkpoint snapshot
 - `lk config init|show|set|use|test`: manage provider and approval config
 - `lk init`: guided setup for OpenAI auth, defaults, and PATH
+- `lk version`: show the installed version
+- `lk update`: update to the latest GitHub release
 - `lk models list|current|set <model>`: list, show, or set the default model
 - `lk model [name]`: shortcut to show the current model or set a new one
 
@@ -190,6 +196,7 @@ Build from source:
 ```bash
 make test
 make build
+make install
 ```
 
 Run the freshly built binary from the repo:
@@ -199,11 +206,10 @@ Run the freshly built binary from the repo:
 ./bin/lark "hello"
 ```
 
-If you already installed `lk` into `~/.local/bin`, rebuilding the repo does not update that installed binary automatically. Reinstall the rebuilt binary after code changes:
+If you already installed `lk` into `~/.local/bin`, use one command to rebuild and reinstall it:
 
 ```bash
-cp ./bin/lark ~/.local/bin/lark
-ln -sf ~/.local/bin/lark ~/.local/bin/lk
+make install
 ```
 
 Verify the installed binary is the updated one:
