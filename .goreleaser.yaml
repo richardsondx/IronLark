@@ -1,0 +1,32 @@
+project_name: lark
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: lark
+    main: ./cmd/lark
+    binary: lark
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "lark_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - install.sh
+
+checksum:
+  name_template: checksums.txt

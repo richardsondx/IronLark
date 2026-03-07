@@ -1,0 +1,53 @@
+#!/usr/bin/env sh
+set -eu
+
+REPO_SLUG="${LARK_REPO:-richardson/lark-term}"
+VERSION="${LARK_VERSION:-latest}"
+INSTALL_DIR="${LARK_INSTALL_DIR:-$HOME/.local/bin}"
+
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+esac
+
+if [ "$VERSION" = "latest" ]; then
+  RELEASE_URL="https://github.com/${REPO_SLUG}/releases/latest/download/lark_${OS}_${ARCH}.tar.gz"
+else
+  RELEASE_URL="https://github.com/${REPO_SLUG}/releases/download/${VERSION}/lark_${OS}_${ARCH}.tar.gz"
+fi
+
+TMP_DIR="$(mktemp -d)"
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$INSTALL_DIR"
+
+echo "Downloading ${RELEASE_URL}"
+curl -fsSL "$RELEASE_URL" -o "$TMP_DIR/lark.tar.gz"
+tar -xzf "$TMP_DIR/lark.tar.gz" -C "$TMP_DIR"
+
+install "$TMP_DIR/lark" "$INSTALL_DIR/lark"
+ln -sf "$INSTALL_DIR/lark" "$INSTALL_DIR/lk"
+
+echo "Installed:"
+echo "  $INSTALL_DIR/lark"
+echo "  $INSTALL_DIR/lk"
+
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *)
+    echo
+    echo "Add this to your shell profile if needed:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    ;;
+esac
+
+echo
+echo "Quick start:"
+echo "  export OPENAI_API_KEY=..."
+echo "  lk config init"
+echo "  lk \"why is nginx failing?\""
