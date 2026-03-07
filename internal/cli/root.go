@@ -27,6 +27,7 @@ type rootFlags struct {
 	model    string
 	profile  string
 	approval string
+	color    string
 	readOnly bool
 	json     bool
 }
@@ -63,6 +64,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&flags.model, "model", "m", "", "override model")
 	cmd.PersistentFlags().StringVar(&flags.profile, "profile", "", "use configured profile")
 	cmd.PersistentFlags().StringVar(&flags.approval, "approval", "", "approval mode: suggest|confirm|auto-safe|agent")
+	cmd.PersistentFlags().StringVar(&flags.color, "color", "auto", "color mode: auto|always|never")
 	cmd.PersistentFlags().BoolVar(&flags.readOnly, "read-only", false, "block mutating actions")
 	cmd.PersistentFlags().BoolVar(&flags.json, "json", false, "print JSON output")
 
@@ -494,6 +496,7 @@ func buildApp(flags *rootFlags) (*app.App, error) {
 		Model:    flags.model,
 		Profile:  flags.profile,
 		Approval: flags.approval,
+		Color:    flags.color,
 		ReadOnly: flags.readOnly,
 		JSON:     flags.json,
 	})

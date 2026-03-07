@@ -24,13 +24,13 @@ type Renderer struct {
 	Color bool
 }
 
-func New(in io.Reader, out, err io.Writer, jsonOutput bool) *Renderer {
+func New(in io.Reader, out, err io.Writer, jsonOutput bool, colorMode string) *Renderer {
 	return &Renderer{
 		In:    bufio.NewReader(in),
 		Out:   out,
 		Err:   err,
 		JSON:  jsonOutput,
-		Color: shouldUseColor(out, jsonOutput),
+		Color: shouldUseColor(out, jsonOutput, colorMode),
 	}
 }
 
@@ -58,11 +58,11 @@ func (r *Renderer) Response(response core.LLMResponse) error {
 	if r.JSON {
 		return r.encode(response)
 	}
-	fmt.Fprintf(r.Out, "Summary: %s\n", response.Summary)
+	fmt.Fprintf(r.Out, "%s: %s\n", r.label("Summary"), response.Summary)
 	if len(response.Findings) > 0 {
-		fmt.Fprintln(r.Out, "\nFindings:")
+		fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Findings"))
 		for idx, finding := range response.Findings {
-			fmt.Fprintf(r.Out, "%d. %s\n", idx+1, finding)
+			fmt.Fprintf(r.Out, "%s %s\n", r.accent(fmt.Sprintf("%d.", idx+1)), finding)
 		}
 	}
 	return nil
@@ -72,7 +72,7 @@ func (r *Renderer) PlannedActions(actions []core.Action, previews []core.RiskRep
 	if len(actions) == 0 {
 		return
 	}
-	fmt.Fprintln(r.Out, "\nProposed actions:")
+	fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Proposed actions"))
 	for idx, action := range actions {
 		report := core.RiskReport{}
 		if idx < len(previews) {
@@ -88,14 +88,17 @@ func (r *Renderer) PlannedActions(actions []core.Action, previews []core.RiskRep
 		if target == "" && len(action.Paths) > 0 {
 			target = strings.Join(action.Paths, ", ")
 		}
-		fmt.Fprintf(r.Out, "[%s] %s\n", action.Type, target)
-		fmt.Fprintf(r.Out, "  Risk: %s | Needs sudo: %t | Touches system files: %t | Rollback available: %t\n",
-			report.Level, report.NeedsSudo, report.TouchesSystemFiles, report.RollbackAvailable)
+		fmt.Fprintf(r.Out, "%s %s\n", r.actionTag(string(action.Type)), target)
+		fmt.Fprintf(r.Out, "  %s: %s | %s: %t | %s: %t | %s: %t\n",
+			r.label("Risk"), r.riskLevel(report.Level),
+			r.label("Needs sudo"), report.NeedsSudo,
+			r.label("Touches system files"), report.TouchesSystemFiles,
+			r.label("Rollback available"), report.RollbackAvailable)
 		if action.Reason != "" {
-			fmt.Fprintf(r.Out, "  Why: %s\n", action.Reason)
+			fmt.Fprintf(r.Out, "  %s: %s\n", r.label("Why"), action.Reason)
 		}
 		if action.Type == core.ActionEditFile && action.PatchUnifiedDiff != "" {
-			fmt.Fprintln(r.Out, "  Diff:")
+			fmt.Fprintf(r.Out, "  %s:\n", r.label("Diff"))
 			for _, line := range strings.Split(strings.TrimSpace(action.PatchUnifiedDiff), "\n") {
 				fmt.Fprintf(r.Out, "    %s\n", r.formatDiffLine(line))
 			}
@@ -115,24 +118,24 @@ func (r *Renderer) Result(result core.ActionResult) {
 	if result.Skipped {
 		status = "skipped"
 	}
-	fmt.Fprintf(r.Out, "\n[%s] %s\n", status, result.Action.Title)
+	fmt.Fprintf(r.Out, "\n%s %s\n", r.resultTag(status), result.Action.Title)
 	if result.Summary != "" {
-		fmt.Fprintf(r.Out, "%s\n", result.Summary)
+		fmt.Fprintf(r.Out, "%s: %s\n", r.label("Summary"), result.Summary)
 	}
 	if result.Stdout != "" {
-		fmt.Fprintf(r.Out, "%s\n", strings.TrimSpace(result.Stdout))
+		r.outputBlock("Output", result.Stdout, ansiGray)
 	}
 	if result.Stderr != "" {
-		fmt.Fprintf(r.Out, "%s\n", strings.TrimSpace(result.Stderr))
+		r.outputBlock("Stderr", result.Stderr, ansiRed)
 	}
 	if result.Error != "" {
-		fmt.Fprintf(r.Out, "Error: %s\n", strings.TrimSpace(result.Error))
+		fmt.Fprintf(r.Out, "%s: %s\n", r.label("Error"), strings.TrimSpace(result.Error))
 	}
 	if result.PatchID != "" {
-		fmt.Fprintf(r.Out, "Patch ID: %s\n", result.PatchID)
+		fmt.Fprintf(r.Out, "%s: %s\n", r.label("Patch ID"), result.PatchID)
 	}
 	if result.CheckpointID != "" {
-		fmt.Fprintf(r.Out, "Checkpoint ID: %s\n", result.CheckpointID)
+		fmt.Fprintf(r.Out, "%s: %s\n", r.label("Checkpoint ID"), result.CheckpointID)
 	}
 }
 
@@ -167,12 +170,12 @@ func (r *Renderer) Checkpoints(records []checkpoints.Record) error {
 }
 
 func (r *Renderer) PromptChoice() (string, error) {
-	fmt.Fprintln(r.Out, "\nChoose:")
-	fmt.Fprintln(r.Out, "1. Approve all")
-	fmt.Fprintln(r.Out, "2. Approve step by step")
-	fmt.Fprintln(r.Out, "3. Show commands only")
-	fmt.Fprintln(r.Out, "4. Cancel")
-	return r.readLine("> ")
+	fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Choose"))
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("1."), "Approve all")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("2."), "Approve step by step")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), "Show commands only")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Cancel")
+	return r.readLine(r.prompt("> "))
 }
 
 func (r *Renderer) Confirm(label string, double bool) (bool, error) {
@@ -242,25 +245,122 @@ func (r *Renderer) formatDiffLine(line string) string {
 	}
 }
 
-func shouldUseColor(out io.Writer, jsonOutput bool) bool {
+func (r *Renderer) outputBlock(title, body, lineColor string) {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return
+	}
+	fmt.Fprintf(r.Out, "%s:\n", r.label(title))
+	for _, line := range strings.Split(body, "\n") {
+		fmt.Fprintf(r.Out, "  %s %s\n", r.outputPrefix(lineColor), r.outputLine(line, lineColor))
+	}
+}
+
+func (r *Renderer) heading(text string) string {
+	return r.style(text, ansiBold, ansiCyan)
+}
+
+func (r *Renderer) label(text string) string {
+	return r.style(text, ansiBold)
+}
+
+func (r *Renderer) accent(text string) string {
+	return r.style(text, ansiCyan)
+}
+
+func (r *Renderer) prompt(text string) string {
+	return r.style(text, ansiBold, ansiCyan)
+}
+
+func (r *Renderer) actionTag(text string) string {
+	return r.style("["+text+"]", ansiBold, ansiBlue)
+}
+
+func (r *Renderer) resultTag(status string) string {
+	code := ansiBlue
+	switch status {
+	case "ok":
+		code = ansiGreen
+	case "error":
+		code = ansiRed
+	case "skipped":
+		code = ansiYellow
+	}
+	return r.style("["+status+"]", ansiBold, code)
+}
+
+func (r *Renderer) riskLevel(level core.RiskLevel) string {
+	code := ansiBlue
+	switch level {
+	case core.RiskLow:
+		code = ansiGreen
+	case core.RiskMedium:
+		code = ansiYellow
+	case core.RiskHigh:
+		code = ansiRed
+	}
+	return r.style(string(level), ansiBold, code)
+}
+
+func (r *Renderer) outputPrefix(lineColor string) string {
+	return r.style("│", ansiBold, lineColor)
+}
+
+func (r *Renderer) outputLine(text, lineColor string) string {
+	return r.style(text, lineColor)
+}
+
+func (r *Renderer) style(text string, codes ...string) string {
+	if !r.Color {
+		return text
+	}
+	return strings.Join(codes, "") + text + ansiReset
+}
+
+func shouldUseColor(out io.Writer, jsonOutput bool, colorMode string) bool {
+	switch strings.TrimSpace(strings.ToLower(colorMode)) {
+	case "always":
+		return !jsonOutput
+	case "never":
+		return false
+	}
+	if forceColorEnabled() {
+		return !jsonOutput
+	}
 	if jsonOutput || os.Getenv("NO_COLOR") != "" {
 		return false
 	}
-	file, ok := out.(*os.File)
-	if !ok {
+	if termEnv := strings.TrimSpace(os.Getenv("TERM")); termEnv == "" || termEnv == "dumb" {
 		return false
 	}
-	return term.IsTerminal(int(file.Fd()))
+	file, ok := out.(*os.File)
+	if ok && term.IsTerminal(int(file.Fd())) {
+		return true
+	}
+	return term.IsTerminal(int(os.Stdout.Fd())) || term.IsTerminal(int(os.Stderr.Fd()))
 }
 
 func colorize(value, code string) string {
 	return code + value + ansiReset
 }
 
+func forceColorEnabled() bool {
+	for _, key := range []string{"CLICOLOR_FORCE", "FORCE_COLOR"} {
+		value := strings.TrimSpace(os.Getenv(key))
+		if value != "" && value != "0" {
+			return true
+		}
+	}
+	return false
+}
+
 const (
-	ansiReset = "\033[0m"
-	ansiBold  = "\033[1m"
-	ansiRed   = "\033[31m"
-	ansiGreen = "\033[32m"
-	ansiCyan  = "\033[36m"
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiBlue   = "\033[34m"
+	ansiGray   = "\033[90m"
+	ansiCyan   = "\033[36m"
 )

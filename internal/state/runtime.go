@@ -27,6 +27,7 @@ type Overrides struct {
 	Model    string
 	Profile  string
 	Approval string
+	Color    string
 	ReadOnly bool
 	JSON     bool
 }

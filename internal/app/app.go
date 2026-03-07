@@ -52,7 +52,7 @@ func New(overrides state.Overrides) (*App, error) {
 
 	redactor := redact.New(runtimeState.Config.Security.RedactPatterns)
 	classifier := policy.NewClassifier(runtimeState.Config.Security.ProtectedPaths)
-	renderer := render.New(os.Stdin, os.Stdout, os.Stderr, runtimeState.JSONOutput)
+	renderer := render.New(os.Stdin, os.Stdout, os.Stderr, runtimeState.JSONOutput, overrides.Color)
 
 	app := &App{
 		Loaded:    loaded,
