@@ -47,6 +47,7 @@ EOF
 Verify it works:
 
 ```bash
+lk init
 lk model
 lk config test
 lk "hello"
@@ -76,10 +77,7 @@ source ~/.bashrc
 Add your API key on the server:
 
 ```bash
-mkdir -p ~/.config/lark
-cat > ~/.config/lark/.env <<'EOF'
-OPENAI_API_KEY=your_key_here
-EOF
+lk init
 ```
 
 Test it:
@@ -87,7 +85,7 @@ Test it:
 ```bash
 lk model
 lk config test
-lk "inspect this machine and tell me anything risky"
+lk "what can you help me do on this server?"
 ```
 
 Try a file edit:
@@ -111,7 +109,7 @@ OPENAI_API_KEY=your_key_here
 EOF
 export PATH="$HOME/.local/bin:$PATH"
 lk config test
-lk "why is nginx failing?"
+lk "what can you help me do on this server?"
 ```
 
 You can also review a config change directly on the droplet:
@@ -123,12 +121,13 @@ lk edit /etc/ssh/sshd_config "disable password authentication and preserve the r
 ## First Commands To Try
 
 ```bash
-lk "why is nginx failing?"
+lk "what can you help me do on this server?"
+lk "summarize this machine"
 lk inspect
 lk chat
 lk history
 lk model
-lk model gpt-5
+lk model openai-codex/gpt-5.3-codex
 lk edit ./README.md "rewrite the first sentence to be clearer"
 ```
 
@@ -143,6 +142,7 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk undo <patch-id>`: restore a saved file backup
 - `lk restore <checkpoint-id>`: restore a saved checkpoint snapshot
 - `lk config init|show|set|use|test`: manage provider and approval config
+- `lk init`: guided setup for OpenAI auth, defaults, and PATH
 - `lk models list|current|set <model>`: list, show, or set the default model
 - `lk model [name]`: shortcut to show the current model or set a new one
 

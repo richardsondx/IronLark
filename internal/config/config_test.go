@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -66,6 +67,30 @@ func TestSetValueSupportsProviderFields(t *testing.T) {
 	}
 	if cfg.Providers["openai"].BaseURL != "https://example.com/v1" {
 		t.Fatalf("unexpected provider value %q", cfg.Providers["openai"].BaseURL)
+	}
+}
+
+func TestUpsertEnvValueCreatesAndUpdatesEnvFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := UpsertEnvValue(path, "OPENAI_API_KEY", "one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertEnvValue(path, "OPENAI_API_KEY", "two"); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertEnvValue(path, "OTHER_TOKEN", "three"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "OPENAI_API_KEY=two\n") {
+		t.Fatalf("expected updated key, got %q", got)
+	}
+	if !strings.Contains(got, "OTHER_TOKEN=three\n") {
+		t.Fatalf("expected second key, got %q", got)
 	}
 }
 

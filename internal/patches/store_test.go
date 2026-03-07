@@ -3,6 +3,7 @@ package patches
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -42,5 +43,19 @@ func TestApplyUnifiedDiffAndUndo(t *testing.T) {
 	}
 	if string(restored) != original {
 		t.Fatalf("expected original content restored, got %q", string(restored))
+	}
+}
+
+func TestApplyUnifiedDiffRejectsApplyPatchFormat(t *testing.T) {
+	_, err := ApplyUnifiedDiff("hello\n", `*** Begin Patch
+*** Update File: hello.txt
+@@
++world
+*** End Patch`)
+	if err == nil {
+		t.Fatal("expected apply_patch format to be rejected")
+	}
+	if got := err.Error(); !strings.Contains(got, "standard unified diff") {
+		t.Fatalf("unexpected error: %s", got)
 	}
 }

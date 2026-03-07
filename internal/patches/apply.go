@@ -12,6 +12,9 @@ type hunk struct {
 }
 
 func ApplyUnifiedDiff(original, diff string) (string, error) {
+	if err := validateUnifiedDiff(diff); err != nil {
+		return "", err
+	}
 	origLines, hadTrailingNewline := splitContent(original)
 	hunks, err := parseHunks(diff)
 	if err != nil {
@@ -112,7 +115,7 @@ func parseHunks(diff string) ([]hunk, error) {
 func parseOrigStart(header string) (int, error) {
 	parts := strings.Split(header, " ")
 	if len(parts) < 3 {
-		return 0, fmt.Errorf("invalid hunk header %q", header)
+		return 0, fmt.Errorf("invalid unified diff hunk header %q", header)
 	}
 	rangePart := strings.TrimPrefix(parts[1], "-")
 	rangePart = strings.TrimSuffix(rangePart, "@@")
@@ -122,4 +125,17 @@ func parseOrigStart(header string) (int, error) {
 		return 0, fmt.Errorf("parse hunk start: %w", err)
 	}
 	return value, nil
+}
+
+func validateUnifiedDiff(diff string) error {
+	normalized := strings.ReplaceAll(strings.TrimSpace(diff), "\r\n", "\n")
+	switch {
+	case normalized == "":
+		return fmt.Errorf("patch is empty")
+	case strings.Contains(normalized, "*** Begin Patch"):
+		return fmt.Errorf("patch uses Codex apply_patch format; edit_file requires a standard unified diff with ---/+++ headers and @@ hunk ranges")
+	case !strings.Contains(normalized, "@@"):
+		return fmt.Errorf("patch does not contain any unified diff hunks")
+	}
+	return nil
 }

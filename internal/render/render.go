@@ -125,6 +125,9 @@ func (r *Renderer) Result(result core.ActionResult) {
 	if result.Stderr != "" {
 		fmt.Fprintf(r.Out, "%s\n", strings.TrimSpace(result.Stderr))
 	}
+	if result.Error != "" {
+		fmt.Fprintf(r.Out, "Error: %s\n", strings.TrimSpace(result.Error))
+	}
 	if result.PatchID != "" {
 		fmt.Fprintf(r.Out, "Patch ID: %s\n", result.PatchID)
 	}

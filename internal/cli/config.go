@@ -3,9 +3,11 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 )
@@ -26,77 +28,19 @@ func newConfigCommand(flags *rootFlags) *cobra.Command {
 func newConfigInitCommand(flags *rootFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Create or overwrite ~/.config/lark/config.yaml",
+		Short: "Interactive setup for config, env, and shell PATH",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			application, err := buildApp(flags)
-			if err != nil {
-				return err
-			}
-			cfg := cfgpkg.DefaultConfig()
-			providerName, err := application.Renderer.ReadPrompt("Select provider [openai]: ")
-			if err != nil {
-				return err
-			}
-			if providerName == "" {
-				providerName = "openai"
-			}
-			providerCfg, ok := cfg.Providers[providerName]
-			if !ok {
-				providerCfg = cfgpkg.ProviderConfig{
-					Type:         "openai-compatible",
-					BaseURL:      "https://api.openai.com/v1",
-					APIKeyEnv:    strings.ToUpper(providerName) + "_API_KEY",
-					DefaultModel: cfg.DefaultModel,
-				}
-			}
-			modelName, err := application.Renderer.ReadPrompt(fmt.Sprintf("Default model [%s]: ", cfg.DefaultModel))
-			if err != nil {
-				return err
-			}
-			if modelName != "" {
-				cfg.DefaultModel = modelName
-			}
-			apiEnv, err := application.Renderer.ReadPrompt(fmt.Sprintf("API key env var [%s]: ", providerCfg.APIKeyEnv))
-			if err != nil {
-				return err
-			}
-			baseURL, err := application.Renderer.ReadPrompt(fmt.Sprintf("Base URL [%s]: ", providerCfg.BaseURL))
-			if err != nil {
-				return err
-			}
-			profileName, err := application.Renderer.ReadPrompt(fmt.Sprintf("Default profile [%s]: ", cfg.DefaultProfile))
-			if err != nil {
-				return err
-			}
-			approvalMode, err := application.Renderer.ReadPrompt(fmt.Sprintf("Approval mode [%s]: ", cfg.ApprovalMode))
-			if err != nil {
-				return err
-			}
+			return runInteractiveInit(flags)
+		},
+	}
+}
 
-			cfg.DefaultProvider = providerName
-			if profileName != "" {
-				cfg.DefaultProfile = profileName
-			}
-			if approvalMode != "" {
-				cfg.ApprovalMode = approvalMode
-			}
-
-			if apiEnv != "" {
-				providerCfg.APIKeyEnv = apiEnv
-			}
-			if baseURL != "" {
-				providerCfg.BaseURL = baseURL
-			}
-			if modelName != "" {
-				providerCfg.DefaultModel = modelName
-			}
-			cfg.Providers[providerName] = providerCfg
-
-			if err := cfgpkg.SaveUserConfig(application.Loaded.Paths.ConfigPath, cfg); err != nil {
-				return err
-			}
-			application.Renderer.Message(fmt.Sprintf("Config saved to %s", application.Loaded.Paths.ConfigPath))
-			return nil
+func newInitCommand(flags *rootFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "init",
+		Short: "Set up OpenAI auth, defaults, and shell PATH",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runInteractiveInit(flags)
 		},
 	}
 }
@@ -183,4 +127,125 @@ func newConfigTestCommand(flags *rootFlags) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func runInteractiveInit(flags *rootFlags) error {
+	application, err := buildApp(flags)
+	if err != nil {
+		return err
+	}
+
+	cfg := cfgpkg.DefaultConfig()
+	modelName, err := application.Renderer.ReadPrompt(fmt.Sprintf("Model [%s]: ", cfg.DefaultModel))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(modelName) != "" {
+		cfg.DefaultModel = strings.TrimSpace(modelName)
+	}
+	cfg.DefaultProvider = "openai"
+	cfg.DefaultProfile = "strong"
+	if providerCfg, ok := cfg.Providers["openai"]; ok {
+		providerCfg.DefaultModel = cfg.DefaultModel
+		cfg.Providers["openai"] = providerCfg
+	}
+	if profileCfg, ok := cfg.Profiles["strong"]; ok {
+		profileCfg.Model = cfg.DefaultModel
+		cfg.Profiles["strong"] = profileCfg
+	}
+
+	apiKey, err := readSecret("OpenAI API key (stored in ~/.config/lark/.env): ")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		if existing := strings.TrimSpace(os.Getenv("OPENAI_API_KEY")); existing != "" {
+			apiKey = existing
+		} else {
+			return fmt.Errorf("OPENAI_API_KEY is required for setup")
+		}
+	}
+
+	if err := cfgpkg.SaveUserConfig(application.Loaded.Paths.ConfigPath, cfg); err != nil {
+		return err
+	}
+	if err := cfgpkg.UpsertEnvValue(application.Loaded.Paths.EnvPath, "OPENAI_API_KEY", apiKey); err != nil {
+		return err
+	}
+
+	profilePath, exportLine := detectShellProfile()
+	installBin := filepath.Join(mustUserHomeDir(), ".local", "bin")
+	if profilePath != "" && !pathContains(os.Getenv("PATH"), installBin) {
+		addPath, err := application.Renderer.ReadPrompt(fmt.Sprintf("Add %q to %s? [Y/n] ", exportLine, profilePath))
+		if err != nil {
+			return err
+		}
+		if addPath == "" || strings.EqualFold(addPath, "y") || strings.EqualFold(addPath, "yes") {
+			if err := ensureLineInFile(profilePath, exportLine); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Added PATH export to %s", profilePath))
+			application.Renderer.Message(fmt.Sprintf("Run: source %s", profilePath))
+		}
+	}
+
+	application.Renderer.Message(fmt.Sprintf("Config saved to %s", application.Loaded.Paths.ConfigPath))
+	application.Renderer.Message(fmt.Sprintf("OpenAI key saved to %s", application.Loaded.Paths.EnvPath))
+	application.Renderer.Message(`Next: lk "why is nginx failing?"`)
+	return nil
+}
+
+func readSecret(prompt string) (string, error) {
+	fmt.Fprint(os.Stdout, prompt)
+	secret, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Fprintln(os.Stdout)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(secret)), nil
+}
+
+func detectShellProfile() (string, string) {
+	home := mustUserHomeDir()
+	shell := filepath.Base(strings.TrimSpace(os.Getenv("SHELL")))
+	switch shell {
+	case "zsh":
+		return filepath.Join(home, ".zshrc"), fmt.Sprintf(`export PATH="%s:$PATH"`, filepath.Join(home, ".local", "bin"))
+	case "fish":
+		return filepath.Join(home, ".config", "fish", "config.fish"), fmt.Sprintf(`fish_add_path %s`, filepath.Join(home, ".local", "bin"))
+	default:
+		return filepath.Join(home, ".bashrc"), fmt.Sprintf(`export PATH="%s:$PATH"`, filepath.Join(home, ".local", "bin"))
+	}
+}
+
+func mustUserHomeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
+}
+
+func ensureLineInFile(path, line string) error {
+	content, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if strings.Contains(string(content), line) {
+		return nil
+	}
+	block := "\n# >>> ironlark-managed path >>>\n" + line + "\n# <<< ironlark-managed path <<<\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(content, []byte(block)...), 0o644)
+}
+
+func pathContains(pathEnv, dir string) bool {
+	for _, part := range filepath.SplitList(pathEnv) {
+		if part == dir {
+			return true
+		}
+	}
+	return false
 }

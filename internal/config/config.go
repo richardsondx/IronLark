@@ -102,7 +102,7 @@ func DefaultConfig() Config {
 	return Config{
 		Version:         1,
 		DefaultProvider: "openai",
-		DefaultModel:    "gpt-5",
+		DefaultModel:    "openai-codex/gpt-5.3-codex",
 		DefaultProfile:  "strong",
 		ApprovalMode:    "confirm",
 		Context: ContextConfig{
@@ -137,7 +137,7 @@ func DefaultConfig() Config {
 				Type:         "openai-compatible",
 				BaseURL:      "https://api.openai.com/v1",
 				APIKeyEnv:    "OPENAI_API_KEY",
-				DefaultModel: "gpt-5",
+				DefaultModel: "openai-codex/gpt-5.3-codex",
 			},
 			"openrouter": {
 				Type:         "openai-compatible",
@@ -157,7 +157,7 @@ func DefaultConfig() Config {
 			},
 			"strong": {
 				Provider: "openai",
-				Model:    "gpt-5",
+				Model:    "openai-codex/gpt-5.3-codex",
 			},
 			"local": {
 				Provider: "openai",
@@ -254,6 +254,32 @@ func SaveUserConfig(path string, cfg Config) error {
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
+	}
+	return nil
+}
+
+func UpsertEnvValue(path, key, value string) error {
+	values, err := readEnvFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read env file: %w", err)
+	}
+	if values == nil {
+		values = map[string]string{}
+	}
+	values[key] = value
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create env directory: %w", err)
+	}
+	lines := make([]string, 0, len(values))
+	for _, envKey := range sortedKeys(values) {
+		lines = append(lines, fmt.Sprintf("%s=%s", envKey, values[envKey]))
+	}
+	content := strings.Join(lines, "\n")
+	if content != "" {
+		content += "\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("write env file: %w", err)
 	}
 	return nil
 }
@@ -436,10 +462,27 @@ func loadEnvFiles(paths ...string) error {
 }
 
 func loadEnvFile(path string) error {
-	data, err := os.ReadFile(path)
+	values, err := readEnvFile(path)
 	if err != nil {
 		return err
 	}
+	for key, value := range values {
+		if _, exists := os.LookupEnv(key); exists {
+			continue
+		}
+		if err := os.Setenv(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func readEnvFile(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	values := map[string]string{}
 	for _, rawLine := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -458,12 +501,16 @@ func loadEnvFile(path string) error {
 		if key == "" {
 			continue
 		}
-		if _, exists := os.LookupEnv(key); exists {
-			continue
-		}
-		if err := os.Setenv(key, value); err != nil {
-			return err
-		}
+		values[key] = value
 	}
-	return nil
+	return values, nil
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	return keys
 }

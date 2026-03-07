@@ -49,13 +49,13 @@ case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *)
     echo
-    echo "Add this to your shell profile if needed:"
-    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+    echo "If $INSTALL_DIR is not on your PATH yet, let IronLark add it for you after setup:"
+    echo "  $INSTALL_DIR/lk init"
+    echo "  $INSTALL_DIR/lk \"add export PATH=\\\"$INSTALL_DIR:\\\$PATH\\\" to my shell profile and apply it\""
     ;;
 esac
 
 echo
 echo "Quick start:"
-echo "  export OPENAI_API_KEY=..."
-echo "  lk config init"
-echo "  lk \"why is nginx failing?\""
+echo "  $INSTALL_DIR/lk init"
+echo "  lk \"what can you help me do on this server?\""

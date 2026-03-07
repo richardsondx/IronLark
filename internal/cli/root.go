@@ -70,6 +70,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newHistoryCommand(flags))
 	cmd.AddCommand(newUndoCommand(flags))
 	cmd.AddCommand(newRestoreCommand(flags))
+	cmd.AddCommand(newInitCommand(flags))
 	cmd.AddCommand(newModelsCommand(flags))
 	cmd.AddCommand(newModelCommand(flags))
 	cmd.AddCommand(newConfigCommand(flags))
