@@ -131,7 +131,7 @@ lk history
 lk version
 lk update
 lk model
-lk model openai-codex/gpt-5.3-codex
+lk model gpt-5-mini
 lk edit ./README.md "rewrite the first sentence to be clearer"
 ```
 

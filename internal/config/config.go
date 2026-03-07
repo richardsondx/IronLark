@@ -102,7 +102,7 @@ func DefaultConfig() Config {
 	return Config{
 		Version:         1,
 		DefaultProvider: "openai",
-		DefaultModel:    "openai-codex/gpt-5.3-codex",
+		DefaultModel:    "gpt-5-mini",
 		DefaultProfile:  "strong",
 		ApprovalMode:    "confirm",
 		Context: ContextConfig{
@@ -137,7 +137,7 @@ func DefaultConfig() Config {
 				Type:         "openai-compatible",
 				BaseURL:      "https://api.openai.com/v1",
 				APIKeyEnv:    "OPENAI_API_KEY",
-				DefaultModel: "openai-codex/gpt-5.3-codex",
+				DefaultModel: "gpt-5-mini",
 			},
 			"openrouter": {
 				Type:         "openai-compatible",
@@ -157,7 +157,7 @@ func DefaultConfig() Config {
 			},
 			"strong": {
 				Provider: "openai",
-				Model:    "openai-codex/gpt-5.3-codex",
+				Model:    "gpt-5-mini",
 			},
 			"local": {
 				Provider: "openai",

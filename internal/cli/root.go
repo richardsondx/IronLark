@@ -452,6 +452,15 @@ func setDefaultModel(model string) error {
 	if err != nil {
 		return err
 	}
+	providerName := loaded.Merged.DefaultProvider
+	if loaded.Merged.DefaultProfile != "" {
+		if profile, ok := loaded.Merged.Profiles[loaded.Merged.DefaultProfile]; ok && strings.TrimSpace(profile.Provider) != "" {
+			providerName = profile.Provider
+		}
+	}
+	if err := validateModelForProvider(providerName, model); err != nil {
+		return err
+	}
 	cfg := loaded.User
 	cfg.DefaultModel = model
 	cfg.DefaultProfile = ""
@@ -459,6 +468,23 @@ func setDefaultModel(model string) error {
 		return err
 	}
 	fmt.Printf("Default model set to %s\n", model)
+	return nil
+}
+
+func validateModelForProvider(providerName, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("model cannot be empty")
+	}
+	switch providerName {
+	case "openai":
+		if strings.Contains(model, "codex") {
+			return fmt.Errorf("model %q is not supported by IronLark's current OpenAI chat-completions client; use gpt-5-mini instead", model)
+		}
+		if strings.Contains(model, "/") {
+			return fmt.Errorf("model %q is not a valid raw OpenAI model ID; use values like gpt-5-mini or gpt-4.1-mini", model)
+		}
+	}
 	return nil
 }
 

@@ -51,6 +51,9 @@ func Resolve(loaded config.Loaded, overrides Overrides) (Runtime, error) {
 			modelName = provider.DefaultModel
 		}
 	}
+	if err := validateModelForProvider(providerName, modelName); err != nil {
+		return Runtime{}, err
+	}
 	approval := core.ApprovalMode(firstNonEmpty(overrides.Approval, cfg.ApprovalMode))
 	if approval == "" {
 		approval = core.ApprovalConfirm
@@ -109,4 +112,21 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func validateModelForProvider(providerName, model string) error {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return fmt.Errorf("model cannot be empty")
+	}
+	switch providerName {
+	case "openai":
+		if strings.Contains(model, "codex") {
+			return fmt.Errorf("invalid configured model %q for provider %q: IronLark currently uses the OpenAI chat-completions API, so use gpt-5-mini instead", model, providerName)
+		}
+		if strings.Contains(model, "/") {
+			return fmt.Errorf("invalid configured model %q for provider %q: use a raw OpenAI model ID like gpt-5-mini or gpt-4.1-mini", model, providerName)
+		}
+	}
+	return nil
 }

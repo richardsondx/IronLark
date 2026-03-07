@@ -191,7 +191,7 @@ func runInteractiveInit(flags *rootFlags) error {
 
 	application.Renderer.Message(fmt.Sprintf("Config saved to %s", application.Loaded.Paths.ConfigPath))
 	application.Renderer.Message(fmt.Sprintf("OpenAI key saved to %s", application.Loaded.Paths.EnvPath))
-	application.Renderer.Message(`Next: lk "why is nginx failing?"`)
+	application.Renderer.Message(`Next: lk "what can you help me do on this server?"`)
 	return nil
 }
 
