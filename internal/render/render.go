@@ -22,16 +22,47 @@ type Renderer struct {
 	Err   io.Writer
 	JSON  bool
 	Color bool
+	rawIn *os.File
+}
+
+type UI interface {
+	Snapshot(snapshot ctxpkg.Snapshot) error
+	Response(response core.LLMResponse) error
+	PlannedActions(actions []core.Action, previews []core.RiskReport)
+	ActionProgress(action core.Action)
+	ApprovalPrompt(action core.Action, report core.RiskReport)
+	Result(result core.ActionResult)
+	BeginThinking(label string)
+	EndThinking()
+	SetInteraction(mode core.InteractionMode)
+	SetApproval(mode core.ApprovalMode)
+	SetSecretVisibility(visible bool)
+	SecretVisibility() string
+	ClearScreen()
+	Sessions(records []sessions.Record) error
+	Patches(records []patches.Record) error
+	Checkpoints(records []checkpoints.Record) error
+	PromptChoice() (string, error)
+	PromptApprovalChoice() (string, error)
+	CollectUserInput(action core.Action) (core.ActionResult, error)
+	Confirm(label string, double bool) (bool, error)
+	ReadPrompt(prefix string) (string, error)
+	Message(text string)
+	MessageJSON(v any) error
 }
 
 func New(in io.Reader, out, err io.Writer, jsonOutput bool, colorMode string) *Renderer {
-	return &Renderer{
+	renderer := &Renderer{
 		In:    bufio.NewReader(in),
 		Out:   out,
 		Err:   err,
 		JSON:  jsonOutput,
 		Color: shouldUseColor(out, jsonOutput, colorMode),
 	}
+	if file, ok := in.(*os.File); ok {
+		renderer.rawIn = file
+	}
+	return renderer
 }
 
 func (r *Renderer) Snapshot(snapshot ctxpkg.Snapshot) error {
@@ -191,6 +222,20 @@ func (r *Renderer) Result(result core.ActionResult) {
 	}
 }
 
+func (r *Renderer) BeginThinking(label string) {}
+
+func (r *Renderer) EndThinking() {}
+
+func (r *Renderer) SetInteraction(mode core.InteractionMode) {}
+
+func (r *Renderer) SetApproval(mode core.ApprovalMode) {}
+
+func (r *Renderer) SetSecretVisibility(visible bool) {}
+
+func (r *Renderer) SecretVisibility() string { return "visible" }
+
+func (r *Renderer) ClearScreen() {}
+
 func (r *Renderer) Sessions(records []sessions.Record) error {
 	if r.JSON {
 		return r.encode(records)
@@ -237,6 +282,62 @@ func (r *Renderer) PromptApprovalChoice() (string, error) {
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), "Deny once")
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Cancel")
 	return r.readLine(r.prompt("> "))
+}
+
+func (r *Renderer) CollectUserInput(action core.Action) (core.ActionResult, error) {
+	result := core.ActionResult{
+		Action:      action,
+		Approved:    true,
+		InputKind:   action.InputKind,
+		FieldKey:    action.FieldKey,
+		IsSensitive: action.InputKind == core.InputSecret,
+	}
+
+	if !r.JSON {
+		fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Input needed"))
+		label := strings.TrimSpace(firstNonEmpty(action.Prompt, action.Title, action.Reason))
+		if label != "" {
+			fmt.Fprintf(r.Out, "%s: %s\n", r.label("Prompt"), label)
+		}
+		if action.Reason != "" && action.Reason != action.Prompt {
+			fmt.Fprintf(r.Out, "%s: %s\n", r.label("Why"), action.Reason)
+		}
+		if action.Clarification != "" {
+			fmt.Fprintf(r.Out, "%s: %s\n", r.label("Note"), action.Clarification)
+		}
+		if action.DestinationHint != "" {
+			fmt.Fprintf(r.Out, "%s: %s\n", r.label("Next"), action.DestinationHint)
+		}
+		if action.Placeholder != "" && action.InputKind != core.InputSecret {
+			fmt.Fprintf(r.Out, "%s: %s\n", r.label("Example"), action.Placeholder)
+		}
+		fmt.Fprintf(r.Out, "%s:\n", r.label("Options"))
+		fmt.Fprintf(r.Out, "  %s %s\n", r.accent("Enter"), "submit typed input, or skip if blank")
+		fmt.Fprintf(r.Out, "  %s %s\n", r.accent("/"), "ask a follow-up or add clarification")
+	}
+
+	input, mode, err := r.readUserInputAction(action)
+	if err != nil {
+		return core.ActionResult{}, err
+	}
+	result.ResponseMode = mode
+	result.InputValue = input
+	switch mode {
+	case core.InputResponseSkipped:
+		result.Skipped = true
+		result.Summary = "user skipped input"
+	case core.InputResponseFollowUp:
+		result.Summary = "user added follow-up clarification"
+	default:
+		if action.InputKind == core.InputSecret {
+			result.Summary = "user provided secret input"
+		} else if action.InputKind == core.InputConfirm && strings.EqualFold(strings.TrimSpace(input), "yes") {
+			result.Summary = "user confirmed"
+		} else {
+			result.Summary = "user provided input"
+		}
+	}
+	return result, nil
 }
 
 func (r *Renderer) Confirm(label string, double bool) (bool, error) {
@@ -286,6 +387,54 @@ func (r *Renderer) readLine(prefix string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+func (r *Renderer) readUserInputAction(action core.Action) (string, core.InputResponseMode, error) {
+	for {
+		if action.InputKind == core.InputSecret {
+			value, err := r.readSecretLine(r.prompt("> "))
+			if err != nil {
+				return "", "", err
+			}
+			if value == "" {
+				return "", core.InputResponseSkipped, nil
+			}
+			if value == "/" || value == "?" {
+				followUp, err := r.readLine(r.prompt("clarify> "))
+				if err != nil {
+					return "", "", err
+				}
+				return followUp, core.InputResponseFollowUp, nil
+			}
+			return value, core.InputResponseSubmitted, nil
+		}
+
+		value, err := r.readLine(r.prompt("> "))
+		if err != nil {
+			return "", "", err
+		}
+		if value == "/" || value == "?" {
+			followUp, err := r.readLine(r.prompt("clarify> "))
+			if err != nil {
+				return "", "", err
+			}
+			return followUp, core.InputResponseFollowUp, nil
+		}
+		if strings.TrimSpace(value) == "" {
+			return "", core.InputResponseSkipped, nil
+		}
+		if action.InputKind == core.InputConfirm {
+			if strings.EqualFold(value, "y") || strings.EqualFold(value, "yes") {
+				return "yes", core.InputResponseSubmitted, nil
+			}
+			return value, core.InputResponseFollowUp, nil
+		}
+		return value, core.InputResponseSubmitted, nil
+	}
+}
+
+func (r *Renderer) readSecretLine(prefix string) (string, error) {
+	return r.readLine(prefix)
 }
 
 func (r *Renderer) formatDiffLine(line string) string {

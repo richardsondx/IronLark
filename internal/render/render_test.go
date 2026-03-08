@@ -142,3 +142,75 @@ func TestShouldUseColorForceOverridesNoColor(t *testing.T) {
 		t.Fatal("expected FORCE_COLOR to override NO_COLOR")
 	}
 }
+
+func TestCollectUserInputTreatsEmptyEnterAsSkip(t *testing.T) {
+	var out bytes.Buffer
+	r := &Renderer{
+		In:  bufio.NewReader(strings.NewReader("\n")),
+		Out: &out,
+	}
+
+	result, err := r.CollectUserInput(core.Action{
+		Type:         core.ActionAskUser,
+		InputKind:    core.InputText,
+		FieldKey:     "token",
+		Prompt:       "Paste the token",
+		Alternatives: []string{"submit", "skip", "follow_up"},
+	})
+	if err != nil {
+		t.Fatalf("CollectUserInput() error = %v", err)
+	}
+	if result.ResponseMode != core.InputResponseSkipped {
+		t.Fatalf("expected skip response, got %q", result.ResponseMode)
+	}
+}
+
+func TestCollectUserInputSupportsFollowUpShortcut(t *testing.T) {
+	var out bytes.Buffer
+	r := &Renderer{
+		In:  bufio.NewReader(strings.NewReader("/\nI need the docs URL first\n")),
+		Out: &out,
+	}
+
+	result, err := r.CollectUserInput(core.Action{
+		Type:         core.ActionAskUser,
+		InputKind:    core.InputText,
+		FieldKey:     "token",
+		Prompt:       "Paste the token",
+		Alternatives: []string{"submit", "skip", "follow_up"},
+	})
+	if err != nil {
+		t.Fatalf("CollectUserInput() error = %v", err)
+	}
+	if result.ResponseMode != core.InputResponseFollowUp {
+		t.Fatalf("expected follow-up response, got %q", result.ResponseMode)
+	}
+	if result.InputValue != "I need the docs URL first" {
+		t.Fatalf("unexpected follow-up value %q", result.InputValue)
+	}
+}
+
+func TestCollectUserInputSecretDoesNotRedactBufferedValue(t *testing.T) {
+	var out bytes.Buffer
+	r := &Renderer{
+		In:  bufio.NewReader(strings.NewReader("super-secret\n")),
+		Out: &out,
+	}
+
+	result, err := r.CollectUserInput(core.Action{
+		Type:         core.ActionAskUser,
+		InputKind:    core.InputSecret,
+		FieldKey:     "api_key",
+		Prompt:       "Paste the API key",
+		Alternatives: []string{"submit", "skip", "follow_up"},
+	})
+	if err != nil {
+		t.Fatalf("CollectUserInput() error = %v", err)
+	}
+	if result.InputValue != "super-secret" {
+		t.Fatalf("unexpected secret value %q", result.InputValue)
+	}
+	if strings.Contains(out.String(), "[secret]") {
+		t.Fatalf("expected no secret redaction marker, got %q", out.String())
+	}
+}

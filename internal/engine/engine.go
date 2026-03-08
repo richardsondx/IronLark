@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/richardsondx/IronLark/internal/agent"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
@@ -24,7 +25,8 @@ type Engine struct {
 	Collector   *ctxpkg.Collector
 	Executor    *executor.Executor
 	Provider    provider.Client
-	Renderer    *render.Renderer
+	Renderer    render.UI
+	Agents      agent.Store
 	Sessions    sessions.Store
 	Threads     threads.Store
 	PolicyStore policy.Store
@@ -64,12 +66,14 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		maxTurns = 5
 	}
 	for turn := 0; turn < maxTurns; turn++ {
+		e.Renderer.BeginThinking(e.thinkingLabel())
 		response, err := e.Provider.Generate(ctx, provider.Request{
 			Model:       e.Runtime.Model,
 			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 			Messages:    history,
 			Temperature: 0.1,
 		})
+		e.Renderer.EndThinking()
 		if err != nil {
 			return err
 		}
@@ -110,7 +114,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		if err != nil {
 			return err
 		}
-		record.Results = append(record.Results, results...)
+		record.Results = append(record.Results, sanitizeResults(results)...)
 		if hasErrors(results) {
 			consecutiveFailures++
 		} else {
@@ -126,16 +130,11 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		if stop || len(results) == 0 || reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures) {
 			break
 		}
-		resultsJSON, _ := json.Marshal(results)
-		history = append(history, core.ConversationMessage{
-			Role: "user",
-			Content: "Action results:\n" + string(resultsJSON) +
-				"\nIf the issue is resolved, finish. Otherwise propose the next smallest safe step.",
-		})
+		history = append(history, buildContinuationMessage(results))
 	}
 
 	record.Summary = finalSummary
-	record.Messages = history
+	record.Messages = sanitizeMessages(history)
 	record.FinishedAt = time.Now().UTC()
 	if err := e.Sessions.Save(record); err != nil {
 		return err
@@ -197,6 +196,50 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 			args := parts[1:]
 
 			switch cmd {
+			case "/mode":
+				if len(args) > 0 {
+					mode := core.InteractionMode(args[0])
+					if !mode.Valid() {
+						e.Renderer.Message(fmt.Sprintf("Invalid mode: %s. Use execute-first or plan-first.", args[0]))
+						continue
+					}
+					e.Runtime.Interaction = mode
+					e.Renderer.SetInteraction(mode)
+					e.Renderer.Message(fmt.Sprintf("Interaction mode set to: %s", e.Runtime.Interaction))
+				} else {
+					e.Renderer.Message(fmt.Sprintf("Current interaction mode: %s. Use /mode <execute-first|plan-first> to change.", e.Runtime.Interaction))
+				}
+				continue
+			case "/approval":
+				if len(args) > 0 {
+					mode := core.ApprovalMode(args[0])
+					if !mode.Valid() {
+						e.Renderer.Message(fmt.Sprintf("Invalid approval mode: %s. Use confirm, auto-safe, agent, or suggest.", args[0]))
+						continue
+					}
+					e.Runtime.ApprovalMode = mode
+					e.Renderer.SetApproval(mode)
+					e.Renderer.Message(fmt.Sprintf("Approval mode set to: %s", e.Runtime.ApprovalMode))
+				} else {
+					e.Renderer.Message(fmt.Sprintf("Current approval mode: %s. Use /approval <confirm|auto-safe|agent|suggest> to change.", e.Runtime.ApprovalMode))
+				}
+				continue
+			case "/secret":
+				if len(args) > 0 {
+					switch args[0] {
+					case "visible":
+						e.Renderer.SetSecretVisibility(true)
+						e.Renderer.Message("Secret input visibility set to: visible")
+					case "hidden":
+						e.Renderer.SetSecretVisibility(false)
+						e.Renderer.Message("Secret input visibility set to: hidden")
+					default:
+						e.Renderer.Message(fmt.Sprintf("Invalid secret visibility: %s. Use visible or hidden.", args[0]))
+					}
+				} else {
+					e.Renderer.Message(fmt.Sprintf("Current secret input visibility: %s. Use /secret <visible|hidden> to change.", e.Renderer.SecretVisibility()))
+				}
+				continue
 			case "/model":
 				if len(args) > 0 {
 					e.Runtime.Model = args[0]
@@ -230,10 +273,11 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 				continue
 			case "/clear":
 				history = nil
+				e.Renderer.ClearScreen()
 				e.Renderer.Message("Chat history cleared. Starting fresh.")
 				continue
 			case "/help":
-				e.Renderer.Message("Available slash commands:\n  /model [name]    - Get or set the current model\n  /provider [name] - Get or set the current provider\n  /clear           - Clear the conversation history\n  /help            - Show this menu")
+				e.Renderer.Message("Available slash commands:\n  /mode [name]      - Get or set execute-first / plan-first\n  /approval [name]  - Get or set confirm / auto-safe / agent / suggest\n  /secret [state]   - Get or set secret input visibility\n  /model [name]     - Get or set the current model\n  /provider [name]  - Get or set the current provider\n  /clear            - Clear the conversation history\n  /help             - Show this menu")
 				continue
 			default:
 				e.Renderer.Message(fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", cmd))
@@ -264,12 +308,14 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 		Role:    "user",
 		Content: buildInitialPrompt(prompt, snapshot),
 	})
+	e.Renderer.BeginThinking(e.thinkingLabel())
 	response, err := e.Provider.Generate(ctx, provider.Request{
 		Model:       e.Runtime.Model,
 		System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 		Messages:    *history,
 		Temperature: 0.1,
 	})
+	e.Renderer.EndThinking()
 	if err != nil {
 		return err
 	}
@@ -287,21 +333,16 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	if err != nil {
 		return err
 	}
-	record.Results = append(record.Results, results...)
+	record.Results = append(record.Results, sanitizeResults(results)...)
 	rawResponse, _ := json.Marshal(response)
 	*history = append(*history, core.ConversationMessage{
 		Role:    "assistant",
 		Content: string(rawResponse),
 	})
 	if len(results) > 0 {
-		resultsJSON, _ := json.Marshal(results)
-		*history = append(*history, core.ConversationMessage{
-			Role: "user",
-			Content: "Action results:\n" + string(resultsJSON) +
-				"\nSummarize the outcome briefly and only ask for more actions if needed.",
-		})
+		*history = append(*history, buildContinuationMessage(results))
 	}
-	record.Messages = *history
+	record.Messages = sanitizeMessages(*history)
 	record.FinishedAt = time.Now().UTC()
 	if err := e.Sessions.Save(*record); err != nil {
 		return err
@@ -382,17 +423,15 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			continue
 		}
 		if action.Type == core.ActionAskUser {
-			answer, err := e.Renderer.ReadPrompt(action.Reason + ": ")
+			result, err := e.Renderer.CollectUserInput(action)
 			if err != nil {
 				return results, false, err
 			}
-			results = append(results, core.ActionResult{
-				Action:   action,
-				Risk:     report,
-				Approved: true,
-				Stdout:   answer,
-				Summary:  answer,
-			})
+			result.Action = action
+			result.Risk = report
+			result.Approved = true
+			e.Renderer.Result(redactActionResult(result))
+			results = append(results, result)
 			continue
 		}
 		if match.Matched && match.Decision == policy.DecisionDeny {
@@ -531,6 +570,104 @@ func reachedFailureLimit(current, limit int) bool {
 		limit = 2
 	}
 	return current >= limit
+}
+
+func buildContinuationMessage(results []core.ActionResult) core.ConversationMessage {
+	if followUp := findFollowUp(results); followUp != nil {
+		return core.ConversationMessage{
+			Role: "user",
+			Content: fmt.Sprintf("User follow-up while blocked:\nfield=%s\nkind=%s\nmessage=%s\nContinue the task using this clarification and only ask for another blocker if still required.",
+				followUp.FieldKey,
+				followUp.InputKind,
+				followUp.InputValue,
+			),
+		}
+	}
+	resultsJSON, _ := json.Marshal(results)
+	return core.ConversationMessage{
+		Role: "user",
+		Content: "Action results:\n" + string(resultsJSON) +
+			"\nIf the issue is resolved, finish. Otherwise propose the next smallest safe step.",
+	}
+}
+
+func findFollowUp(results []core.ActionResult) *core.ActionResult {
+	for i := range results {
+		if results[i].ResponseMode == core.InputResponseFollowUp {
+			return &results[i]
+		}
+	}
+	return nil
+}
+
+func sanitizeResults(results []core.ActionResult) []core.ActionResult {
+	out := make([]core.ActionResult, 0, len(results))
+	for _, result := range results {
+		out = append(out, redactActionResult(result))
+	}
+	return out
+}
+
+func sanitizeMessages(history []core.ConversationMessage) []core.ConversationMessage {
+	out := make([]core.ConversationMessage, 0, len(history))
+	for _, msg := range history {
+		if msg.Role == "user" && strings.Contains(msg.Content, "Action results:\n") {
+			prefix := "Action results:\n"
+			body := strings.TrimPrefix(msg.Content, prefix)
+			if idx := strings.Index(body, "\nIf the issue is resolved"); idx >= 0 {
+				resultsJSON := body[:idx]
+				var results []core.ActionResult
+				if err := json.Unmarshal([]byte(resultsJSON), &results); err == nil {
+					safeJSON, _ := json.Marshal(sanitizeResults(results))
+					msg.Content = prefix + string(safeJSON) + body[idx:]
+				}
+			}
+		}
+		if strings.Contains(msg.Content, "User follow-up while blocked:") {
+			msg.Content = strings.ReplaceAll(msg.Content, "[secret]", "[secret]")
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+func redactActionResult(result core.ActionResult) core.ActionResult {
+	if !result.IsSensitive {
+		return result
+	}
+	result.InputValue = "[secret]"
+	if result.Stdout != "" {
+		result.Stdout = "[secret]"
+	}
+	if result.Stderr != "" {
+		result.Stderr = "[secret]"
+	}
+	if result.Error != "" {
+		result.Error = "[secret]"
+	}
+	result.Summary = blockerSummaryForStorage(result)
+	return result
+}
+
+func blockerSummaryForStorage(result core.ActionResult) string {
+	switch result.ResponseMode {
+	case core.InputResponseSkipped:
+		return "user skipped input"
+	case core.InputResponseFollowUp:
+		return "user added follow-up clarification"
+	default:
+		if result.IsSensitive {
+			return "user provided secret input"
+		}
+		return result.Summary
+	}
+}
+
+func (e *Engine) thinkingLabel() string {
+	if e.Runtime.Interaction == core.InteractionPlanFirst {
+		return "Planning..."
+	}
+	return "Thinking..."
 }
 
 func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot) string {

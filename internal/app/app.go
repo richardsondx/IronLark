@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/richardsondx/IronLark/internal/agent"
 	"github.com/richardsondx/IronLark/internal/checkpoints"
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
@@ -25,8 +26,9 @@ type App struct {
 	Runtime     state.Runtime
 	Collector   *ctxpkg.Collector
 	Executor    *executor.Executor
-	Renderer    *render.Renderer
+	Renderer    render.UI
 	Provider    provider.Client
+	Agents      agent.Store
 	Sessions    sessions.Store
 	Threads     threads.Store
 	PolicyStore policy.Store
@@ -83,6 +85,7 @@ func New(overrides state.Overrides) (*App, error) {
 			WebSearchResults:   runtimeState.Config.Tools.WebSearchResults,
 		},
 		Renderer:    renderer,
+		Agents:      agent.Store{Dir: loaded.Paths.AgentDir},
 		Sessions:    sessions.Store{Dir: loaded.Paths.SessionsDir},
 		Threads:     threads.Store{Dir: loaded.Paths.ThreadsDir},
 		PolicyStore: policy.Store{Path: loaded.Paths.PolicyPath},
@@ -107,6 +110,7 @@ func (a *App) Engine() *engine.Engine {
 		Executor:    a.Executor,
 		Provider:    a.Provider,
 		Renderer:    a.Renderer,
+		Agents:      a.Agents,
 		Sessions:    a.Sessions,
 		Threads:     a.Threads,
 		PolicyStore: a.PolicyStore,

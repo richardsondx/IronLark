@@ -80,6 +80,22 @@ func TestSetValueSupportsInteractionMode(t *testing.T) {
 	}
 }
 
+func TestSetValueSupportsAgentFields(t *testing.T) {
+	cfg := Config{}
+	if err := SetValue(&cfg, "agent.session_prefix", "remote"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "agent.compact_mode_rows", "26"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent.SessionPrefix != "remote" {
+		t.Fatalf("unexpected agent session prefix %q", cfg.Agent.SessionPrefix)
+	}
+	if cfg.Agent.CompactModeRows != 26 {
+		t.Fatalf("unexpected compact mode rows %d", cfg.Agent.CompactModeRows)
+	}
+}
+
 func TestUpsertEnvValueCreatesAndUpdatesEnvFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := UpsertEnvValue(path, "OPENAI_API_KEY", "one"); err != nil {

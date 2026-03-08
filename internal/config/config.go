@@ -18,6 +18,7 @@ type Config struct {
 	DefaultProfile  string                    `yaml:"default_profile,omitempty"`
 	ApprovalMode    string                    `yaml:"approval_mode,omitempty"`
 	InteractionMode string                    `yaml:"interaction_mode,omitempty"`
+	Agent           AgentConfig               `yaml:"agent,omitempty"`
 	Context         ContextConfig             `yaml:"context,omitempty"`
 	Thread          ThreadConfig              `yaml:"thread,omitempty"`
 	Tools           ToolConfig                `yaml:"tools,omitempty"`
@@ -48,6 +49,12 @@ type ContextConfig struct {
 	MaxSTDINBytes         int  `yaml:"max_stdin_bytes,omitempty"`
 	MaxActions            int  `yaml:"max_actions,omitempty"`
 	MaxListEntries        int  `yaml:"max_list_entries,omitempty"`
+}
+
+type AgentConfig struct {
+	SessionPrefix   string `yaml:"session_prefix,omitempty"`
+	AttachPolicy    string `yaml:"attach_policy,omitempty"`
+	CompactModeRows int    `yaml:"compact_mode_rows,omitempty"`
 }
 
 type ThreadConfig struct {
@@ -99,6 +106,7 @@ type Paths struct {
 	ProjectEnvPath    string
 	SessionsDir       string
 	ThreadsDir        string
+	AgentDir          string
 	PolicyPath        string
 	PatchesDir        string
 	CheckpointsDir    string
@@ -120,6 +128,11 @@ func DefaultConfig() Config {
 		DefaultProfile:  "strong",
 		ApprovalMode:    "confirm",
 		InteractionMode: "execute-first",
+		Agent: AgentConfig{
+			SessionPrefix:   "ironlark",
+			AttachPolicy:    "host-cwd",
+			CompactModeRows: 28,
+		},
 		Context: ContextConfig{
 			AutoCollect:           true,
 			MaxFileBytes:          64 * 1024,
@@ -214,6 +227,7 @@ func ResolvePaths(cwd string) (Paths, error) {
 		ProjectEnvPath:    filepath.Join(cwd, ".env"),
 		SessionsDir:       filepath.Join(dataHome, "lark", "sessions"),
 		ThreadsDir:        filepath.Join(dataHome, "lark", "threads"),
+		AgentDir:          filepath.Join(dataHome, "lark", "agents"),
 		PolicyPath:        filepath.Join(dataHome, "lark", "policy.json"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
@@ -225,6 +239,7 @@ func EnsureDirs(paths Paths) error {
 		filepath.Dir(paths.ConfigPath),
 		paths.SessionsDir,
 		paths.ThreadsDir,
+		paths.AgentDir,
 		paths.PatchesDir,
 		paths.CheckpointsDir,
 	}
@@ -330,6 +345,15 @@ func mergeConfig(base Config, override Config) Config {
 	}
 	if override.InteractionMode != "" {
 		out.InteractionMode = override.InteractionMode
+	}
+	if override.Agent.SessionPrefix != "" {
+		out.Agent.SessionPrefix = override.Agent.SessionPrefix
+	}
+	if override.Agent.AttachPolicy != "" {
+		out.Agent.AttachPolicy = override.Agent.AttachPolicy
+	}
+	if override.Agent.CompactModeRows != 0 {
+		out.Agent.CompactModeRows = override.Agent.CompactModeRows
 	}
 	if override.Context.MaxFileBytes != 0 {
 		out.Context.MaxFileBytes = override.Context.MaxFileBytes
@@ -444,6 +468,12 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.ApprovalMode = value
 	case "interaction_mode":
 		cfg.InteractionMode = value
+	case "agent.session_prefix":
+		cfg.Agent.SessionPrefix = value
+	case "agent.attach_policy":
+		cfg.Agent.AttachPolicy = value
+	case "agent.compact_mode_rows":
+		cfg.Agent.CompactModeRows = parseInt(value)
 	case "thread.enabled":
 		cfg.Thread.Enabled = boolPtr(parseBool(value))
 	case "thread.scope":

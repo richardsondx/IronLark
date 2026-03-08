@@ -79,6 +79,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(&flags.plan, "plan", false, "show a visible plan before execution")
 
 	cmd.AddCommand(newChatCommand(flags))
+	cmd.AddCommand(newAgentCommand(flags))
 	cmd.AddCommand(newPlanCommand(flags))
 	cmd.AddCommand(newContextCommand(flags))
 	cmd.AddCommand(newPolicyCommand(flags))

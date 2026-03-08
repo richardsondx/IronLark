@@ -59,6 +59,31 @@ const (
 	ActionPatch    = ActionEditFile
 )
 
+type InputKind string
+
+const (
+	InputText       InputKind = "text"
+	InputSecret     InputKind = "secret"
+	InputConfirm    InputKind = "confirm"
+	InputManualWait InputKind = "manual_wait"
+)
+
+type InputAlternative string
+
+const (
+	InputAlternativeSubmit   InputAlternative = "submit"
+	InputAlternativeSkip     InputAlternative = "skip"
+	InputAlternativeFollowUp InputAlternative = "follow_up"
+)
+
+type InputResponseMode string
+
+const (
+	InputResponseSubmitted InputResponseMode = "submitted"
+	InputResponseSkipped   InputResponseMode = "skipped"
+	InputResponseFollowUp  InputResponseMode = "follow_up"
+)
+
 type Action struct {
 	ID               string     `json:"id"`
 	Type             ActionType `json:"type"`
@@ -73,6 +98,14 @@ type Action struct {
 	PatchUnifiedDiff string     `json:"patch_unified_diff,omitempty"`
 	CWD              string     `json:"cwd,omitempty"`
 	TimeoutSec       int        `json:"timeout_sec,omitempty"`
+	InputKind        InputKind  `json:"input_kind,omitempty"`
+	FieldKey         string     `json:"field_key,omitempty"`
+	Prompt           string     `json:"prompt,omitempty"`
+	Clarification    string     `json:"clarification,omitempty"`
+	Placeholder      string     `json:"placeholder,omitempty"`
+	DestinationHint  string     `json:"destination_hint,omitempty"`
+	ExpectsValue     bool       `json:"expects_value,omitempty"`
+	Alternatives     []string   `json:"alternatives,omitempty"`
 }
 
 type Verification struct {
@@ -110,21 +143,26 @@ type RiskReport struct {
 }
 
 type ActionResult struct {
-	Action       Action     `json:"action"`
-	Risk         RiskReport `json:"risk"`
-	Approved     bool       `json:"approved"`
-	Skipped      bool       `json:"skipped"`
-	Stdout       string     `json:"stdout,omitempty"`
-	Stderr       string     `json:"stderr,omitempty"`
-	Summary      string     `json:"summary,omitempty"`
-	ExitCode     int        `json:"exit_code,omitempty"`
-	DurationMS   int64      `json:"duration_ms,omitempty"`
-	Error        string     `json:"error,omitempty"`
-	PatchID      string     `json:"patch_id,omitempty"`
-	BackupPath   string     `json:"backup_path,omitempty"`
-	CheckpointID string     `json:"checkpoint_id,omitempty"`
-	StartedAt    time.Time  `json:"started_at"`
-	FinishedAt   time.Time  `json:"finished_at"`
+	Action       Action            `json:"action"`
+	Risk         RiskReport        `json:"risk"`
+	Approved     bool              `json:"approved"`
+	Skipped      bool              `json:"skipped"`
+	Stdout       string            `json:"stdout,omitempty"`
+	Stderr       string            `json:"stderr,omitempty"`
+	Summary      string            `json:"summary,omitempty"`
+	ExitCode     int               `json:"exit_code,omitempty"`
+	DurationMS   int64             `json:"duration_ms,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	PatchID      string            `json:"patch_id,omitempty"`
+	BackupPath   string            `json:"backup_path,omitempty"`
+	CheckpointID string            `json:"checkpoint_id,omitempty"`
+	InputKind    InputKind         `json:"input_kind,omitempty"`
+	FieldKey     string            `json:"field_key,omitempty"`
+	ResponseMode InputResponseMode `json:"response_mode,omitempty"`
+	InputValue   string            `json:"input_value,omitempty"`
+	IsSensitive  bool              `json:"is_sensitive,omitempty"`
+	StartedAt    time.Time         `json:"started_at"`
+	FinishedAt   time.Time         `json:"finished_at"`
 }
 
 type ConversationMessage struct {

@@ -60,7 +60,15 @@ Expected JSON Schema:
       "query": "search or fetch query",
       "pattern": "exact or regex search text for search_files",
       "glob": "optional file glob filter for search_files",
-      "patch_unified_diff": "diff (for edit_file)"
+      "patch_unified_diff": "diff (for edit_file)",
+      "input_kind": "text|secret|confirm|manual_wait (for ask_user)",
+      "field_key": "stable key for the missing value (for ask_user)",
+      "prompt": "short question shown to the user (for ask_user)",
+      "clarification": "optional one-line note if the ask is not obvious",
+      "placeholder": "optional example value if helpful",
+      "destination_hint": "optional note about what IronLark will do with the value next",
+      "expects_value": true,
+      "alternatives": ["submit","skip","follow_up"]
     }
   ],
   "verification": [
@@ -84,6 +92,14 @@ Prefer bounded read-only actions first. Search before reading, read before editi
 Use semantic_search when exact search_files results are weak or absent.
 Use fetch_rules when project instructions or rule files may affect behavior.
 Create a checkpoint before risky multi-step edits or when a rollback would matter.
+Use ask_user only when you are blocked on information or a manual step the terminal cannot perform.
+When using ask_user, ask for exactly one blocker at a time.
+For tokens, passwords, API keys, or secrets, set input_kind to "secret".
+For off-terminal tasks such as visiting a dashboard, talking to BotFather, or copying a returned token, set input_kind to "manual_wait".
+Keep clarification to one short sentence only when needed.
+Always include field_key, prompt, and alternatives for ask_user actions.
+If the user skipped a blocker in the prior action results, adapt or explain the consequence instead of asking the same blocker again without new context.
+If the user sent a follow-up clarification in the prior action results, treat that as a high-priority instruction and continue the task.
 Never suggest destructive actions unless absolutely necessary.
 For file edits, patch_unified_diff must be a standard unified diff only.
 Do not use Codex apply_patch format such as "*** Begin Patch", "*** Update File:", or "*** End Patch".
@@ -103,6 +119,23 @@ func ParseResponse(raw string) (core.LLMResponse, error) {
 	var response core.LLMResponse
 	if err := json.Unmarshal([]byte(trimmed), &response); err != nil {
 		return core.LLMResponse{}, fmt.Errorf("decode provider response: %w", err)
+	}
+	for _, action := range response.Actions {
+		if action.Type != core.ActionAskUser {
+			continue
+		}
+		if action.InputKind == "" {
+			return core.LLMResponse{}, fmt.Errorf("decode provider response: ask_user action %q missing input_kind", action.ID)
+		}
+		if strings.TrimSpace(action.FieldKey) == "" {
+			return core.LLMResponse{}, fmt.Errorf("decode provider response: ask_user action %q missing field_key", action.ID)
+		}
+		if strings.TrimSpace(action.Prompt) == "" {
+			return core.LLMResponse{}, fmt.Errorf("decode provider response: ask_user action %q missing prompt", action.ID)
+		}
+		if len(action.Alternatives) == 0 {
+			return core.LLMResponse{}, fmt.Errorf("decode provider response: ask_user action %q missing alternatives", action.ID)
+		}
 	}
 	return response, nil
 }
