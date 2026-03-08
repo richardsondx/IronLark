@@ -500,13 +500,15 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 		}
 
 		result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst)
+		if !stop {
+			results = append(results, result)
+		}
 		if err != nil {
 			return results, false, nil
 		}
 		if stop {
 			return results, true, nil
 		}
-		results = append(results, result)
 	}
 
 	if len(response.Verification) > 0 {
@@ -530,10 +532,12 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 				return results, false, err
 			}
 			result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, false)
+			if !stop {
+				results = append(results, result)
+			}
 			if err != nil {
 				return results, false, nil
 			}
-			results = append(results, result)
 			if stop {
 				return results, true, nil
 			}
