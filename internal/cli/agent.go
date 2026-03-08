@@ -148,7 +148,7 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 				Interaction:   application.Runtime.Interaction,
 				PolicyStore:   application.PolicyStore,
 			})
-			defer fmt.Fprint(os.Stdout, "\033[?1049l")
+			defer fmt.Fprint(os.Stdout, "\033[?25h\033[?2004l\033[?1049l")
 			application.Renderer.Message("Remote operator workspace ready.")
 			if err := application.Agents.Save(workspace); err != nil {
 				return err

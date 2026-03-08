@@ -70,7 +70,7 @@ func TestDrawLockedLimitsTranscriptToViewportHeightWhenScrolled(t *testing.T) {
 	output := renderer.Out.(*bytes.Buffer).String()
 	renderer.mu.Unlock()
 
-	if count := strings.Count(output, "\rline\r\n"); count != 8 {
+	if count := strings.Count(output, "line\033[K"); count != 8 {
 		t.Fatalf("expected 8 visible transcript lines, got %d in output %q", count, output)
 	}
 }
@@ -89,11 +89,46 @@ func TestDrawLockedKeepsCursorOnPromptLine(t *testing.T) {
 	output := renderer.Out.(*bytes.Buffer).String()
 	renderer.mu.Unlock()
 
-	if !strings.Contains(output, "\r> \r\n") {
+	if !strings.Contains(output, "> \033[K") {
 		t.Fatalf("expected output to contain prompt line before footer, got %q", output)
 	}
-	if !strings.HasSuffix(output, "\r IronLark Agent                                               \"srv-1\"  thread-1 ") {
+	if !strings.HasSuffix(output, "\033[24;1H") {
+		t.Fatalf("expected output to end by positioning the cursor on the last row, got %q", output)
+	}
+	if !strings.Contains(output, "IronLark Agent") {
 		t.Fatalf("expected output to end on footer line, got %q", output)
+	}
+}
+
+func TestDrawLockedAvoidsFullClearOnIncrementalRedraw(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+
+	renderer.mu.Lock()
+	renderer.Out = &bytes.Buffer{}
+	renderer.composer = []rune("hello")
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("first drawLocked() error = %v", err)
+	}
+	first := renderer.Out.(*bytes.Buffer).String()
+	renderer.Out = &bytes.Buffer{}
+	renderer.composer = []rune("hello!")
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("second drawLocked() error = %v", err)
+	}
+	second := renderer.Out.(*bytes.Buffer).String()
+	renderer.mu.Unlock()
+
+	if !strings.Contains(first, "\033[H\033[2J") {
+		t.Fatalf("expected initial full clear, got %q", first)
+	}
+	if strings.Contains(second, "\033[H\033[2J") {
+		t.Fatalf("expected incremental redraw without full clear, got %q", second)
+	}
+	if !strings.Contains(second, "hello!") {
+		t.Fatalf("expected updated prompt content in incremental redraw, got %q", second)
 	}
 }
 

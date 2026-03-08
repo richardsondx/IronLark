@@ -378,6 +378,59 @@ func TestRunTaskInjectsGraphDigestIntoPrompt(t *testing.T) {
 	}
 }
 
+func TestVerificationRespectsApprovalFlow(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{approvalChoices: []string{"1"}}
+	engine.Renderer = renderer
+	response := core.LLMResponse{
+		Summary: "Verify service.",
+		Verification: []core.Verification{{
+			Type:        core.ActionRunShell,
+			Command:     "curl -I http://127.0.0.1:3000",
+			SuccessHint: "verify HTTP is reachable",
+		}},
+	}
+
+	results, _, err := engine.executeTurn(context.Background(), response)
+	if err != nil {
+		t.Fatalf("executeTurn() error = %v", err)
+	}
+	if renderer.approvalPromptCalls == 0 {
+		t.Fatal("expected verification to request approval")
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one verification result, got %d", len(results))
+	}
+	if results[0].Summary == "blocked by read-only mode" {
+		t.Fatalf("expected verification to stop using forced read-only path, got %#v", results[0])
+	}
+}
+
+func TestVerificationCanBeDeniedByUser(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{approvalChoices: []string{"3"}}
+	engine.Renderer = renderer
+	response := core.LLMResponse{
+		Summary: "Verify service.",
+		Verification: []core.Verification{{
+			Type:        core.ActionRunShell,
+			Command:     "curl -I http://127.0.0.1:3000",
+			SuccessHint: "verify HTTP is reachable",
+		}},
+	}
+
+	results, _, err := engine.executeTurn(context.Background(), response)
+	if err != nil {
+		t.Fatalf("executeTurn() error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one verification result, got %d", len(results))
+	}
+	if !results[0].Skipped || results[0].Summary != "user declined action" {
+		t.Fatalf("expected declined verification result, got %#v", results[0])
+	}
+}
+
 func testEngine(t *testing.T, interaction core.InteractionMode) (*Engine, *bytes.Buffer) {
 	t.Helper()
 	root := t.TempDir()
@@ -442,35 +495,48 @@ func (f *fakeProvider) Generate(ctx context.Context, req provider.Request) (core
 }
 
 type trackingRenderer struct {
-	beginCalls      int
-	endCalls        int
-	clearCalls      int
-	lastApproval    core.ApprovalMode
-	lastInteraction core.InteractionMode
-	prompts         []string
-	inputResults    []core.ActionResult
-	blockerActions  []core.Action
-	index           int
+	beginCalls          int
+	endCalls            int
+	clearCalls          int
+	approvalPromptCalls int
+	lastApproval        core.ApprovalMode
+	lastInteraction     core.InteractionMode
+	prompts             []string
+	approvalChoices     []string
+	inputResults        []core.ActionResult
+	blockerActions      []core.Action
+	index               int
 }
 
 func (r *trackingRenderer) Snapshot(snapshot ctxpkg.Snapshot) error                          { return nil }
 func (r *trackingRenderer) Response(response core.LLMResponse) error                         { return nil }
 func (r *trackingRenderer) PlannedActions(actions []core.Action, previews []core.RiskReport) {}
 func (r *trackingRenderer) ActionProgress(action core.Action)                                {}
-func (r *trackingRenderer) ApprovalPrompt(action core.Action, report core.RiskReport)        {}
-func (r *trackingRenderer) Result(result core.ActionResult)                                  {}
-func (r *trackingRenderer) BeginThinking(label string)                                       { r.beginCalls++ }
-func (r *trackingRenderer) EndThinking()                                                     { r.endCalls++ }
-func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)                         { r.lastInteraction = mode }
-func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)                               { r.lastApproval = mode }
-func (r *trackingRenderer) SetSecretVisibility(visible bool)                                 {}
-func (r *trackingRenderer) SecretVisibility() string                                         { return "visible" }
-func (r *trackingRenderer) ClearScreen()                                                     { r.clearCalls++ }
-func (r *trackingRenderer) Sessions(records []sessions.Record) error                         { return nil }
-func (r *trackingRenderer) Patches(records []patches.Record) error                           { return nil }
-func (r *trackingRenderer) Checkpoints(records []checkpoints.Record) error                   { return nil }
-func (r *trackingRenderer) PromptChoice() (string, error)                                    { return "1", nil }
-func (r *trackingRenderer) PromptApprovalChoice() (string, error)                            { return "1", nil }
+func (r *trackingRenderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
+	r.approvalPromptCalls++
+}
+func (r *trackingRenderer) Result(result core.ActionResult)                {}
+func (r *trackingRenderer) BeginThinking(label string)                     { r.beginCalls++ }
+func (r *trackingRenderer) EndThinking()                                   { r.endCalls++ }
+func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)       { r.lastInteraction = mode }
+func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)             { r.lastApproval = mode }
+func (r *trackingRenderer) SetSecretVisibility(visible bool)               {}
+func (r *trackingRenderer) SecretVisibility() string                       { return "visible" }
+func (r *trackingRenderer) ClearScreen()                                   { r.clearCalls++ }
+func (r *trackingRenderer) Sessions(records []sessions.Record) error       { return nil }
+func (r *trackingRenderer) Patches(records []patches.Record) error         { return nil }
+func (r *trackingRenderer) Checkpoints(records []checkpoints.Record) error { return nil }
+func (r *trackingRenderer) PromptChoice() (string, error)                  { return "1", nil }
+func (r *trackingRenderer) PromptApprovalChoice() (string, error) {
+	if len(r.approvalChoices) == 0 {
+		return "1", nil
+	}
+	choice := r.approvalChoices[0]
+	if len(r.approvalChoices) > 1 {
+		r.approvalChoices = r.approvalChoices[1:]
+	}
+	return choice, nil
+}
 func (r *trackingRenderer) CollectUserInput(action core.Action) (core.ActionResult, error) {
 	r.blockerActions = append(r.blockerActions, action)
 	result := r.inputResults[0]

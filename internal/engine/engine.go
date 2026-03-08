@@ -412,7 +412,7 @@ func (e *Engine) generateResponse(ctx context.Context, request provider.Request)
 }
 
 func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]core.ActionResult, bool, error) {
-	if len(response.Actions) == 0 {
+	if len(response.Actions) == 0 && len(response.Verification) == 0 {
 		return nil, true, nil
 	}
 
@@ -499,47 +499,14 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			continue
 		}
 
-		approved := true
-		if e.actionNeedsApproval(action, report, match) {
-			decision, err := e.promptForActionDecision(action, report, strategy)
-			if err != nil {
-				return results, false, err
-			}
-			switch decision {
-			case "allow-once":
-				approved = true
-			case "allow-always":
-				approved = true
-				if _, err := e.PolicyStore.Add(policy.RuleForAction(action, policy.DecisionAllow)); err != nil {
-					return results, false, err
-				}
-			case "deny-once":
-				approved = false
-			case "cancel":
-				return results, true, nil
-			default:
-				approved = false
-			}
-		}
-		if !approved {
-			results = append(results, core.ActionResult{
-				Action:   action,
-				Risk:     report,
-				Skipped:  true,
-				Summary:  "user declined action",
-				Approved: false,
-			})
-			continue
-		}
-		if e.Runtime.Interaction == core.InteractionExecuteFirst && !e.Runtime.JSONOutput {
-			e.Renderer.ActionProgress(action)
-		}
-		result, err := e.Executor.Execute(ctx, action, e.Runtime.ReadOnly)
-		e.Renderer.Result(result)
-		results = append(results, result)
+		result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst)
 		if err != nil {
 			return results, false, nil
 		}
+		if stop {
+			return results, true, nil
+		}
+		results = append(results, result)
 	}
 
 	if len(response.Verification) > 0 {
@@ -554,16 +521,84 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 				Reason:     verify.SuccessHint,
 				TimeoutSec: verify.TimeoutSec,
 			}
-			result, err := e.Executor.Execute(ctx, action, true)
-			e.Renderer.Result(result)
-			results = append(results, result)
+			report, err := e.Executor.Preview(action, e.Runtime.ReadOnly)
 			if err != nil {
-				break
+				return results, false, err
+			}
+			match, err := e.PolicyStore.Evaluate(action)
+			if err != nil {
+				return results, false, err
+			}
+			result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, false)
+			if err != nil {
+				return results, false, nil
+			}
+			results = append(results, result)
+			if stop {
+				return results, true, nil
 			}
 		}
 	}
 
 	return results, false, nil
+}
+
+func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, match policy.Match, strategy string, readOnly bool, showProgress bool) (core.ActionResult, bool, error) {
+	if match.Matched && match.Decision == policy.DecisionDeny {
+		result := core.ActionResult{
+			Action:   action,
+			Risk:     report,
+			Skipped:  true,
+			Summary:  "blocked by machine policy",
+			Approved: false,
+		}
+		if !e.Runtime.JSONOutput {
+			e.Renderer.Result(result)
+		}
+		return result, false, nil
+	}
+
+	approved := true
+	if e.actionNeedsApproval(action, report, match) {
+		decision, err := e.promptForActionDecision(action, report, strategy)
+		if err != nil {
+			return core.ActionResult{}, false, err
+		}
+		switch decision {
+		case "allow-once":
+			approved = true
+		case "allow-always":
+			approved = true
+			if _, err := e.PolicyStore.Add(policy.RuleForAction(action, policy.DecisionAllow)); err != nil {
+				return core.ActionResult{}, false, err
+			}
+		case "deny-once":
+			approved = false
+		case "cancel":
+			return core.ActionResult{}, true, nil
+		default:
+			approved = false
+		}
+	}
+	if !approved {
+		result := core.ActionResult{
+			Action:   action,
+			Risk:     report,
+			Skipped:  true,
+			Summary:  "user declined action",
+			Approved: false,
+		}
+		if !e.Runtime.JSONOutput {
+			e.Renderer.Result(result)
+		}
+		return result, false, nil
+	}
+	if showProgress && !e.Runtime.JSONOutput {
+		e.Renderer.ActionProgress(action)
+	}
+	result, err := e.Executor.Execute(ctx, action, readOnly)
+	e.Renderer.Result(result)
+	return result, false, err
 }
 
 func (e *Engine) actionNeedsApproval(action core.Action, report core.RiskReport, match policy.Match) bool {

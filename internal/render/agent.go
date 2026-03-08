@@ -118,6 +118,9 @@ type AgentRenderer struct {
 	altScreen      bool
 	blocker        *blockerState
 	nowFn          func() time.Time
+	lastFrame      []string
+	lastWidth      int
+	cursorHidden   bool
 }
 
 func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta) *AgentRenderer {
@@ -355,6 +358,8 @@ func (r *AgentRenderer) ClearScreen() {
 	r.blocker = nil
 	r.actionStatus = ""
 	r.stopThinkingLocked()
+	r.lastFrame = nil
+	r.lastWidth = 0
 	_ = r.drawLocked()
 }
 
@@ -1120,36 +1125,34 @@ func (r *AgentRenderer) drawLocked() error {
 	body := r.transcript[start:end]
 
 	r.ensureAltScreenLocked()
-	if _, err := fmt.Fprint(r.Out, "\033[H\033[2J"); err != nil {
-		return err
-	}
+	frame := make([]string, 0, height)
 	for _, line := range header {
-		if err := r.writeScreenLine(truncateDisplay(line, width)); err != nil {
-			return err
-		}
+		frame = append(frame, truncateDisplay(line, width))
 	}
 	for _, line := range body {
-		if err := r.writeScreenLine(truncateDisplay(line, width)); err != nil {
-			return err
-		}
+		frame = append(frame, truncateDisplay(line, width))
 	}
 	for i := len(body); i < bodyHeight; i++ {
-		if err := r.writeScreenLine(""); err != nil {
-			return err
-		}
+		frame = append(frame, "")
 	}
 	for _, line := range overlayLines {
-		if err := r.writeScreenLine(truncateDisplay(line, width)); err != nil {
-			return err
+		frame = append(frame, truncateDisplay(line, width))
+	}
+	frame = append(frame,
+		truncateDisplay(r.statusLineLocked(width), width),
+		truncateDisplay(r.promptLineLocked(width), width),
+		truncateDisplay(r.footerLineLocked(width), width),
+	)
+
+	if len(frame) < height {
+		for len(frame) < height {
+			frame = append(frame, "")
 		}
 	}
-	if err := r.writeScreenLine(truncateDisplay(r.statusLineLocked(width), width)); err != nil {
-		return err
+	if len(frame) > height {
+		frame = frame[:height]
 	}
-	if err := r.writeScreenLine(truncateDisplay(r.promptLineLocked(width), width)); err != nil {
-		return err
-	}
-	return r.writeFinalScreenLine(r.footerLineLocked(width))
+	return r.renderFrameLocked(frame, width)
 }
 
 func (r *AgentRenderer) headerLines(width, height int) []string {
@@ -1405,8 +1408,43 @@ func (r *AgentRenderer) ensureAltScreenLocked() {
 	if r.altScreen {
 		return
 	}
-	_, _ = fmt.Fprint(r.Out, "\033[?1049h\033[?2004h")
+	_, _ = fmt.Fprint(r.Out, "\033[?1049h\033[?2004h\033[?25l")
 	r.altScreen = true
+	r.cursorHidden = true
+}
+
+func (r *AgentRenderer) renderFrameLocked(frame []string, width int) error {
+	fullRedraw := len(r.lastFrame) != len(frame) || r.lastWidth != width || r.lastFrame == nil
+	if fullRedraw {
+		if _, err := fmt.Fprint(r.Out, "\033[H\033[2J"); err != nil {
+			return err
+		}
+		for idx, line := range frame {
+			if err := r.writeFrameLine(idx+1, line); err != nil {
+				return err
+			}
+		}
+	} else {
+		for idx, line := range frame {
+			if line == r.lastFrame[idx] {
+				continue
+			}
+			if err := r.writeFrameLine(idx+1, line); err != nil {
+				return err
+			}
+		}
+	}
+	r.lastFrame = append(r.lastFrame[:0], frame...)
+	r.lastWidth = width
+	if _, err := fmt.Fprintf(r.Out, "\033[%d;1H", len(frame)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *AgentRenderer) writeFrameLine(row int, line string) error {
+	_, err := fmt.Fprintf(r.Out, "\033[%d;1H%s\033[K", row, line)
+	return err
 }
 
 func (r *AgentRenderer) scrollLocked(delta int) {
