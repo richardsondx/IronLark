@@ -18,6 +18,7 @@ type Config struct {
 	DefaultProfile  string                    `yaml:"default_profile,omitempty"`
 	ApprovalMode    string                    `yaml:"approval_mode,omitempty"`
 	Context         ContextConfig             `yaml:"context,omitempty"`
+	Thread          ThreadConfig              `yaml:"thread,omitempty"`
 	Tools           ToolConfig                `yaml:"tools,omitempty"`
 	Rules           RulesConfig               `yaml:"rules,omitempty"`
 	Security        SecurityConfig            `yaml:"security,omitempty"`
@@ -46,6 +47,16 @@ type ContextConfig struct {
 	MaxSTDINBytes         int  `yaml:"max_stdin_bytes,omitempty"`
 	MaxActions            int  `yaml:"max_actions,omitempty"`
 	MaxListEntries        int  `yaml:"max_list_entries,omitempty"`
+}
+
+type ThreadConfig struct {
+	Enabled        *bool   `yaml:"enabled,omitempty"`
+	Scope          string  `yaml:"scope,omitempty"`
+	MaxTokens      int     `yaml:"max_tokens,omitempty"`
+	WarnAtRatio    float64 `yaml:"warn_at_ratio,omitempty"`
+	RecentTurns    int     `yaml:"recent_turns,omitempty"`
+	MaxResultChars int     `yaml:"max_result_chars,omitempty"`
+	AutoCompact    *bool   `yaml:"auto_compact,omitempty"`
 }
 
 type ToolConfig struct {
@@ -86,6 +97,7 @@ type Paths struct {
 	ProjectConfigPath string
 	ProjectEnvPath    string
 	SessionsDir       string
+	ThreadsDir        string
 	PatchesDir        string
 	CheckpointsDir    string
 }
@@ -112,6 +124,15 @@ func DefaultConfig() Config {
 			MaxSTDINBytes:         128 * 1024,
 			MaxActions:            8,
 			MaxListEntries:        50,
+		},
+		Thread: ThreadConfig{
+			Enabled:        boolPtr(true),
+			Scope:          "auto-shell",
+			MaxTokens:      12000,
+			WarnAtRatio:    0.8,
+			RecentTurns:    8,
+			MaxResultChars: 1200,
+			AutoCompact:    boolPtr(true),
 		},
 		Tools: ToolConfig{
 			MaxTurns:               5,
@@ -189,6 +210,7 @@ func ResolvePaths(cwd string) (Paths, error) {
 		ProjectConfigPath: filepath.Join(cwd, ".lark.yaml"),
 		ProjectEnvPath:    filepath.Join(cwd, ".env"),
 		SessionsDir:       filepath.Join(dataHome, "lark", "sessions"),
+		ThreadsDir:        filepath.Join(dataHome, "lark", "threads"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
 	}, nil
@@ -198,6 +220,7 @@ func EnsureDirs(paths Paths) error {
 	dirs := []string{
 		filepath.Dir(paths.ConfigPath),
 		paths.SessionsDir,
+		paths.ThreadsDir,
 		paths.PatchesDir,
 		paths.CheckpointsDir,
 	}
@@ -317,6 +340,27 @@ func mergeConfig(base Config, override Config) Config {
 		out.Context.MaxListEntries = override.Context.MaxListEntries
 	}
 	out.Context.AutoCollect = override.Context.AutoCollect || out.Context.AutoCollect
+	if override.Thread.Scope != "" {
+		out.Thread.Scope = override.Thread.Scope
+	}
+	if override.Thread.MaxTokens != 0 {
+		out.Thread.MaxTokens = override.Thread.MaxTokens
+	}
+	if override.Thread.WarnAtRatio != 0 {
+		out.Thread.WarnAtRatio = override.Thread.WarnAtRatio
+	}
+	if override.Thread.RecentTurns != 0 {
+		out.Thread.RecentTurns = override.Thread.RecentTurns
+	}
+	if override.Thread.MaxResultChars != 0 {
+		out.Thread.MaxResultChars = override.Thread.MaxResultChars
+	}
+	if override.Thread.Enabled != nil {
+		out.Thread.Enabled = boolPtr(*override.Thread.Enabled)
+	}
+	if override.Thread.AutoCompact != nil {
+		out.Thread.AutoCompact = boolPtr(*override.Thread.AutoCompact)
+	}
 	if override.Tools.MaxTurns != 0 {
 		out.Tools.MaxTurns = override.Tools.MaxTurns
 	}
@@ -391,6 +435,20 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.DefaultProfile = value
 	case "approval_mode", "approval":
 		cfg.ApprovalMode = value
+	case "thread.enabled":
+		cfg.Thread.Enabled = boolPtr(parseBool(value))
+	case "thread.scope":
+		cfg.Thread.Scope = value
+	case "thread.max_tokens":
+		cfg.Thread.MaxTokens = parseInt(value)
+	case "thread.warn_at_ratio":
+		cfg.Thread.WarnAtRatio = parseFloat(value)
+	case "thread.recent_turns":
+		cfg.Thread.RecentTurns = parseInt(value)
+	case "thread.max_result_chars":
+		cfg.Thread.MaxResultChars = parseInt(value)
+	case "thread.auto_compact":
+		cfg.Thread.AutoCompact = boolPtr(parseBool(value))
 	default:
 		if strings.HasPrefix(key, "providers.") {
 			return setProviderValue(cfg, key, value)
@@ -425,6 +483,45 @@ func setProviderValue(cfg *Config, key, value string) error {
 	}
 	cfg.Providers[name] = provider
 	return nil
+}
+
+func parseBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseInt(value string) int {
+	var out int
+	fmt.Sscanf(strings.TrimSpace(value), "%d", &out)
+	return out
+}
+
+func parseFloat(value string) float64 {
+	var out float64
+	fmt.Sscanf(strings.TrimSpace(value), "%f", &out)
+	return out
+}
+
+func boolPtr(value bool) *bool {
+	return &value
+}
+
+func (c ThreadConfig) EnabledValue() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+func (c ThreadConfig) AutoCompactValue() bool {
+	if c.AutoCompact == nil {
+		return true
+	}
+	return *c.AutoCompact
 }
 
 func readYAML(path string, out any) error {

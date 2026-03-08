@@ -15,6 +15,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/render"
 	"github.com/richardsondx/IronLark/internal/sessions"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/threads"
 )
 
 type Engine struct {
@@ -24,6 +25,7 @@ type Engine struct {
 	Provider  provider.Client
 	Renderer  *render.Renderer
 	Sessions  sessions.Store
+	Threads   threads.Store
 }
 
 func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode string) error {
@@ -36,11 +38,9 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		return err
 	}
 
-	history := []core.ConversationMessage{
-		{
-			Role:    "user",
-			Content: buildInitialPrompt(prompt, snapshot),
-		},
+	threadRef, threadState, history, err := e.prepareTaskHistory(prompt, snapshot)
+	if err != nil {
+		return err
 	}
 
 	record := sessions.Record{
@@ -90,7 +90,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			record.ContextJSON = fullSnapshot.JSON()
 
 			// Replace initial user message with full context and re-run the generation
-			history[0].Content = buildInitialPrompt(prompt, fullSnapshot)
+			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot)
 			continue
 		}
 
@@ -135,7 +135,24 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 	record.Summary = finalSummary
 	record.Messages = history
 	record.FinishedAt = time.Now().UTC()
-	return e.Sessions.Save(record)
+	if err := e.Sessions.Save(record); err != nil {
+		return err
+	}
+	if threadState != nil {
+		*threadState = e.Threads.AppendTurn(*threadState, prompt, core.LLMResponse{
+			Summary:  finalSummary,
+			Findings: record.Findings,
+			Actions:  record.Actions,
+		}, record.Results, threads.AppendOptions{
+			ResultCharLimit: e.Runtime.Config.Thread.MaxResultChars,
+			ThreadConfig:    e.Runtime.Config.Thread,
+		})
+		if err := e.Threads.Save(*threadState); err != nil {
+			return err
+		}
+		e.warnContextUsage(*threadState, threadRef.Source)
+	}
+	return nil
 }
 
 func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte) error {
@@ -151,10 +168,14 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 		ApprovalMode: e.Runtime.ApprovalMode,
 		StartedAt:    time.Now().UTC(),
 	}
+	threadRef, threadState, err := e.resolveThreadContext()
+	if err != nil {
+		return err
+	}
 
 	var history []core.ConversationMessage
 	if initialPrompt != "" {
-		if err := e.runChatPrompt(ctx, initialPrompt, stdin, &history, &record); err != nil {
+		if err := e.runChatPrompt(ctx, initialPrompt, stdin, &history, &record, threadState, threadRef); err != nil {
 			return err
 		}
 	}
@@ -226,13 +247,13 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 			record.FinishedAt = time.Now().UTC()
 			return e.Sessions.Save(record)
 		}
-		if err := e.runChatPrompt(ctx, prompt, nil, &history, &record); err != nil {
+		if err := e.runChatPrompt(ctx, prompt, nil, &history, &record, threadState, threadRef); err != nil {
 			return err
 		}
 	}
 }
 
-func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte, history *[]core.ConversationMessage, record *sessions.Record) error {
+func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte, history *[]core.ConversationMessage, record *sessions.Record, threadState *threads.Thread, threadRef threads.ThreadRef) error {
 	snapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
 	if err != nil {
 		return err
@@ -280,7 +301,20 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	}
 	record.Messages = *history
 	record.FinishedAt = time.Now().UTC()
-	return e.Sessions.Save(*record)
+	if err := e.Sessions.Save(*record); err != nil {
+		return err
+	}
+	if threadState != nil {
+		*threadState = e.Threads.AppendTurn(*threadState, prompt, response, results, threads.AppendOptions{
+			ResultCharLimit: e.Runtime.Config.Thread.MaxResultChars,
+			ThreadConfig:    e.Runtime.Config.Thread,
+		})
+		if err := e.Threads.Save(*threadState); err != nil {
+			return err
+		}
+		e.warnContextUsage(*threadState, threadRef.Source)
+	}
+	return nil
 }
 
 func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]core.ActionResult, bool, error) {
@@ -421,6 +455,78 @@ func reachedFailureLimit(current, limit int) bool {
 
 func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot) string {
 	return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s", prompt, snapshot.JSON())
+}
+
+func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot) (threads.ThreadRef, *threads.Thread, []core.ConversationMessage, error) {
+	threadRef, threadState, err := e.resolveThreadContext()
+	if err != nil {
+		return threads.ThreadRef{}, nil, nil, err
+	}
+	history := []core.ConversationMessage{}
+	if threadState != nil {
+		history = append(history, threads.PromptMessages(*threadState, threads.PromptOptions{
+			RecentTurns: e.Runtime.Config.Thread.RecentTurns,
+		})...)
+		e.warnContextUsage(*threadState, threadRef.Source)
+	}
+	history = append(history, core.ConversationMessage{
+		Role:    "user",
+		Content: buildInitialPrompt(prompt, snapshot),
+	})
+	return threadRef, threadState, history, nil
+}
+
+func (e *Engine) resolveThreadContext() (threads.ThreadRef, *threads.Thread, error) {
+	if e.Runtime.NoContext || !e.Runtime.Config.Thread.EnabledValue() {
+		return threads.ThreadRef{}, nil, nil
+	}
+	ref, err := threads.ResolveDefaultThread(e.Runtime)
+	if err != nil {
+		return threads.ThreadRef{}, nil, err
+	}
+	threadState, err := e.Threads.Load(ref.ThreadID)
+	if err != nil {
+		return threads.ThreadRef{}, nil, err
+	}
+	if threadState.ID == "" {
+		threadState = threads.NewThread(ref)
+	}
+	if threadState.Scope == "" {
+		threadState.Scope = ref.Scope
+	}
+	if threadState.ScopeKey == "" {
+		threadState.ScopeKey = ref.ScopeKey
+	}
+	if threadState.CWD == "" {
+		threadState.CWD = ref.WorkingDir
+	}
+	if threadState.Host == "" {
+		threadState.Host = ref.Host
+	}
+	if threadState.User == "" {
+		threadState.User = ref.User
+	}
+	if threadState.ParentPID == 0 {
+		threadState.ParentPID = ref.ParentPID
+	}
+	if threadState.ParentStart == "" {
+		threadState.ParentStart = ref.ParentStart
+	}
+	return ref, &threadState, nil
+}
+
+func (e *Engine) warnContextUsage(thread threads.Thread, source string) {
+	maxTokens := e.Runtime.Config.Thread.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 12000
+	}
+	warnAt := int(float64(maxTokens) * 0.8)
+	if ratio := e.Runtime.Config.Thread.WarnAtRatio; ratio > 0 && ratio < 1 {
+		warnAt = int(float64(maxTokens) * ratio)
+	}
+	if thread.EstimatedTokens >= warnAt && !e.Runtime.JSONOutput {
+		e.Renderer.Message(fmt.Sprintf("Context warning: thread %s (%s) is using %d/%d estimated tokens.", thread.ID, source, thread.EstimatedTokens, maxTokens))
+	}
 }
 
 func newRecordID() string {

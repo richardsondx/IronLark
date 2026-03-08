@@ -20,16 +20,22 @@ type Runtime struct {
 	ReadOnly     bool
 	JSONOutput   bool
 	Profile      string
+	ThreadID     string
+	NoContext    bool
+	NewThread    bool
 }
 
 type Overrides struct {
-	Provider string
-	Model    string
-	Profile  string
-	Approval string
-	Color    string
-	ReadOnly bool
-	JSON     bool
+	Provider  string
+	Model     string
+	Profile   string
+	Approval  string
+	Color     string
+	ReadOnly  bool
+	JSON      bool
+	ThreadID  string
+	NoContext bool
+	NewThread bool
 }
 
 func Resolve(loaded config.Loaded, overrides Overrides) (Runtime, error) {
@@ -74,6 +80,9 @@ func Resolve(loaded config.Loaded, overrides Overrides) (Runtime, error) {
 		ReadOnly:     overrides.ReadOnly,
 		JSONOutput:   overrides.JSON,
 		Profile:      profileName,
+		ThreadID:     overrides.ThreadID,
+		NoContext:    overrides.NoContext,
+		NewThread:    overrides.NewThread,
 	}, nil
 }
 

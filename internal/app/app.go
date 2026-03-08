@@ -17,6 +17,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/search"
 	"github.com/richardsondx/IronLark/internal/sessions"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/threads"
 )
 
 type App struct {
@@ -27,6 +28,7 @@ type App struct {
 	Renderer    *render.Renderer
 	Provider    provider.Client
 	Sessions    sessions.Store
+	Threads     threads.Store
 	Patches     patches.Store
 	Checkpoints checkpoints.Store
 }
@@ -81,6 +83,7 @@ func New(overrides state.Overrides) (*App, error) {
 		},
 		Renderer:    renderer,
 		Sessions:    sessions.Store{Dir: loaded.Paths.SessionsDir},
+		Threads:     threads.Store{Dir: loaded.Paths.ThreadsDir},
 		Patches:     patches.Store{Dir: loaded.Paths.PatchesDir},
 		Checkpoints: checkpoints.Store{Dir: loaded.Paths.CheckpointsDir},
 	}
@@ -103,5 +106,6 @@ func (a *App) Engine() *engine.Engine {
 		Provider:  a.Provider,
 		Renderer:  a.Renderer,
 		Sessions:  a.Sessions,
+		Threads:   a.Threads,
 	}
 }

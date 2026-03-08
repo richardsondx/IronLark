@@ -1,24 +1,15 @@
 # IronLark
 
-IronLark is an SSH-first AI terminal assistant.
-
-The binaries and commands are still:
-
-- `lark`
-- `lk`
-
-IronLark is built for the moment when you SSH into a machine, hit a problem, and want AI help without leaving the terminal.
-
-Created by Richardson Dackam ([`@richardsondx` on X](https://x.com/richardsondx)).
+IronLark is an SSH-first AI terminal assistant built for the moment when you SSH into a machine, hit a problem, and want AI help without leaving the terminal.
 
 ## Why IronLark
 
 Use IronLark when you want AI that feels natural inside an SSH session:
-
 - inspect a server
 - read logs and config files
 - search a repo
 - suggest or apply small patches
+- keep short-term memory across one-shot commands in the same shell
 - keep explicit approval around risky actions
 - work well on a remote box such as a DigitalOcean droplet
 
@@ -42,6 +33,12 @@ mkdir -p ~/.config/lark
 cat > ~/.config/lark/.env <<'EOF'
 OPENAI_API_KEY=your_key_here
 EOF
+```
+
+or
+
+```bash
+export OPENAI_API_KEY=your_key_here
 ```
 
 Verify it works:
@@ -125,6 +122,10 @@ lk edit /etc/ssh/sshd_config "disable password authentication and preserve the r
 ```bash
 lk "what can you help me do on this server?"
 lk "summarize this machine"
+lk "remember that my project is in /opt/"
+lk "what did we just find?"
+lk context
+lk context window
 lk inspect
 lk chat
 lk history
@@ -137,8 +138,14 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 
 ## Commands
 
-- `lk "task"`: one-shot inspect -> plan -> run -> verify flow
-- `lk chat`: interactive shared-context session
+- `lk "task"`: one-shot inspect -> plan -> run -> verify flow, with persistent thread context by default
+- `lk chat`: interactive shared-context session that also writes to the current thread store
+- `lk context`: show the active persistent context thread
+- `lk context window`: show the current context-window usage and replay preview
+- `lk context clear`: clear the active thread history but keep the thread record
+- `lk context drop`: delete the active thread
+- `lk context use <thread-id>`: pin the current working directory to a manual thread
+- `lk context list`: list recent context threads
 - `lk inspect [system|repo]`: inspect the current machine or repo
 - `lk edit <path> [instruction]`: patch a file with diff approval
 - `lk run "<command>"`: run a shell command with policy guardrails
@@ -166,6 +173,40 @@ Environment variables can be loaded from:
 
 Existing shell environment variables take precedence over values from env files.
 
+### Persistent Thread Context
+
+By default, one-shot `lk "..."` commands reuse a lightweight local thread so follow-up prompts in the same shell and directory keep their context.
+
+- thread state is stored locally under the Lark data directory
+- context is scoped to the current shell when possible, with a cwd fallback
+- older turns are compacted into a rolling summary as the context window fills
+- IronLark warns when the estimated context window is getting close to full
+
+Useful controls:
+
+```bash
+lk context
+lk context window
+lk context clear
+lk context drop
+lk --no-context "run this statelessly"
+lk --new-thread "start a fresh thread for this run"
+lk --thread incident-123 "continue a specific thread"
+```
+
+Relevant config keys in `~/.config/lark/config.yaml`:
+
+```yaml
+thread:
+  enabled: true
+  scope: auto-shell
+  max_tokens: 12000
+  warn_at_ratio: 0.8
+  recent_turns: 8
+  max_result_chars: 1200
+  auto_compact: true
+```
+
 ## Review Before File Changes
 
 When IronLark proposes a file edit, it prints a unified diff before asking for approval.
@@ -188,6 +229,7 @@ IronLark can currently use terminal-native tools for:
 - guarded edits
 - inline checkpoints before edits
 - command execution with policy checks
+- persistent short-term thread context across one-shot commands
 
 ## Local Development
 
@@ -238,8 +280,14 @@ NO_COLOR=1 ./bin/lark edit ./README.md "change the first sentence"
 - For SSH-heavy workflows, forwarding env vars is still useful if you prefer `SendEnv` and `AcceptEnv`.
 - The current GitHub install script installs released binaries. If you want unreleased local changes on a remote server, copy your freshly built binary there manually or publish a release first.
 
+
+## Author 
+
+Created by Richardson Dackam ([`@richardsondx` on X](https://x.com/richardsondx)).
+
 ## Open Source
 
 - License: MIT
 - Commands stay `lark` and `lk`
 - Project name: IronLark
+

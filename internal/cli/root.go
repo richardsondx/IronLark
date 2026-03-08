@@ -19,17 +19,21 @@ import (
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/threads"
 	"github.com/richardsondx/IronLark/internal/update"
 )
 
 type rootFlags struct {
-	provider string
-	model    string
-	profile  string
-	approval string
-	color    string
-	readOnly bool
-	json     bool
+	provider  string
+	model     string
+	profile   string
+	approval  string
+	color     string
+	readOnly  bool
+	json      bool
+	threadID  string
+	noContext bool
+	newThread bool
 }
 
 func NewRootCommand() *cobra.Command {
@@ -67,8 +71,12 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&flags.color, "color", "auto", "color mode: auto|always|never")
 	cmd.PersistentFlags().BoolVar(&flags.readOnly, "read-only", false, "block mutating actions")
 	cmd.PersistentFlags().BoolVar(&flags.json, "json", false, "print JSON output")
+	cmd.PersistentFlags().StringVar(&flags.threadID, "thread", "", "use a specific context thread")
+	cmd.PersistentFlags().BoolVar(&flags.noContext, "no-context", false, "disable thread context for this run")
+	cmd.PersistentFlags().BoolVar(&flags.newThread, "new-thread", false, "start a fresh context thread for this run")
 
 	cmd.AddCommand(newChatCommand(flags))
+	cmd.AddCommand(newContextCommand(flags))
 	cmd.AddCommand(newInspectCommand(flags))
 	cmd.AddCommand(newEditCommand(flags))
 	cmd.AddCommand(newRunCommand(flags))
@@ -139,6 +147,99 @@ func newChatCommand(flags *rootFlags) *cobra.Command {
 			return application.Engine().RunChat(cmd.Context(), strings.Join(args, " "), stdin)
 		},
 	}
+}
+
+func newContextCommand(flags *rootFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "context",
+		Short: "Inspect and manage thread context",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return showContextStatus(flags, false)
+		},
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "window",
+		Short: "Show what context will be injected into the next request",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return showContextStatus(flags, true)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "clear",
+		Short: "Clear the active thread history",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, ref, err := buildAppWithThread(flags)
+			if err != nil {
+				return err
+			}
+			if err := application.Threads.Clear(ref.ThreadID); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Cleared thread %s", ref.ThreadID))
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "drop",
+		Short: "Delete the active thread",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, ref, err := buildAppWithThread(flags)
+			if err != nil {
+				return err
+			}
+			if err := application.Threads.Delete(ref.ThreadID); err != nil {
+				return err
+			}
+			if err := application.Threads.ClearOverride(ref); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Deleted thread %s", ref.ThreadID))
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "use <thread-id>",
+		Short: "Set the manual thread override for this working directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, ref, err := buildAppWithThread(flags)
+			if err != nil {
+				return err
+			}
+			ref.ThreadID = args[0]
+			ref.Scope = "manual"
+			ref.Source = "override"
+			ref.Manual = true
+			if err := application.Threads.UpsertOverride(ref); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Active override set to thread %s", ref.ThreadID))
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List recent threads",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			records, err := application.Threads.List()
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(records)
+			}
+			for _, record := range records {
+				application.Renderer.Message(fmt.Sprintf("%s  %s  turns=%d  tokens=%d  cwd=%s",
+					record.ID, record.UpdatedAt.Format("2006-01-02 15:04:05"), len(record.Turns), record.EstimatedTokens, record.CWD))
+			}
+			return nil
+		},
+	})
+	return cmd
 }
 
 func newInspectCommand(flags *rootFlags) *cobra.Command {
@@ -492,14 +593,64 @@ func validateModelForProvider(providerName, model string) error {
 
 func buildApp(flags *rootFlags) (*app.App, error) {
 	return app.New(state.Overrides{
-		Provider: flags.provider,
-		Model:    flags.model,
-		Profile:  flags.profile,
-		Approval: flags.approval,
-		Color:    flags.color,
-		ReadOnly: flags.readOnly,
-		JSON:     flags.json,
+		Provider:  flags.provider,
+		Model:     flags.model,
+		Profile:   flags.profile,
+		Approval:  flags.approval,
+		Color:     flags.color,
+		ReadOnly:  flags.readOnly,
+		JSON:      flags.json,
+		ThreadID:  flags.threadID,
+		NoContext: flags.noContext,
+		NewThread: flags.newThread,
 	})
+}
+
+func buildAppWithThread(flags *rootFlags) (*app.App, threads.ThreadRef, error) {
+	application, err := buildApp(flags)
+	if err != nil {
+		return nil, threads.ThreadRef{}, err
+	}
+	ref, err := threads.ResolveDefaultThread(application.Runtime)
+	if err != nil {
+		return nil, threads.ThreadRef{}, err
+	}
+	return application, ref, nil
+}
+
+func showContextStatus(flags *rootFlags, includeWindow bool) error {
+	application, ref, err := buildAppWithThread(flags)
+	if err != nil {
+		return err
+	}
+	stats, err := application.Threads.Stats(ref.ThreadID, application.Runtime.Config.Thread, ref.Source)
+	if err != nil {
+		return err
+	}
+	if application.Runtime.JSONOutput {
+		return application.Renderer.MessageJSON(stats)
+	}
+	application.Renderer.Message(fmt.Sprintf("Thread: %s", stats.ThreadID))
+	application.Renderer.Message(fmt.Sprintf("Scope: %s (%s)", stats.Scope, stats.Source))
+	application.Renderer.Message(fmt.Sprintf("CWD: %s", stats.CWD))
+	application.Renderer.Message(fmt.Sprintf("Updated: %s", stats.LastUpdated.Format("2006-01-02 15:04:05")))
+	application.Renderer.Message(fmt.Sprintf("Turns: %d", stats.TurnCount))
+	application.Renderer.Message(fmt.Sprintf("Estimated tokens: %d/%d", stats.EstimatedTokens, stats.MaxTokens))
+	application.Renderer.Message(fmt.Sprintf("Warning: %t", stats.Warning))
+	if includeWindow {
+		application.Renderer.Message(fmt.Sprintf("Injected messages: %d", stats.PreviewMessageCount))
+		if stats.RollingSummary != "" {
+			application.Renderer.Message("Summary:")
+			application.Renderer.Message(stats.RollingSummary)
+		}
+		if len(stats.RecentTurns) > 0 {
+			application.Renderer.Message("Recent turns:")
+			for _, turn := range stats.RecentTurns {
+				application.Renderer.Message("- " + turn)
+			}
+		}
+	}
+	return nil
 }
 
 func readPipedInput(limit int) ([]byte, error) {
