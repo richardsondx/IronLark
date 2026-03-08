@@ -17,6 +17,7 @@ type Config struct {
 	DefaultModel    string                    `yaml:"default_model,omitempty"`
 	DefaultProfile  string                    `yaml:"default_profile,omitempty"`
 	ApprovalMode    string                    `yaml:"approval_mode,omitempty"`
+	InteractionMode string                    `yaml:"interaction_mode,omitempty"`
 	Context         ContextConfig             `yaml:"context,omitempty"`
 	Thread          ThreadConfig              `yaml:"thread,omitempty"`
 	Tools           ToolConfig                `yaml:"tools,omitempty"`
@@ -98,6 +99,7 @@ type Paths struct {
 	ProjectEnvPath    string
 	SessionsDir       string
 	ThreadsDir        string
+	PolicyPath        string
 	PatchesDir        string
 	CheckpointsDir    string
 }
@@ -117,6 +119,7 @@ func DefaultConfig() Config {
 		DefaultModel:    "gpt-5-mini",
 		DefaultProfile:  "strong",
 		ApprovalMode:    "confirm",
+		InteractionMode: "execute-first",
 		Context: ContextConfig{
 			AutoCollect:           true,
 			MaxFileBytes:          64 * 1024,
@@ -211,6 +214,7 @@ func ResolvePaths(cwd string) (Paths, error) {
 		ProjectEnvPath:    filepath.Join(cwd, ".env"),
 		SessionsDir:       filepath.Join(dataHome, "lark", "sessions"),
 		ThreadsDir:        filepath.Join(dataHome, "lark", "threads"),
+		PolicyPath:        filepath.Join(dataHome, "lark", "policy.json"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
 	}, nil
@@ -324,6 +328,9 @@ func mergeConfig(base Config, override Config) Config {
 	if override.ApprovalMode != "" {
 		out.ApprovalMode = override.ApprovalMode
 	}
+	if override.InteractionMode != "" {
+		out.InteractionMode = override.InteractionMode
+	}
 	if override.Context.MaxFileBytes != 0 {
 		out.Context.MaxFileBytes = override.Context.MaxFileBytes
 	}
@@ -435,6 +442,8 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.DefaultProfile = value
 	case "approval_mode", "approval":
 		cfg.ApprovalMode = value
+	case "interaction_mode":
+		cfg.InteractionMode = value
 	case "thread.enabled":
 		cfg.Thread.Enabled = boolPtr(parseBool(value))
 	case "thread.scope":

@@ -10,6 +10,7 @@ Use IronLark when you want AI that feels natural inside an SSH session:
 - search a repo
 - suggest or apply small patches
 - keep short-term memory across one-shot commands in the same shell
+- execute obvious safe inspection work immediately
 - keep explicit approval around risky actions
 - work well on a remote box such as a DigitalOcean droplet
 
@@ -122,10 +123,13 @@ lk edit /etc/ssh/sshd_config "disable password authentication and preserve the r
 ```bash
 lk "what can you help me do on this server?"
 lk "summarize this machine"
+lk "what's my ip?"
 lk "remember that my project is in /opt/"
 lk "what did we just find?"
+lk --plan "debug why nginx won't start"
 lk context
 lk context window
+lk policy list
 lk inspect
 lk chat
 lk history
@@ -138,7 +142,9 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 
 ## Commands
 
-- `lk "task"`: one-shot inspect -> plan -> run -> verify flow, with persistent thread context by default
+- `lk "task"`: execute-first one-shot flow with persistent thread context by default
+- `lk --plan "task"`: show a visible plan before execution
+- `lk plan "task"`: explicit plan-first mode
 - `lk chat`: interactive shared-context session that also writes to the current thread store
 - `lk context`: show the active persistent context thread
 - `lk context window`: show the current context-window usage and replay preview
@@ -146,6 +152,10 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk context drop`: delete the active thread
 - `lk context use <thread-id>`: pin the current working directory to a manual thread
 - `lk context list`: list recent context threads
+- `lk policy list`: show machine-level allow/deny rules
+- `lk policy allow <action|command|path> <value>`: persist an allow rule on this machine
+- `lk policy deny <action|command|path> <value>`: persist a deny rule on this machine
+- `lk policy remove <id>`: remove a machine policy rule
 - `lk inspect [system|repo]`: inspect the current machine or repo
 - `lk edit <path> [instruction]`: patch a file with diff approval
 - `lk run "<command>"`: run a shell command with policy guardrails
@@ -173,6 +183,15 @@ Environment variables can be loaded from:
 
 Existing shell environment variables take precedence over values from env files.
 
+### Execute-First By Default
+
+Normal one-shot `lk "..."` usage is execute-first. IronLark plans internally, but for simple low-risk inspection work it runs the minimum safe actions immediately instead of showing a full proposed-action block first.
+
+- safe reads and low-risk inspection commands run immediately
+- risky commands and edits stop at the next approval boundary
+- `--plan` or `lk plan` switches back to visible plan-first review
+- persistent machine policy rules can suppress repeat approvals for trusted actions
+
 ### Persistent Thread Context
 
 By default, one-shot `lk "..."` commands reuse a lightweight local thread so follow-up prompts in the same shell and directory keep their context.
@@ -197,6 +216,7 @@ lk --thread incident-123 "continue a specific thread"
 Relevant config keys in `~/.config/lark/config.yaml`:
 
 ```yaml
+interaction_mode: execute-first
 thread:
   enabled: true
   scope: auto-shell
@@ -206,6 +226,20 @@ thread:
   max_result_chars: 1200
   auto_compact: true
 ```
+
+### Machine Policy
+
+IronLark stores allow/deny rules per machine so repeat approvals can disappear for trusted commands.
+
+```bash
+lk policy list
+lk policy allow command "systemctl status"
+lk policy allow command "journalctl -u"
+lk policy deny command "rm"
+lk policy remove <rule-id>
+```
+
+Read-only actions are generally auto-approved, but sensitive paths such as `.env`, key files, and SSH material still require approval.
 
 ## Review Before File Changes
 
@@ -290,4 +324,3 @@ Created by Richardson Dackam ([`@richardsondx` on X](https://x.com/richardsondx)
 - License: MIT
 - Commands stay `lark` and `lk`
 - Project name: IronLark
-

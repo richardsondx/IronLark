@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/richardsondx/IronLark/internal/app"
+	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/state"
 	"github.com/richardsondx/IronLark/internal/threads"
 )
@@ -106,6 +107,50 @@ func TestContextUseAndDrop(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(application.Runtime.Paths.ThreadsDir, ref.ThreadID+".json")); !os.IsNotExist(err) {
 		t.Fatalf("expected dropped thread removed, err=%v", err)
+	}
+}
+
+func TestPlanFlagSelectsPlanFirstInteraction(t *testing.T) {
+	temp := t.TempDir()
+	project := filepath.Join(temp, "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	t.Setenv("HOME", temp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(temp, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(temp, ".local", "share"))
+	t.Chdir(project)
+
+	application, err := buildApp(&rootFlags{plan: true})
+	if err != nil {
+		t.Fatalf("buildApp() error = %v", err)
+	}
+	if application.Runtime.Interaction != core.InteractionPlanFirst {
+		t.Fatalf("expected plan-first interaction, got %q", application.Runtime.Interaction)
+	}
+}
+
+func TestPolicyCommands(t *testing.T) {
+	temp := t.TempDir()
+	project := filepath.Join(temp, "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	t.Setenv("HOME", temp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(temp, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(temp, ".local", "share"))
+	t.Chdir(project)
+
+	if err := runCommand([]string{"policy", "allow", "command", "systemctl status"}); err != nil {
+		t.Fatalf("policy allow error = %v", err)
+	}
+	listOutput := captureStdout(t, func() error {
+		cmd := NewRootCommand()
+		cmd.SetArgs([]string{"policy", "list"})
+		return cmd.Execute()
+	})
+	if !strings.Contains(listOutput, "systemctl status") {
+		t.Fatalf("expected policy rule in list output, got %q", listOutput)
 	}
 }
 

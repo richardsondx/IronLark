@@ -20,6 +20,22 @@ func (m ApprovalMode) Valid() bool {
 	}
 }
 
+type InteractionMode string
+
+const (
+	InteractionExecuteFirst InteractionMode = "execute-first"
+	InteractionPlanFirst    InteractionMode = "plan-first"
+)
+
+func (m InteractionMode) Valid() bool {
+	switch m {
+	case InteractionExecuteFirst, InteractionPlanFirst:
+		return true
+	default:
+		return false
+	}
+}
+
 type ActionType string
 
 const (

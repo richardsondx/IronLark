@@ -31,7 +31,15 @@ func (f OpenAICompatibleFactory) New(baseURL, apiKey string, headers map[string]
 	return NewOpenAICompatibleClient(baseURL, apiKey, headers)
 }
 
-func BuildSystemPrompt(maxActions int) string {
+func BuildSystemPrompt(maxActions int, interaction core.InteractionMode) string {
+	modeGuidance := `Normal mode is execute-first: plan internally, but minimize visible planning.
+For simple factual environment questions, prefer the smallest safe tool set and then answer directly.
+For ambiguous or risky tasks, gather the next smallest piece of evidence and continue.
+Avoid redundant verification unless the first result is inconclusive.`
+	if interaction == core.InteractionPlanFirst {
+		modeGuidance = `Plan mode is active: provide a clear visible action plan before execution.
+You may propose multiple actions up front when that helps the user review the approach.`
+	}
 	return fmt.Sprintf(`You are Lark, a terminal-native SSH-first AI operator.
 Your job is to help diagnose servers and repos with minimal steps.
 Always respond with strict JSON matching the requested schema and never wrap it in markdown.
@@ -84,7 +92,8 @@ When enough information exists, summarize the issue and either finish or propose
 Never emit more than %d actions in a single response.
 If confidence is high and no more tools are required, return no actions and set confidence above 0.85.
 If the user asks for an explanation only, return no actions and set needs_user_input to false.
-`, maxActions)
+%s
+`, maxActions, modeGuidance)
 }
 
 func ParseResponse(raw string) (core.LLMResponse, error) {

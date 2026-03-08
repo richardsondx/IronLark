@@ -29,6 +29,7 @@ type App struct {
 	Provider    provider.Client
 	Sessions    sessions.Store
 	Threads     threads.Store
+	PolicyStore policy.Store
 	Patches     patches.Store
 	Checkpoints checkpoints.Store
 }
@@ -84,6 +85,7 @@ func New(overrides state.Overrides) (*App, error) {
 		Renderer:    renderer,
 		Sessions:    sessions.Store{Dir: loaded.Paths.SessionsDir},
 		Threads:     threads.Store{Dir: loaded.Paths.ThreadsDir},
+		PolicyStore: policy.Store{Path: loaded.Paths.PolicyPath},
 		Patches:     patches.Store{Dir: loaded.Paths.PatchesDir},
 		Checkpoints: checkpoints.Store{Dir: loaded.Paths.CheckpointsDir},
 	}
@@ -100,12 +102,13 @@ func New(overrides state.Overrides) (*App, error) {
 
 func (a *App) Engine() *engine.Engine {
 	return &engine.Engine{
-		Runtime:   a.Runtime,
-		Collector: a.Collector,
-		Executor:  a.Executor,
-		Provider:  a.Provider,
-		Renderer:  a.Renderer,
-		Sessions:  a.Sessions,
-		Threads:   a.Threads,
+		Runtime:     a.Runtime,
+		Collector:   a.Collector,
+		Executor:    a.Executor,
+		Provider:    a.Provider,
+		Renderer:    a.Renderer,
+		Sessions:    a.Sessions,
+		Threads:     a.Threads,
+		PolicyStore: a.PolicyStore,
 	}
 }

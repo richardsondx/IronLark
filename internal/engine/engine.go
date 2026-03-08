@@ -11,6 +11,7 @@ import (
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
+	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/render"
 	"github.com/richardsondx/IronLark/internal/sessions"
@@ -19,13 +20,14 @@ import (
 )
 
 type Engine struct {
-	Runtime   state.Runtime
-	Collector *ctxpkg.Collector
-	Executor  *executor.Executor
-	Provider  provider.Client
-	Renderer  *render.Renderer
-	Sessions  sessions.Store
-	Threads   threads.Store
+	Runtime     state.Runtime
+	Collector   *ctxpkg.Collector
+	Executor    *executor.Executor
+	Provider    provider.Client
+	Renderer    *render.Renderer
+	Sessions    sessions.Store
+	Threads     threads.Store
+	PolicyStore policy.Store
 }
 
 func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode string) error {
@@ -64,7 +66,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 	for turn := 0; turn < maxTurns; turn++ {
 		response, err := e.Provider.Generate(ctx, provider.Request{
 			Model:       e.Runtime.Model,
-			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions),
+			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 			Messages:    history,
 			Temperature: 0.1,
 		})
@@ -264,7 +266,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	})
 	response, err := e.Provider.Generate(ctx, provider.Request{
 		Model:       e.Runtime.Model,
-		System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions),
+		System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 		Messages:    *history,
 		Temperature: 0.1,
 	})
@@ -323,19 +325,27 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	}
 
 	previews := make([]core.RiskReport, 0, len(response.Actions))
+	matches := make([]policy.Match, 0, len(response.Actions))
 	needApproval := false
 	for _, action := range response.Actions {
 		report, err := e.Executor.Preview(action, e.Runtime.ReadOnly)
 		if err != nil {
 			return nil, false, err
 		}
+		match, err := e.PolicyStore.Evaluate(action)
+		if err != nil {
+			return nil, false, err
+		}
 		previews = append(previews, report)
-		if e.Executor.Classifier.NeedsApproval(action, report, e.Runtime.ApprovalMode, e.Runtime.Config.Security.AutoApproveReadTools, e.Runtime.ReadOnly) {
+		matches = append(matches, match)
+		if e.actionNeedsApproval(action, report, match) {
 			needApproval = true
 		}
 	}
-	e.Renderer.PlannedActions(response.Actions, previews)
-	if len(response.Verification) > 0 && !e.Runtime.JSONOutput {
+	if e.Runtime.Interaction == core.InteractionPlanFirst {
+		e.Renderer.PlannedActions(response.Actions, previews)
+	}
+	if len(response.Verification) > 0 && !e.Runtime.JSONOutput && e.Runtime.Interaction == core.InteractionPlanFirst {
 		e.Renderer.Message("\nVerification planned after execution.")
 	}
 
@@ -344,7 +354,7 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	}
 
 	strategy := "all"
-	if needApproval {
+	if needApproval && e.Runtime.Interaction == core.InteractionPlanFirst {
 		choice, err := e.Renderer.PromptChoice()
 		if err != nil {
 			return nil, false, err
@@ -364,6 +374,7 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	results := []core.ActionResult{}
 	for idx, action := range response.Actions {
 		report := previews[idx]
+		match := matches[idx]
 		if action.Type == core.ActionFinish {
 			return results, true, nil
 		}
@@ -384,15 +395,40 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			})
 			continue
 		}
+		if match.Matched && match.Decision == policy.DecisionDeny {
+			results = append(results, core.ActionResult{
+				Action:   action,
+				Risk:     report,
+				Skipped:  true,
+				Summary:  "blocked by machine policy",
+				Approved: false,
+			})
+			if !e.Runtime.JSONOutput {
+				e.Renderer.Result(results[len(results)-1])
+			}
+			continue
+		}
 
 		approved := true
-		if e.Executor.Classifier.NeedsApproval(action, report, e.Runtime.ApprovalMode, e.Runtime.Config.Security.AutoApproveReadTools, e.Runtime.ReadOnly) {
-			if strategy == "step" || e.Executor.Classifier.RequiresDoubleConfirm(report) {
-				ok, err := e.Renderer.Confirm(action.Title, e.Executor.Classifier.RequiresDoubleConfirm(report))
-				if err != nil {
+		if e.actionNeedsApproval(action, report, match) {
+			decision, err := e.promptForActionDecision(action, report, strategy)
+			if err != nil {
+				return results, false, err
+			}
+			switch decision {
+			case "allow-once":
+				approved = true
+			case "allow-always":
+				approved = true
+				if _, err := e.PolicyStore.Add(policy.RuleForAction(action, policy.DecisionAllow)); err != nil {
 					return results, false, err
 				}
-				approved = ok
+			case "deny-once":
+				approved = false
+			case "cancel":
+				return results, true, nil
+			default:
+				approved = false
 			}
 		}
 		if !approved {
@@ -404,6 +440,9 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 				Approved: false,
 			})
 			continue
+		}
+		if e.Runtime.Interaction == core.InteractionExecuteFirst && !e.Runtime.JSONOutput {
+			e.Renderer.ActionProgress(action)
 		}
 		result, err := e.Executor.Execute(ctx, action, e.Runtime.ReadOnly)
 		e.Renderer.Result(result)
@@ -435,6 +474,47 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	}
 
 	return results, false, nil
+}
+
+func (e *Engine) actionNeedsApproval(action core.Action, report core.RiskReport, match policy.Match) bool {
+	if match.Matched && match.Decision == policy.DecisionAllow && report.Level != core.RiskHigh {
+		return false
+	}
+	if e.Executor.Classifier.IsSensitiveAction(action) {
+		return true
+	}
+	return e.Executor.Classifier.NeedsApproval(action, report, e.Runtime.ApprovalMode, e.Runtime.Config.Security.AutoApproveReadTools, e.Runtime.ReadOnly)
+}
+
+func (e *Engine) promptForActionDecision(action core.Action, report core.RiskReport, strategy string) (string, error) {
+	if e.Runtime.Interaction == core.InteractionPlanFirst && strategy == "all" && !e.Executor.Classifier.RequiresDoubleConfirm(report) {
+		return "allow-once", nil
+	}
+	if e.Runtime.Interaction == core.InteractionPlanFirst && strategy != "step" && e.Executor.Classifier.RequiresDoubleConfirm(report) {
+		ok, err := e.Renderer.Confirm(action.Title, true)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return "allow-once", nil
+		}
+		return "deny-once", nil
+	}
+	e.Renderer.ApprovalPrompt(action, report)
+	choice, err := e.Renderer.PromptApprovalChoice()
+	if err != nil {
+		return "", err
+	}
+	switch choice {
+	case "1":
+		return "allow-once", nil
+	case "2":
+		return "allow-always", nil
+	case "3":
+		return "deny-once", nil
+	default:
+		return "cancel", nil
+	}
 }
 
 func hasErrors(results []core.ActionResult) bool {

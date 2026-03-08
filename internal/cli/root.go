@@ -17,6 +17,7 @@ import (
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
+	policypkg "github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/state"
 	"github.com/richardsondx/IronLark/internal/threads"
@@ -34,6 +35,7 @@ type rootFlags struct {
 	threadID  string
 	noContext bool
 	newThread bool
+	plan      bool
 }
 
 func NewRootCommand() *cobra.Command {
@@ -74,9 +76,12 @@ func NewRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&flags.threadID, "thread", "", "use a specific context thread")
 	cmd.PersistentFlags().BoolVar(&flags.noContext, "no-context", false, "disable thread context for this run")
 	cmd.PersistentFlags().BoolVar(&flags.newThread, "new-thread", false, "start a fresh context thread for this run")
+	cmd.PersistentFlags().BoolVar(&flags.plan, "plan", false, "show a visible plan before execution")
 
 	cmd.AddCommand(newChatCommand(flags))
+	cmd.AddCommand(newPlanCommand(flags))
 	cmd.AddCommand(newContextCommand(flags))
+	cmd.AddCommand(newPolicyCommand(flags))
 	cmd.AddCommand(newInspectCommand(flags))
 	cmd.AddCommand(newEditCommand(flags))
 	cmd.AddCommand(newRunCommand(flags))
@@ -145,6 +150,31 @@ func newChatCommand(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			return application.Engine().RunChat(cmd.Context(), strings.Join(args, " "), stdin)
+		},
+	}
+}
+
+func newPlanCommand(flags *rootFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "plan [task]",
+		Short: "Show a visible plan before execution",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			planFlags := *flags
+			planFlags.plan = true
+			application, err := buildApp(&planFlags)
+			if err != nil {
+				return err
+			}
+			stdin, err := readPipedInput(application.Runtime.Config.Context.MaxSTDINBytes)
+			if err != nil {
+				return err
+			}
+			if len(args) == 0 {
+				prompt := "Summarize this input, explain any failures, and propose the next safe step."
+				return application.Engine().RunTask(cmd.Context(), prompt, stdin, "plan")
+			}
+			return application.Engine().RunTask(cmd.Context(), strings.Join(args, " "), stdin, "plan")
 		},
 	}
 }
@@ -240,6 +270,84 @@ func newContextCommand(flags *rootFlags) *cobra.Command {
 		},
 	})
 	return cmd
+}
+
+func newPolicyCommand(flags *rootFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "policy",
+		Short: "Inspect and manage machine policy rules",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List policy rules",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			rules, err := application.PolicyStore.List()
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(rules)
+			}
+			for _, rule := range rules {
+				application.Renderer.Message(fmt.Sprintf("%s  %s  %s  %s", rule.ID, rule.Decision, rule.Kind, rule.Value))
+			}
+			return nil
+		},
+	})
+	cmd.AddCommand(newPolicyDecisionCommand(flags, policypkg.DecisionAllow))
+	cmd.AddCommand(newPolicyDecisionCommand(flags, policypkg.DecisionDeny))
+	cmd.AddCommand(&cobra.Command{
+		Use:   "remove <id>",
+		Short: "Remove a policy rule",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			if err := application.PolicyStore.Remove(args[0]); err != nil {
+				return err
+			}
+			application.Renderer.Message("Removed policy rule " + args[0])
+			return nil
+		},
+	})
+	return cmd
+}
+
+func newPolicyDecisionCommand(flags *rootFlags, decision policypkg.Decision) *cobra.Command {
+	return &cobra.Command{
+		Use:   string(decision) + " <action|command|path> <value>",
+		Short: strings.Title(string(decision)) + " a machine policy rule",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			var rule policypkg.Rule
+			switch args[0] {
+			case "action":
+				rule = policypkg.Rule{Decision: decision, Kind: policypkg.RuleActionType, Value: args[1], Action: args[1], Scope: "machine"}
+			case "command":
+				rule = policypkg.Rule{Decision: decision, Kind: policypkg.RuleCommandPrefix, Value: args[1], Action: string(core.ActionRunShell), Scope: "machine"}
+			case "path":
+				rule = policypkg.Rule{Decision: decision, Kind: policypkg.RulePathPrefix, Value: args[1], Scope: "machine"}
+			default:
+				return fmt.Errorf("unknown policy type %q", args[0])
+			}
+			saved, err := application.PolicyStore.Add(rule)
+			if err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Added %s rule %s", decision, saved.ID))
+			return nil
+		},
+	}
 }
 
 func newInspectCommand(flags *rootFlags) *cobra.Command {
@@ -597,6 +705,7 @@ func buildApp(flags *rootFlags) (*app.App, error) {
 		Model:     flags.model,
 		Profile:   flags.profile,
 		Approval:  flags.approval,
+		Plan:      flags.plan,
 		Color:     flags.color,
 		ReadOnly:  flags.readOnly,
 		JSON:      flags.json,
@@ -680,7 +789,7 @@ func providerSmokeTest(ctx context.Context, application *app.App) error {
 	}
 	_, err := application.Provider.Generate(ctx, provider.Request{
 		Model:  application.Runtime.Model,
-		System: provider.BuildSystemPrompt(1),
+		System: provider.BuildSystemPrompt(1, application.Runtime.Interaction),
 		Messages: []core.ConversationMessage{
 			{Role: "user", Content: `Return {"summary":"ok","findings":[],"actions":[],"verification":[],"needs_user_input":false}`},
 		},

@@ -17,6 +17,7 @@ type Runtime struct {
 	ProviderName string
 	Model        string
 	ApprovalMode core.ApprovalMode
+	Interaction  core.InteractionMode
 	ReadOnly     bool
 	JSONOutput   bool
 	Profile      string
@@ -30,6 +31,7 @@ type Overrides struct {
 	Model     string
 	Profile   string
 	Approval  string
+	Plan      bool
 	Color     string
 	ReadOnly  bool
 	JSON      bool
@@ -68,6 +70,16 @@ func Resolve(loaded config.Loaded, overrides Overrides) (Runtime, error) {
 	if !approval.Valid() {
 		return Runtime{}, fmt.Errorf("invalid approval mode %q", approval)
 	}
+	interaction := core.InteractionMode(strings.TrimSpace(cfg.InteractionMode))
+	if interaction == "" {
+		interaction = core.InteractionExecuteFirst
+	}
+	if overrides.Plan {
+		interaction = core.InteractionPlanFirst
+	}
+	if !interaction.Valid() {
+		return Runtime{}, fmt.Errorf("invalid interaction mode %q", interaction)
+	}
 
 	return Runtime{
 		Config:       cfg,
@@ -77,6 +89,7 @@ func Resolve(loaded config.Loaded, overrides Overrides) (Runtime, error) {
 		ProviderName: providerName,
 		Model:        modelName,
 		ApprovalMode: approval,
+		Interaction:  interaction,
 		ReadOnly:     overrides.ReadOnly,
 		JSONOutput:   overrides.JSON,
 		Profile:      profileName,

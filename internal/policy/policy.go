@@ -46,7 +46,24 @@ var (
 		"rm", "dd", "mkfs", "shutdown", "reboot", "iptables", "ufw",
 		"firewall-cmd", "killall",
 	}
-	systemRoots = []string{"/etc", "/usr", "/var", "/opt", "/lib", "/root", "/srv"}
+	systemRoots            = []string{"/etc", "/usr", "/var", "/opt", "/lib", "/root", "/srv"}
+	sensitivePathFragments = []string{
+		".env",
+		".npmrc",
+		".pypirc",
+		"credentials",
+		"secret",
+		"token",
+		"id_rsa",
+		"id_ed25519",
+		".ssh/",
+	}
+	sensitivePathSuffixes = []string{
+		".pem",
+		".key",
+		".p12",
+		".pfx",
+	}
 )
 
 type Classifier struct {
@@ -116,6 +133,9 @@ func (c *Classifier) NeedsApproval(action core.Action, report core.RiskReport, m
 		return false
 	}
 	if mode == core.ApprovalAgent && report.Level == core.RiskMedium && !readOnly {
+		return false
+	}
+	if mode == core.ApprovalAutoSafe && report.Level == core.RiskLow {
 		return false
 	}
 	return report.Level != core.RiskLow || mode == core.ApprovalConfirm
@@ -202,7 +222,7 @@ func (c *Classifier) classifyCommand(command string) (core.RiskReport, error) {
 }
 
 func (c *Classifier) pathRisk(path string) core.RiskLevel {
-	if c.matchesProtectedPath(path) || c.touchesSystemPath(path) {
+	if c.matchesProtectedPath(path) || c.isSensitivePath(path) {
 		return core.RiskMedium
 	}
 	return core.RiskLow
@@ -215,6 +235,64 @@ func (c *Classifier) touchesSystemPath(value string) bool {
 		}
 	}
 	return c.matchesProtectedPath(value)
+}
+
+func (c *Classifier) IsSensitiveAction(action core.Action) bool {
+	if c.actionTouchesSensitivePath(action) {
+		return true
+	}
+	if action.Type == core.ActionRunShell {
+		return c.commandLooksSensitive(action.Command)
+	}
+	return false
+}
+
+func (c *Classifier) actionTouchesSensitivePath(action core.Action) bool {
+	if c.isSensitivePath(action.Path) {
+		return true
+	}
+	for _, path := range action.Paths {
+		if c.isSensitivePath(path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Classifier) isSensitivePath(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return false
+	}
+	if c.matchesProtectedPath(value) {
+		return true
+	}
+	for _, suffix := range sensitivePathSuffixes {
+		if strings.HasSuffix(value, suffix) {
+			return true
+		}
+	}
+	for _, fragment := range sensitivePathFragments {
+		if strings.Contains(value, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Classifier) commandLooksSensitive(command string) bool {
+	lower := strings.ToLower(command)
+	for _, fragment := range sensitivePathFragments {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	for _, suffix := range sensitivePathSuffixes {
+		if strings.Contains(lower, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Classifier) matchesProtectedPath(value string) bool {

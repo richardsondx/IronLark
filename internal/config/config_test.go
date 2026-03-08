@@ -70,6 +70,16 @@ func TestSetValueSupportsProviderFields(t *testing.T) {
 	}
 }
 
+func TestSetValueSupportsInteractionMode(t *testing.T) {
+	cfg := Config{}
+	if err := SetValue(&cfg, "interaction_mode", "plan-first"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InteractionMode != "plan-first" {
+		t.Fatalf("unexpected interaction mode %q", cfg.InteractionMode)
+	}
+}
+
 func TestUpsertEnvValueCreatesAndUpdatesEnvFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := UpsertEnvValue(path, "OPENAI_API_KEY", "one"); err != nil {

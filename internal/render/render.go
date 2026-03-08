@@ -106,6 +106,58 @@ func (r *Renderer) PlannedActions(actions []core.Action, previews []core.RiskRep
 	}
 }
 
+func (r *Renderer) ActionProgress(action core.Action) {
+	if r.JSON {
+		return
+	}
+	target := action.Title
+	if target == "" {
+		target = action.Command
+	}
+	if target == "" {
+		target = action.Path
+	}
+	if target == "" {
+		target = action.Query
+	}
+	if target == "" {
+		target = string(action.Type)
+	}
+	fmt.Fprintf(r.Out, "%s %s\n", r.actionTag(string(action.Type)), target)
+}
+
+func (r *Renderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
+	if r.JSON {
+		return
+	}
+	fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Approval needed"))
+	target := action.Command
+	if target == "" {
+		target = action.Path
+	}
+	if target == "" {
+		target = action.Query
+	}
+	if target == "" {
+		target = action.Title
+	}
+	fmt.Fprintf(r.Out, "%s %s\n", r.actionTag(string(action.Type)), target)
+	fmt.Fprintf(r.Out, "  %s: %s | %s: %t | %s: %t | %s: %t\n",
+		r.label("Risk"), r.riskLevel(report.Level),
+		r.label("Needs sudo"), report.NeedsSudo,
+		r.label("Touches system files"), report.TouchesSystemFiles,
+		r.label("Rollback available"), report.RollbackAvailable)
+	if action.Reason != "" {
+		fmt.Fprintf(r.Out, "  %s: %s\n", r.label("Why"), action.Reason)
+	}
+	if action.Type == core.ActionEditFile && action.PatchUnifiedDiff != "" {
+		fmt.Fprintf(r.Out, "  %s:\n", r.label("Diff"))
+		for _, line := range strings.Split(strings.TrimSpace(action.PatchUnifiedDiff), "\n") {
+			fmt.Fprintf(r.Out, "    %s\n", r.formatDiffLine(line))
+		}
+	}
+}
+
 func (r *Renderer) Result(result core.ActionResult) {
 	if r.JSON {
 		_ = r.encode(result)
@@ -174,6 +226,15 @@ func (r *Renderer) PromptChoice() (string, error) {
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("1."), "Approve all")
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("2."), "Approve step by step")
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), "Show commands only")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Cancel")
+	return r.readLine(r.prompt("> "))
+}
+
+func (r *Renderer) PromptApprovalChoice() (string, error) {
+	fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Choose"))
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("1."), "Allow once")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("2."), "Always allow on this machine")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), "Deny once")
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Cancel")
 	return r.readLine(r.prompt("> "))
 }
