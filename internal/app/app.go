@@ -10,6 +10,7 @@ import (
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/engine"
 	"github.com/richardsondx/IronLark/internal/executor"
+	"github.com/richardsondx/IronLark/internal/graph"
 	"github.com/richardsondx/IronLark/internal/patches"
 	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
@@ -34,6 +35,7 @@ type App struct {
 	PolicyStore policy.Store
 	Patches     patches.Store
 	Checkpoints checkpoints.Store
+	Graph       *graph.Manager
 }
 
 func New(overrides state.Overrides) (*App, error) {
@@ -91,6 +93,7 @@ func New(overrides state.Overrides) (*App, error) {
 		PolicyStore: policy.Store{Path: loaded.Paths.PolicyPath},
 		Patches:     patches.Store{Dir: loaded.Paths.PatchesDir},
 		Checkpoints: checkpoints.Store{Dir: loaded.Paths.CheckpointsDir},
+		Graph:       graph.NewManager(graph.Store{Dir: loaded.Paths.GraphDir}, runtimeState.Config.Graph, runtimeState.WorkingDir),
 	}
 
 	if providerCfg, err := runtimeState.ProviderConfig(); err == nil {
@@ -114,5 +117,6 @@ func (a *App) Engine() *engine.Engine {
 		Sessions:    a.Sessions,
 		Threads:     a.Threads,
 		PolicyStore: a.PolicyStore,
+		Graph:       a.Graph,
 	}
 }

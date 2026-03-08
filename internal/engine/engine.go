@@ -15,6 +15,7 @@ import (
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
+	"github.com/richardsondx/IronLark/internal/graph"
 	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/render"
@@ -35,6 +36,7 @@ type Engine struct {
 	Sessions    sessions.Store
 	Threads     threads.Store
 	PolicyStore policy.Store
+	Graph       *graph.Manager
 }
 
 func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode string) error {
@@ -46,8 +48,9 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 	if err != nil {
 		return err
 	}
+	graphDigest := e.ensureGraphDigest(ctx, graph.ModeLight)
 
-	threadRef, threadState, history, err := e.prepareTaskHistory(prompt, snapshot)
+	threadRef, threadState, history, err := e.prepareTaskHistory(prompt, snapshot, graphDigest)
 	if err != nil {
 		return err
 	}
@@ -101,7 +104,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			record.ContextJSON = fullSnapshot.JSON()
 
 			// Replace initial user message with full context and re-run the generation
-			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot)
+			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot, graphDigest)
 			continue
 		}
 
@@ -316,9 +319,10 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	if err != nil {
 		return err
 	}
+	graphDigest := e.ensureGraphDigest(ctx, graph.ModeLight)
 	*history = append(*history, core.ConversationMessage{
 		Role:    "user",
-		Content: buildInitialPrompt(prompt, snapshot),
+		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
 	})
 	e.Renderer.BeginThinking(e.thinkingLabel())
 	response, stopped, err := e.generateResponse(ctx, provider.Request{
@@ -717,11 +721,14 @@ func (e *Engine) thinkingLabel() string {
 	return "Thinking..."
 }
 
-func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot) string {
-	return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s", prompt, snapshot.JSON())
+func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot, graphDigest string) string {
+	if strings.TrimSpace(graphDigest) == "" {
+		return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s", prompt, snapshot.JSON())
+	}
+	return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s\n\nServer graph memory:\n%s", prompt, snapshot.JSON(), graphDigest)
 }
 
-func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot) (threads.ThreadRef, *threads.Thread, []core.ConversationMessage, error) {
+func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot, graphDigest string) (threads.ThreadRef, *threads.Thread, []core.ConversationMessage, error) {
 	threadRef, threadState, err := e.resolveThreadContext()
 	if err != nil {
 		return threads.ThreadRef{}, nil, nil, err
@@ -735,9 +742,19 @@ func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot) (th
 	}
 	history = append(history, core.ConversationMessage{
 		Role:    "user",
-		Content: buildInitialPrompt(prompt, snapshot),
+		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
 	})
 	return threadRef, threadState, history, nil
+}
+
+func (e *Engine) ensureGraphDigest(ctx context.Context, mode string) string {
+	if e.Graph == nil || !e.Graph.Enabled() {
+		return ""
+	}
+	if _, _, err := e.Graph.EnsureFresh(ctx, mode); err != nil {
+		return ""
+	}
+	return e.Graph.Digest(6)
 }
 
 func (e *Engine) resolveThreadContext() (threads.ThreadRef, *threads.Thread, error) {

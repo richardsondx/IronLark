@@ -96,6 +96,40 @@ func TestSetValueSupportsAgentFields(t *testing.T) {
 	}
 }
 
+func TestSetValueSupportsGraphFields(t *testing.T) {
+	cfg := Config{}
+	if err := SetValue(&cfg, "graph.enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "graph.auto_refresh", "light"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "graph.refresh_min_interval", "10m"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "graph.watch.enabled", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "graph.crawlers.docker.enabled", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Graph.Enabled == nil || !*cfg.Graph.Enabled {
+		t.Fatalf("expected graph enabled, got %#v", cfg.Graph.Enabled)
+	}
+	if cfg.Graph.AutoRefresh != "light" {
+		t.Fatalf("unexpected graph auto refresh %q", cfg.Graph.AutoRefresh)
+	}
+	if cfg.Graph.RefreshMinInterval != "10m" {
+		t.Fatalf("unexpected graph refresh interval %q", cfg.Graph.RefreshMinInterval)
+	}
+	if cfg.Graph.Watch.Enabled == nil || !*cfg.Graph.Watch.Enabled {
+		t.Fatalf("expected graph watch enabled, got %#v", cfg.Graph.Watch.Enabled)
+	}
+	if cfg.Graph.Crawlers["docker"].Enabled == nil || *cfg.Graph.Crawlers["docker"].Enabled {
+		t.Fatalf("expected docker crawler disabled, got %#v", cfg.Graph.Crawlers["docker"].Enabled)
+	}
+}
+
 func TestUpsertEnvValueCreatesAndUpdatesEnvFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := UpsertEnvValue(path, "OPENAI_API_KEY", "one"); err != nil {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -17,6 +18,7 @@ import (
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
+	"github.com/richardsondx/IronLark/internal/graph"
 	policypkg "github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/state"
@@ -82,6 +84,7 @@ func NewRootCommand() *cobra.Command {
 	cmd.AddCommand(newAgentCommand(flags))
 	cmd.AddCommand(newPlanCommand(flags))
 	cmd.AddCommand(newContextCommand(flags))
+	cmd.AddCommand(newGraphCommand(flags))
 	cmd.AddCommand(newPolicyCommand(flags))
 	cmd.AddCommand(newInspectCommand(flags))
 	cmd.AddCommand(newEditCommand(flags))
@@ -378,6 +381,302 @@ func newInspectCommand(flags *rootFlags) *cobra.Command {
 			return application.Renderer.Snapshot(snapshot)
 		},
 	}
+}
+
+func newGraphCommand(flags *rootFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "graph",
+		Short: "Inspect persistent server graph memory",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runGraphStatus(flags)
+		},
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "status",
+		Short: "Show the latest graph snapshot status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runGraphStatus(flags)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "crawl",
+		Short: "Run a graph crawl now",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			snapshot, events, err := application.Graph.Crawl(cmd.Context(), graph.ModeFull)
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(map[string]any{
+					"snapshot": snapshot,
+					"events":   events,
+				})
+			}
+			application.Renderer.Message(fmt.Sprintf("Graph snapshot updated for %s at %s", snapshot.Host, snapshot.CollectedAt.Format(time.RFC3339)))
+			application.Renderer.Message(fmt.Sprintf("Coverage: %d crawlers, new events: %d", len(snapshot.Coverage), len(events)))
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "coverage",
+		Short: "Show crawler coverage and skip reasons",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			snapshot, _, err := application.Graph.EnsureFresh(cmd.Context(), graph.ModeLight)
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(snapshot.Coverage)
+			}
+			for _, selection := range snapshot.Coverage {
+				status := "enabled"
+				if selection.Skipped {
+					status = "skipped"
+				}
+				application.Renderer.Message(fmt.Sprintf("%s  %s  %s", selection.Name, status, selection.Reason))
+			}
+			return nil
+		},
+	})
+	cmd.AddCommand(newGraphSummaryCommand(flags))
+	cmd.AddCommand(newGraphEventsCommand(flags))
+	cmd.AddCommand(newGraphShowCommand(flags))
+	cmd.AddCommand(newGraphWatchCommand(flags))
+	return cmd
+}
+
+func newGraphSummaryCommand(flags *rootFlags) *cobra.Command {
+	var sinceRaw string
+	cmd := &cobra.Command{
+		Use:   "summary",
+		Short: "Summarize recent graph activity",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			_, _, err = application.Graph.EnsureFresh(cmd.Context(), graph.ModeLight)
+			if err != nil {
+				return err
+			}
+			since, err := graph.ParseSince(sinceRaw, time.Now())
+			if err != nil {
+				return err
+			}
+			summary, err := application.Graph.Summary(since)
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(summary)
+			}
+			application.Renderer.Message(fmt.Sprintf("Host: %s", summary.Host))
+			application.Renderer.Message(fmt.Sprintf("Snapshot: %s", summary.SnapshotAt.Format(time.RFC3339)))
+			for _, line := range summary.Highlights {
+				application.Renderer.Message("- " + line)
+			}
+			for _, event := range summary.Recent {
+				application.Renderer.Message(fmt.Sprintf("%s  %s", event.OccurredAt.Format("2006-01-02 15:04:05"), event.Summary))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&sinceRaw, "since", "today", "time window: 2h, today, yesterday, all")
+	return cmd
+}
+
+func newGraphEventsCommand(flags *rootFlags) *cobra.Command {
+	var sinceRaw string
+	cmd := &cobra.Command{
+		Use:   "events",
+		Short: "List graph events",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			since, err := graph.ParseSince(sinceRaw, time.Now())
+			if err != nil {
+				return err
+			}
+			events, err := application.Graph.Store.EventsSince(application.Graph.HostKey(), since)
+			if err != nil {
+				return err
+			}
+			if application.Runtime.JSONOutput {
+				return application.Renderer.MessageJSON(events)
+			}
+			for _, event := range events {
+				application.Renderer.Message(fmt.Sprintf("%s  %-20s  %s", event.OccurredAt.Format("2006-01-02 15:04:05"), event.Type, event.Summary))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&sinceRaw, "since", "today", "time window: 2h, today, yesterday, all")
+	return cmd
+}
+
+func newGraphShowCommand(flags *rootFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "show <entity>",
+		Short: "Show matching graph entities",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			snapshot, _, err := application.Graph.EnsureFresh(cmd.Context(), graph.ModeLight)
+			if err != nil {
+				return err
+			}
+			query := strings.ToLower(args[0])
+			result := map[string]any{
+				"services":   filterServices(snapshot.Services, query),
+				"processes":  filterProcesses(snapshot.Processes, query),
+				"listeners":  filterListeners(snapshot.Listeners, query),
+				"containers": filterContainers(snapshot.Containers, query),
+				"relations":  filterRelations(snapshot.Relations, query),
+			}
+			return application.Renderer.MessageJSON(result)
+		},
+	}
+}
+
+func newGraphWatchCommand(flags *rootFlags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Manage desired graph watch state",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "enable",
+		Short: "Enable graph watch metadata",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			state := graph.WatchState{
+				Enabled:   true,
+				UpdatedAt: time.Now().UTC(),
+				Interval:  application.Runtime.Config.Graph.Watch.Interval,
+			}
+			if err := application.Graph.Store.SaveWatch(application.Graph.HostKey(), state); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Graph watch enabled for %s (interval %s)", application.Graph.HostKey(), state.Interval))
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "disable",
+		Short: "Disable graph watch metadata",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			state := graph.WatchState{
+				Enabled:   false,
+				UpdatedAt: time.Now().UTC(),
+				Interval:  application.Runtime.Config.Graph.Watch.Interval,
+			}
+			if err := application.Graph.Store.SaveWatch(application.Graph.HostKey(), state); err != nil {
+				return err
+			}
+			application.Renderer.Message(fmt.Sprintf("Graph watch disabled for %s", application.Graph.HostKey()))
+			return nil
+		},
+	})
+	return cmd
+}
+
+func runGraphStatus(flags *rootFlags) error {
+	application, err := buildApp(flags)
+	if err != nil {
+		return err
+	}
+	snapshot, _, err := application.Graph.EnsureFresh(context.Background(), graph.ModeLight)
+	if err != nil {
+		return err
+	}
+	watch, err := application.Graph.Store.Watch(application.Graph.HostKey())
+	if err != nil {
+		return err
+	}
+	if application.Runtime.JSONOutput {
+		return application.Renderer.MessageJSON(map[string]any{
+			"snapshot": snapshot,
+			"watch":    watch,
+		})
+	}
+	application.Renderer.Message(fmt.Sprintf("Host: %s", snapshot.Host))
+	application.Renderer.Message(fmt.Sprintf("Collected: %s", snapshot.CollectedAt.Format(time.RFC3339)))
+	application.Renderer.Message(fmt.Sprintf("Mode: %s", snapshot.Mode))
+	application.Renderer.Message(fmt.Sprintf("Watch enabled: %t", watch.Enabled))
+	application.Renderer.Message(fmt.Sprintf("Services: %d  Processes: %d  Listeners: %d  Containers: %d", len(snapshot.Services), len(snapshot.Processes), len(snapshot.Listeners), len(snapshot.Containers)))
+	return nil
+}
+
+func filterServices(values []graph.Service, query string) []graph.Service {
+	filtered := []graph.Service{}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(value.Name), query) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func filterProcesses(values []graph.Process, query string) []graph.Process {
+	filtered := []graph.Process{}
+	for _, value := range values {
+		if strings.Contains(strings.ToLower(value.Command), query) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func filterListeners(values []graph.Listener, query string) []graph.Listener {
+	filtered := []graph.Listener{}
+	for _, value := range values {
+		line := fmt.Sprintf("%s:%d %s", value.Address, value.Port, value.Process)
+		if strings.Contains(strings.ToLower(line), query) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func filterContainers(values []graph.Container, query string) []graph.Container {
+	filtered := []graph.Container{}
+	for _, value := range values {
+		line := value.Name + " " + value.Image + " " + value.Status
+		if strings.Contains(strings.ToLower(line), query) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
+}
+
+func filterRelations(values []graph.GraphRelation, query string) []graph.GraphRelation {
+	filtered := []graph.GraphRelation{}
+	for _, value := range values {
+		line := value.From + " " + value.Type + " " + value.To + " " + value.Evidence
+		if strings.Contains(strings.ToLower(line), query) {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func newDoctorCommand(flags *rootFlags) *cobra.Command {

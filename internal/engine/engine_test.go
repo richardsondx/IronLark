@@ -7,12 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/richardsondx/IronLark/internal/checkpoints"
 	cfgpkg "github.com/richardsondx/IronLark/internal/config"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
+	"github.com/richardsondx/IronLark/internal/graph"
 	"github.com/richardsondx/IronLark/internal/patches"
 	policypkg "github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
@@ -338,6 +340,44 @@ func TestRunTaskRedactsSecretUserInputInSessionStorage(t *testing.T) {
 	}
 }
 
+func TestRunTaskInjectsGraphDigestIntoPrompt(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	provider := &fakeProvider{responses: []core.LLMResponse{{Summary: "Done"}}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	graphDir := filepath.Join(t.TempDir(), "graph")
+	engine.Graph = graph.NewManager(graph.Store{Dir: graphDir}, cfgpkg.DefaultConfig().Graph, engine.Runtime.WorkingDir)
+	engine.Graph.Host = "srv-1"
+	engine.Graph.User = "richardson"
+	if err := engine.Graph.Store.SaveSnapshot(graph.GraphSnapshot{
+		ID:          "snap-1",
+		Host:        engine.Graph.HostKey(),
+		CollectedAt: time.Now().UTC(),
+		Services:    []graph.Service{{Name: "nextjs.service", ActiveState: "active"}},
+		Listeners:   []graph.Listener{{Port: 3000, Proto: "tcp"}},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "is nextjs running?", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	if len(provider.requests) == 0 {
+		t.Fatal("expected provider request")
+	}
+	if !strings.Contains(provider.requests[0].Messages[0].Content, "Server graph memory:") {
+		t.Fatalf("expected graph digest in prompt, got %q", provider.requests[0].Messages[0].Content)
+	}
+	if !strings.Contains(provider.requests[0].Messages[0].Content, "nextjs.service") {
+		t.Fatalf("expected graph service in prompt, got %q", provider.requests[0].Messages[0].Content)
+	}
+}
+
 func testEngine(t *testing.T, interaction core.InteractionMode) (*Engine, *bytes.Buffer) {
 	t.Helper()
 	root := t.TempDir()
@@ -385,9 +425,11 @@ func testEngine(t *testing.T, interaction core.InteractionMode) (*Engine, *bytes
 type fakeProvider struct {
 	responses []core.LLMResponse
 	index     int
+	requests  []provider.Request
 }
 
 func (f *fakeProvider) Generate(ctx context.Context, req provider.Request) (core.LLMResponse, error) {
+	f.requests = append(f.requests, req)
 	if len(f.responses) == 0 {
 		return core.LLMResponse{}, nil
 	}

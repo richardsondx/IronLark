@@ -21,6 +21,7 @@ type Config struct {
 	Agent           AgentConfig               `yaml:"agent,omitempty"`
 	Context         ContextConfig             `yaml:"context,omitempty"`
 	Thread          ThreadConfig              `yaml:"thread,omitempty"`
+	Graph           GraphConfig               `yaml:"graph,omitempty"`
 	Tools           ToolConfig                `yaml:"tools,omitempty"`
 	Rules           RulesConfig               `yaml:"rules,omitempty"`
 	Security        SecurityConfig            `yaml:"security,omitempty"`
@@ -67,6 +68,24 @@ type ThreadConfig struct {
 	AutoCompact    *bool   `yaml:"auto_compact,omitempty"`
 }
 
+type GraphConfig struct {
+	Enabled            *bool                    `yaml:"enabled,omitempty"`
+	AutoRefresh        string                   `yaml:"auto_refresh,omitempty"`
+	RefreshMinInterval string                   `yaml:"refresh_min_interval,omitempty"`
+	RetentionDays      int                      `yaml:"retention_days,omitempty"`
+	Watch              GraphWatchConfig         `yaml:"watch,omitempty"`
+	Crawlers           map[string]CrawlerConfig `yaml:"crawlers,omitempty"`
+}
+
+type GraphWatchConfig struct {
+	Enabled  *bool  `yaml:"enabled,omitempty"`
+	Interval string `yaml:"interval,omitempty"`
+}
+
+type CrawlerConfig struct {
+	Enabled *bool `yaml:"enabled,omitempty"`
+}
+
 type ToolConfig struct {
 	MaxTurns               int     `yaml:"max_turns,omitempty"`
 	MaxConsecutiveFailures int     `yaml:"max_consecutive_failures,omitempty"`
@@ -107,6 +126,7 @@ type Paths struct {
 	SessionsDir       string
 	ThreadsDir        string
 	AgentDir          string
+	GraphDir          string
 	PolicyPath        string
 	PatchesDir        string
 	CheckpointsDir    string
@@ -149,6 +169,27 @@ func DefaultConfig() Config {
 			RecentTurns:    8,
 			MaxResultChars: 1200,
 			AutoCompact:    boolPtr(true),
+		},
+		Graph: GraphConfig{
+			Enabled:            boolPtr(true),
+			AutoRefresh:        "light",
+			RefreshMinInterval: "5m",
+			RetentionDays:      14,
+			Watch: GraphWatchConfig{
+				Enabled:  boolPtr(false),
+				Interval: "5m",
+			},
+			Crawlers: map[string]CrawlerConfig{
+				"service":  {Enabled: boolPtr(true)},
+				"process":  {Enabled: boolPtr(true)},
+				"network":  {Enabled: boolPtr(true)},
+				"docker":   {Enabled: boolPtr(true)},
+				"file":     {Enabled: boolPtr(true)},
+				"git":      {Enabled: boolPtr(true)},
+				"log":      {Enabled: boolPtr(true)},
+				"cron":     {Enabled: boolPtr(true)},
+				"security": {Enabled: boolPtr(true)},
+			},
 		},
 		Tools: ToolConfig{
 			MaxTurns:               5,
@@ -228,6 +269,7 @@ func ResolvePaths(cwd string) (Paths, error) {
 		SessionsDir:       filepath.Join(dataHome, "lark", "sessions"),
 		ThreadsDir:        filepath.Join(dataHome, "lark", "threads"),
 		AgentDir:          filepath.Join(dataHome, "lark", "agents"),
+		GraphDir:          filepath.Join(dataHome, "lark", "graph"),
 		PolicyPath:        filepath.Join(dataHome, "lark", "policy.json"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
@@ -240,6 +282,7 @@ func EnsureDirs(paths Paths) error {
 		paths.SessionsDir,
 		paths.ThreadsDir,
 		paths.AgentDir,
+		paths.GraphDir,
 		paths.PatchesDir,
 		paths.CheckpointsDir,
 	}
@@ -392,6 +435,36 @@ func mergeConfig(base Config, override Config) Config {
 	if override.Thread.AutoCompact != nil {
 		out.Thread.AutoCompact = boolPtr(*override.Thread.AutoCompact)
 	}
+	if override.Graph.Enabled != nil {
+		out.Graph.Enabled = boolPtr(*override.Graph.Enabled)
+	}
+	if override.Graph.AutoRefresh != "" {
+		out.Graph.AutoRefresh = override.Graph.AutoRefresh
+	}
+	if override.Graph.RefreshMinInterval != "" {
+		out.Graph.RefreshMinInterval = override.Graph.RefreshMinInterval
+	}
+	if override.Graph.RetentionDays != 0 {
+		out.Graph.RetentionDays = override.Graph.RetentionDays
+	}
+	if override.Graph.Watch.Enabled != nil {
+		out.Graph.Watch.Enabled = boolPtr(*override.Graph.Watch.Enabled)
+	}
+	if override.Graph.Watch.Interval != "" {
+		out.Graph.Watch.Interval = override.Graph.Watch.Interval
+	}
+	if len(override.Graph.Crawlers) > 0 {
+		if out.Graph.Crawlers == nil {
+			out.Graph.Crawlers = map[string]CrawlerConfig{}
+		}
+		for name, crawler := range override.Graph.Crawlers {
+			baseCrawler := out.Graph.Crawlers[name]
+			if crawler.Enabled != nil {
+				baseCrawler.Enabled = boolPtr(*crawler.Enabled)
+			}
+			out.Graph.Crawlers[name] = baseCrawler
+		}
+	}
 	if override.Tools.MaxTurns != 0 {
 		out.Tools.MaxTurns = override.Tools.MaxTurns
 	}
@@ -488,7 +561,22 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.Thread.MaxResultChars = parseInt(value)
 	case "thread.auto_compact":
 		cfg.Thread.AutoCompact = boolPtr(parseBool(value))
+	case "graph.enabled":
+		cfg.Graph.Enabled = boolPtr(parseBool(value))
+	case "graph.auto_refresh":
+		cfg.Graph.AutoRefresh = value
+	case "graph.refresh_min_interval":
+		cfg.Graph.RefreshMinInterval = value
+	case "graph.retention_days":
+		cfg.Graph.RetentionDays = parseInt(value)
+	case "graph.watch.enabled":
+		cfg.Graph.Watch.Enabled = boolPtr(parseBool(value))
+	case "graph.watch.interval":
+		cfg.Graph.Watch.Interval = value
 	default:
+		if strings.HasPrefix(key, "graph.crawlers.") {
+			return setCrawlerValue(cfg, key, value)
+		}
 		if strings.HasPrefix(key, "providers.") {
 			return setProviderValue(cfg, key, value)
 		}
@@ -594,6 +682,27 @@ func loadEnvFiles(paths ...string) error {
 			return fmt.Errorf("load env file %s: %w", path, err)
 		}
 	}
+	return nil
+}
+
+func setCrawlerValue(cfg *Config, key, value string) error {
+	parts := strings.Split(key, ".")
+	if len(parts) != 4 {
+		return fmt.Errorf("crawler key must look like graph.crawlers.<name>.<field>")
+	}
+	name := parts[2]
+	field := parts[3]
+	if cfg.Graph.Crawlers == nil {
+		cfg.Graph.Crawlers = map[string]CrawlerConfig{}
+	}
+	crawler := cfg.Graph.Crawlers[name]
+	switch field {
+	case "enabled":
+		crawler.Enabled = boolPtr(parseBool(value))
+	default:
+		return fmt.Errorf("unsupported crawler field %q", field)
+	}
+	cfg.Graph.Crawlers[name] = crawler
 	return nil
 }
 
