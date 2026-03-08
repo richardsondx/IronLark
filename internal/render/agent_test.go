@@ -18,11 +18,11 @@ func TestAgentHeaderUsesCompactModeForShortTerminals(t *testing.T) {
 	compact := renderer.headerLines(80, 24)
 	full := renderer.headerLines(80, 40)
 
-	if len(compact) != 2 {
-		t.Fatalf("expected compact header with 2 lines, got %d", len(compact))
+	if len(compact) != 1 {
+		t.Fatalf("expected compact header with 1 line, got %d", len(compact))
 	}
-	if len(full) != 3 {
-		t.Fatalf("expected full header with 3 lines, got %d", len(full))
+	if len(full) != 2 {
+		t.Fatalf("expected full header with 2 lines, got %d", len(full))
 	}
 }
 
@@ -89,8 +89,30 @@ func TestDrawLockedKeepsCursorOnPromptLine(t *testing.T) {
 	output := renderer.Out.(*bytes.Buffer).String()
 	renderer.mu.Unlock()
 
-	if !strings.HasSuffix(output, "\r> ") {
-		t.Fatalf("expected output to end on prompt line, got %q", output)
+	if !strings.Contains(output, "\r> \r\n") {
+		t.Fatalf("expected output to contain prompt line before footer, got %q", output)
+	}
+	if !strings.HasSuffix(output, "\r IronLark Agent                                               \"srv-1\"  thread-1 ") {
+		t.Fatalf("expected output to end on footer line, got %q", output)
+	}
+}
+
+func TestFooterLineUsesGreenBarWithAgentLabel(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.Color = true
+	line := renderer.footerLineLocked(48)
+
+	if !strings.Contains(line, ansiBgGreen) {
+		t.Fatalf("expected green background in footer, got %q", line)
+	}
+	if !strings.Contains(line, "IronLark Agent") {
+		t.Fatalf("expected agent label in footer, got %q", line)
+	}
+	if !strings.Contains(line, "\"srv-1\"  thread-1") {
+		t.Fatalf("expected host and thread id in footer, got %q", line)
+	}
+	if visibleWidth(line) != 48 {
+		t.Fatalf("expected padded footer width 48, got %d", visibleWidth(line))
 	}
 }
 
@@ -108,6 +130,7 @@ func TestSlashMenuShowsModeToggleAndSelectsHelp(t *testing.T) {
 		t.Fatalf("unexpected filtered commands %#v", commands)
 	}
 	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'h'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'e'})
 	commands = renderer.filteredSlashCommandsLockedForTest()
 	if len(commands) != 1 || commands[0].Execute != "/help" {
 		t.Fatalf("unexpected filtered commands %#v", commands)
@@ -209,8 +232,11 @@ func TestSetInteractionUpdatesHeaderStatus(t *testing.T) {
 	renderer.SetInteraction(core.InteractionPlanFirst)
 
 	header := renderer.headerLines(120, 40)
-	if header[1] == "" || !containsString(header[1], "mode=plan-first") {
-		t.Fatalf("expected plan-first in header, got %q", header[1])
+	if header[0] == "" || !containsString(header[0], "mode=plan-first") {
+		t.Fatalf("expected plan-first in header, got %q", header[0])
+	}
+	if containsString(strings.Join(header, " "), "host=") || containsString(strings.Join(header, " "), "thread=") || containsString(strings.Join(header, " "), "model=") {
+		t.Fatalf("expected compact header metadata to be removed, got %#v", header)
 	}
 }
 
@@ -228,7 +254,7 @@ func TestThinkingIndicatorAnimatesAndStopsCleanly(t *testing.T) {
 	if frame == 0 {
 		t.Fatalf("expected thinking frame to advance")
 	}
-	if !containsString(status, "Thinking...") {
+	if !containsString(status, "Thinking...") || !containsString(status, "Ctrl+C to stop") {
 		t.Fatalf("expected thinking label in status line, got %q", status)
 	}
 

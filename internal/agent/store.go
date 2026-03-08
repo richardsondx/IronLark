@@ -14,17 +14,18 @@ import (
 )
 
 type Workspace struct {
-	Key               string    `json:"key"`
-	User              string    `json:"user"`
-	Host              string    `json:"host"`
-	CWD               string    `json:"cwd"`
-	ThreadID          string    `json:"thread_id,omitempty"`
-	TmuxSession       string    `json:"tmux_session"`
-	TmuxWindow        string    `json:"tmux_window"`
-	TmuxTarget        string    `json:"tmux_target"`
-	CreatedInsideTmux bool      `json:"created_inside_tmux,omitempty"`
-	LastActiveAt      time.Time `json:"last_active_at"`
-	CreatedAt         time.Time `json:"created_at"`
+	Key            string    `json:"key"`
+	User           string    `json:"user"`
+	Host           string    `json:"host"`
+	CWD            string    `json:"cwd"`
+	ThreadID       string    `json:"thread_id,omitempty"`
+	SessionID      string    `json:"session_id"`
+	RunnerPID      int       `json:"runner_pid,omitempty"`
+	SocketPath     string    `json:"socket_path"`
+	State          string    `json:"state,omitempty"`
+	LastAttachedAt time.Time `json:"last_attached_at,omitempty"`
+	LastActiveAt   time.Time `json:"last_active_at"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type Store struct {
@@ -56,31 +57,18 @@ func DefaultSessionPrefix(prefix string) string {
 	return prefix
 }
 
-func DefaultWindowName(cwd string) string {
-	base := sanitizeToken(filepath.Base(cwd))
-	if base == "" || base == "." || base == string(filepath.Separator) {
-		return "agent"
-	}
-	if len(base) > 24 {
-		base = base[:24]
-	}
-	return "agent-" + base
-}
-
-func BuildWorkspace(prefix, user, host, cwd, threadID string, insideTmux bool) Workspace {
+func BuildWorkspace(prefix, storeDir, user, host, cwd, threadID string) Workspace {
 	key := WorkspaceKey(host, cwd)
-	session := fmt.Sprintf("%s-%s", DefaultSessionPrefix(prefix), key)
-	window := DefaultWindowName(cwd)
+	sessionID := fmt.Sprintf("%s-%s", DefaultSessionPrefix(prefix), key)
 	return Workspace{
-		Key:               key,
-		User:              user,
-		Host:              host,
-		CWD:               filepath.Clean(cwd),
-		ThreadID:          strings.TrimSpace(threadID),
-		TmuxSession:       session,
-		TmuxWindow:        window,
-		TmuxTarget:        session + ":" + window,
-		CreatedInsideTmux: insideTmux,
+		Key:        key,
+		User:       user,
+		Host:       host,
+		CWD:        filepath.Clean(cwd),
+		ThreadID:   strings.TrimSpace(threadID),
+		SessionID:  sessionID,
+		SocketPath: filepath.Join(storeDir, key+".sock"),
+		State:      StateStopped,
 	}
 }
 
@@ -95,6 +83,18 @@ func (s Store) Load(key string) (Workspace, error) {
 	var workspace Workspace
 	if err := json.Unmarshal(data, &workspace); err != nil {
 		return Workspace{}, fmt.Errorf("decode agent workspace: %w", err)
+	}
+	if strings.TrimSpace(workspace.Key) == "" {
+		workspace.Key = key
+	}
+	if strings.TrimSpace(workspace.SocketPath) == "" {
+		workspace.SocketPath = filepath.Join(s.Dir, workspace.Key+".sock")
+	}
+	if strings.TrimSpace(workspace.SessionID) == "" {
+		workspace.SessionID = fmt.Sprintf("%s-%s", DefaultSessionPrefix(""), workspace.Key)
+	}
+	if strings.TrimSpace(workspace.State) == "" {
+		workspace.State = StateStopped
 	}
 	return workspace, nil
 }

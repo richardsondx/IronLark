@@ -565,12 +565,14 @@ func forceColorEnabled() bool {
 }
 
 const (
-	ansiReset  = "\033[0m"
-	ansiBold   = "\033[1m"
-	ansiRed    = "\033[31m"
-	ansiGreen  = "\033[32m"
-	ansiYellow = "\033[33m"
-	ansiBlue   = "\033[34m"
-	ansiGray   = "\033[90m"
-	ansiCyan   = "\033[36m"
+	ansiReset   = "\033[0m"
+	ansiBold    = "\033[1m"
+	ansiBlack   = "\033[30m"
+	ansiRed     = "\033[31m"
+	ansiGreen   = "\033[32m"
+	ansiYellow  = "\033[33m"
+	ansiBlue    = "\033[34m"
+	ansiGray    = "\033[90m"
+	ansiCyan    = "\033[36m"
+	ansiBgGreen = "\033[42m"
 )

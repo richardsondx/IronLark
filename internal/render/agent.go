@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/richardsondx/IronLark/internal/checkpoints"
@@ -115,6 +117,7 @@ type AgentRenderer struct {
 	redrawInterval time.Duration
 	altScreen      bool
 	blocker        *blockerState
+	nowFn          func() time.Time
 }
 
 func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta) *AgentRenderer {
@@ -132,7 +135,9 @@ func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta
 			{Label: "policy", Execute: "/policy"},
 			{Label: "clear", Execute: "/clear"},
 			{Label: "help", Execute: "/help"},
+			{Label: "exit", Execute: "/exit"},
 		},
+		nowFn: time.Now,
 	}
 	if file, ok := in.(*os.File); ok {
 		renderer.rawIn = file
@@ -502,6 +507,8 @@ func (r *AgentRenderer) readPromptRaw(inFile *os.File) (string, error) {
 		return "", err
 	}
 	defer term.Restore(int(inFile.Fd()), oldState)
+	stopResize := r.watchResize()
+	defer stopResize()
 
 	r.mu.Lock()
 	r.lastPrompt = "> "
@@ -572,6 +579,8 @@ func (r *AgentRenderer) readBlockerRaw(inFile *os.File, action core.Action) (str
 		return "", "", err
 	}
 	defer term.Restore(int(inFile.Fd()), oldState)
+	stopResize := r.watchResize()
+	defer stopResize()
 
 	r.mu.Lock()
 	r.lastPrompt = "> "
@@ -614,6 +623,28 @@ func (r *AgentRenderer) readBlockerRaw(inFile *os.File, action core.Action) (str
 			}
 			return submitted, mode, nil
 		}
+	}
+}
+
+func (r *AgentRenderer) watchResize() func() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGWINCH)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-signals:
+				r.mu.Lock()
+				_ = r.drawLocked()
+				r.mu.Unlock()
+			}
+		}
+	}()
+	return func() {
+		close(done)
+		signal.Stop(signals)
 	}
 }
 
@@ -961,6 +992,12 @@ func (r *AgentRenderer) filteredSlashCommandsLocked() []slashCommand {
 		if strings.HasPrefix(left, "approval:") != strings.HasPrefix(right, "approval:") {
 			return strings.HasPrefix(left, "approval:")
 		}
+		if strings.HasPrefix(left, "secret:") != strings.HasPrefix(right, "secret:") {
+			return strings.HasPrefix(left, "secret:")
+		}
+		if left == "exit" || right == "exit" {
+			return right == "exit"
+		}
 		leftStarts := strings.HasPrefix(left, filter)
 		rightStarts := strings.HasPrefix(right, filter)
 		if leftStarts != rightStarts {
@@ -1051,7 +1088,7 @@ func (r *AgentRenderer) writeBlock(title string, lines []string) {
 func (r *AgentRenderer) drawLocked() error {
 	width, height := r.sizeFn()
 	header := r.headerLines(width, height)
-	bodyHeight := height - len(header) - 2
+	bodyHeight := height - len(header) - 3
 	if bodyHeight < 4 {
 		bodyHeight = 4
 	}
@@ -1109,17 +1146,18 @@ func (r *AgentRenderer) drawLocked() error {
 	if err := r.writeScreenLine(truncateDisplay(r.statusLineLocked(width), width)); err != nil {
 		return err
 	}
-	return r.writeFinalScreenLine(truncateDisplay(r.promptLineLocked(width), width))
+	if err := r.writeScreenLine(truncateDisplay(r.promptLineLocked(width), width)); err != nil {
+		return err
+	}
+	return r.writeFinalScreenLine(r.footerLineLocked(width))
 }
 
 func (r *AgentRenderer) headerLines(width, height int) []string {
-	hostLine := fmt.Sprintf(" IronLark Agent  host=%s  cwd=%s ", r.meta.Host, r.meta.CWD)
-	statusLine := fmt.Sprintf(" model=%s  approval=%s  mode=%s  thread=%s ", r.meta.Model, r.meta.ApprovalMode, r.currentModeLabel(), r.meta.ThreadID)
+	statusLine := fmt.Sprintf(" approval=%s  mode=%s ", r.meta.ApprovalMode, r.currentModeLabel())
 	if r.meta.CompactAtRows > 0 && height <= r.meta.CompactAtRows {
-		return []string{truncateDisplay(hostLine, width), truncateDisplay(statusLine, width)}
+		return []string{truncateDisplay(statusLine, width)}
 	}
 	return []string{
-		truncateDisplay(hostLine, width),
 		truncateDisplay(statusLine, width),
 		truncateDisplay(" SSH-first operator workspace. Up/down scrolls output. Type / for command menu. ", width),
 	}
@@ -1129,7 +1167,7 @@ func (r *AgentRenderer) statusLineLocked(width int) string {
 	base := strings.Repeat("-", clamp(width, 12, width))
 	switch {
 	case r.thinking:
-		label := thinkingFrames[r.thinkingFrame%len(thinkingFrames)] + " " + r.thinkingLabel
+		label := thinkingFrames[r.thinkingFrame%len(thinkingFrames)] + " " + r.thinkingLabel + "  Ctrl+C to stop"
 		return truncate(statusWithLabel(width, label), width)
 	case r.actionStatus != "":
 		return truncate(statusWithLabel(width, r.actionStatus), width)
@@ -1150,6 +1188,16 @@ func (r *AgentRenderer) promptLineLocked(width int) string {
 		return "> " + renderPromptValue(value)
 	}
 	return "> " + renderPromptValue(string(r.composer))
+}
+
+func (r *AgentRenderer) footerLineLocked(width int) string {
+	left := " IronLark Agent "
+	right := fmt.Sprintf(" \"%s\"  %s ", shortHost(r.meta.Host), r.meta.ThreadID)
+	label := joinFooterSides(left, right, width)
+	if !r.Color {
+		return label
+	}
+	return ansiBold + ansiBlack + ansiBgGreen + label + ansiReset
 }
 
 func (r *AgentRenderer) overlayLinesLocked(width int) []string {
@@ -1562,6 +1610,48 @@ func truncateVisible(value string, width int) string {
 		b.WriteString(ansiReset)
 	}
 	return b.String()
+}
+
+func padVisibleRight(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	value = truncateDisplay(value, width)
+	padding := width - visibleWidth(value)
+	if padding <= 0 {
+		return value
+	}
+	return value + strings.Repeat(" ", padding)
+}
+
+func joinFooterSides(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	left = truncateDisplay(left, width)
+	right = truncateDisplay(right, width)
+	leftWidth := visibleWidth(left)
+	rightWidth := visibleWidth(right)
+	if leftWidth+rightWidth >= width {
+		if rightWidth >= width {
+			return truncateDisplay(right, width)
+		}
+		left = truncateDisplay(left, width-rightWidth)
+		leftWidth = visibleWidth(left)
+	}
+	gap := width - leftWidth - rightWidth
+	if gap < 1 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func shortHost(host string) string {
+	host = strings.TrimSpace(host)
+	if idx := strings.Index(host, "."); idx > 0 {
+		return host[:idx]
+	}
+	return host
 }
 
 func visibleWidth(value string) int {

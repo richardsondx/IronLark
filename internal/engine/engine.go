@@ -3,9 +3,12 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/richardsondx/IronLark/internal/agent"
@@ -19,6 +22,8 @@ import (
 	"github.com/richardsondx/IronLark/internal/state"
 	"github.com/richardsondx/IronLark/internal/threads"
 )
+
+var errTurnStopped = errors.New("turn stopped")
 
 type Engine struct {
 	Runtime     state.Runtime
@@ -276,8 +281,11 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 				e.Renderer.ClearScreen()
 				e.Renderer.Message("Chat history cleared. Starting fresh.")
 				continue
+			case "/exit":
+				record.FinishedAt = time.Now().UTC()
+				return e.Sessions.Save(record)
 			case "/help":
-				e.Renderer.Message("Available slash commands:\n  /mode [name]      - Get or set execute-first / plan-first\n  /approval [name]  - Get or set confirm / auto-safe / agent / suggest\n  /secret [state]   - Get or set secret input visibility\n  /model [name]     - Get or set the current model\n  /provider [name]  - Get or set the current provider\n  /clear            - Clear the conversation history\n  /help             - Show this menu")
+				e.Renderer.Message("Available slash commands:\n  /mode [name]      - Get or set execute-first / plan-first\n  /approval [name]  - Get or set confirm / auto-safe / agent / suggest\n  /secret [state]   - Get or set secret input visibility\n  /model [name]     - Get or set the current model\n  /provider [name]  - Get or set the current provider\n  /clear            - Clear the conversation history\n  /help             - Show this menu\n  /exit             - Exit the agent session")
 				continue
 			default:
 				e.Renderer.Message(fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", cmd))
@@ -294,6 +302,10 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 			return e.Sessions.Save(record)
 		}
 		if err := e.runChatPrompt(ctx, prompt, nil, &history, &record, threadState, threadRef); err != nil {
+			if errors.Is(err, errTurnStopped) {
+				e.Renderer.Message("Stopped current turn.")
+				continue
+			}
 			return err
 		}
 	}
@@ -309,7 +321,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 		Content: buildInitialPrompt(prompt, snapshot),
 	})
 	e.Renderer.BeginThinking(e.thinkingLabel())
-	response, err := e.Provider.Generate(ctx, provider.Request{
+	response, stopped, err := e.generateResponse(ctx, provider.Request{
 		Model:       e.Runtime.Model,
 		System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 		Messages:    *history,
@@ -318,6 +330,9 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	e.Renderer.EndThinking()
 	if err != nil {
 		return err
+	}
+	if stopped {
+		return errTurnStopped
 	}
 	record.Prompt += "\n" + prompt
 	record.ContextJSON = snapshot.JSON()
@@ -358,6 +373,38 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 		e.warnContextUsage(*threadState, threadRef.Source)
 	}
 	return nil
+}
+
+func (e *Engine) generateResponse(ctx context.Context, request provider.Request) (core.LLMResponse, bool, error) {
+	generateCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+	defer signal.Stop(signals)
+
+	var stopped atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		select {
+		case <-signals:
+			stopped.Store(true)
+			cancel()
+		case <-generateCtx.Done():
+		}
+	}()
+
+	response, err := e.Provider.Generate(generateCtx, request)
+	cancel()
+	<-done
+	if err != nil {
+		if stopped.Load() && errors.Is(err, context.Canceled) {
+			return core.LLMResponse{}, true, nil
+		}
+		return core.LLMResponse{}, false, err
+	}
+	return response, false, nil
 }
 
 func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]core.ActionResult, bool, error) {
