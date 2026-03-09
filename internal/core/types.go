@@ -108,6 +108,52 @@ type Action struct {
 	Alternatives     []string   `json:"alternatives,omitempty"`
 }
 
+type Narration struct {
+	TurnIntent  string                `json:"turn_intent,omitempty"`
+	ActionHints []NarrationActionHint `json:"action_hints,omitempty"`
+}
+
+type NarrationActionHint struct {
+	ActionID string `json:"action_id"`
+	Text     string `json:"text"`
+}
+
+type NarrativeKind string
+
+const (
+	NarrativeTurnStarted       NarrativeKind = "turn_started"
+	NarrativeIntent            NarrativeKind = "intent"
+	NarrativeContextShift      NarrativeKind = "context_shift"
+	NarrativeActionGroup       NarrativeKind = "action_group"
+	NarrativeActionStarted     NarrativeKind = "action_started"
+	NarrativeActionFinished    NarrativeKind = "action_finished"
+	NarrativeVerificationStart NarrativeKind = "verification_started"
+	NarrativeBlocked           NarrativeKind = "blocked"
+	NarrativeTurnFinished      NarrativeKind = "turn_finished"
+)
+
+type NarrativeStatus string
+
+const (
+	NarrativePending NarrativeStatus = "pending"
+	NarrativeRunning NarrativeStatus = "running"
+	NarrativeDone    NarrativeStatus = "done"
+	NarrativeError   NarrativeStatus = "error"
+	NarrativeSkipped NarrativeStatus = "skipped"
+)
+
+type NarrativeEvent struct {
+	ID        string          `json:"id,omitempty"`
+	Kind      NarrativeKind   `json:"kind"`
+	Phase     string          `json:"phase,omitempty"`
+	Text      string          `json:"text"`
+	ActionID  string          `json:"action_id,omitempty"`
+	Target    string          `json:"target,omitempty"`
+	Status    NarrativeStatus `json:"status,omitempty"`
+	Details   []string        `json:"details,omitempty"`
+	Timestamp time.Time       `json:"timestamp,omitempty"`
+}
+
 type Verification struct {
 	Type        ActionType `json:"type"`
 	Command     string     `json:"command,omitempty"`
@@ -122,6 +168,7 @@ type LLMResponse struct {
 	Findings       []string       `json:"findings"`
 	Actions        []Action       `json:"actions"`
 	Verification   []Verification `json:"verification"`
+	Narration      *Narration     `json:"narration,omitempty"`
 	NeedsUserInput bool           `json:"needs_user_input"`
 	Confidence     float64        `json:"confidence,omitempty"`
 }

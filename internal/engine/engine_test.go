@@ -23,6 +23,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/search"
 	"github.com/richardsondx/IronLark/internal/sessions"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/threads"
 )
 
 func TestExecuteTurnExecuteFirstSkipsVisiblePlan(t *testing.T) {
@@ -145,6 +146,414 @@ func TestRunTaskTriggersThinkingLifecycle(t *testing.T) {
 	}
 	if renderer.beginCalls == 0 || renderer.endCalls == 0 {
 		t.Fatalf("expected thinking lifecycle, got begin=%d end=%d", renderer.beginCalls, renderer.endCalls)
+	}
+}
+
+func TestGenerateResponseRetriesEmptySummary(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	fake := &fakeProvider{responses: []core.LLMResponse{
+		{},
+		{Summary: "The project is a single Go CLI with most code under internal/."},
+	}}
+	engine.Provider = fake
+
+	response, stopped, err := engine.generateResponse(context.Background(), provider.Request{
+		Model:       "gpt-5",
+		System:      "test",
+		Messages:    []core.ConversationMessage{{Role: "user", Content: "how is this project setup?"}},
+		Temperature: 0.1,
+	})
+	if err != nil {
+		t.Fatalf("generateResponse() error = %v", err)
+	}
+	if stopped {
+		t.Fatal("expected non-stopped response")
+	}
+	if response.Summary == "" {
+		t.Fatalf("expected non-empty summary after retry, got %#v", response)
+	}
+	if len(fake.requests) != 2 {
+		t.Fatalf("expected retry on empty summary, got %d requests", len(fake.requests))
+	}
+	lastMessages := fake.requests[1].Messages
+	if len(lastMessages) == 0 || !strings.Contains(lastMessages[len(lastMessages)-1].Content, "empty summary") {
+		t.Fatalf("expected corrective retry prompt, got %#v", lastMessages)
+	}
+}
+
+func TestGenerateResponseFallsBackWhenSummaryStaysEmpty(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{Actions: []core.Action{{ID: "1", Type: core.ActionRunShell, Title: "Inspect repo", Reason: "Inspect the repo layout."}}},
+		{Actions: []core.Action{{ID: "1", Type: core.ActionRunShell, Title: "Inspect repo", Reason: "Inspect the repo layout."}}},
+	}}
+
+	response, stopped, err := engine.generateResponse(context.Background(), provider.Request{
+		Model:       "gpt-5",
+		System:      "test",
+		Messages:    []core.ConversationMessage{{Role: "user", Content: "how is this project setup?"}},
+		Temperature: 0.1,
+	})
+	if err != nil {
+		t.Fatalf("generateResponse() error = %v", err)
+	}
+	if stopped {
+		t.Fatal("expected non-stopped response")
+	}
+	if response.Summary != "Inspect the repo layout." {
+		t.Fatalf("expected fallback summary, got %#v", response)
+	}
+}
+
+func TestRunChatPromptNormalizesEmptySummaryBeforeRendering(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{}}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "what is this?", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if record.Summary == "" {
+		t.Fatalf("expected normalized summary in record, got %#v", record)
+	}
+	found := false
+	for _, msg := range record.Messages {
+		if msg.Role == "assistant" && strings.Contains(msg.Content, "I wasn't able to produce a complete answer") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected normalized assistant message, got %#v", record.Messages)
+	}
+}
+
+func TestRunChatPromptShortCircuitsSimpleGreeting(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{}
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "hello world", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if record.Summary != "Hi! How can I help you with your server or repo today?" {
+		t.Fatalf("unexpected greeting summary %q", record.Summary)
+	}
+}
+
+func TestRunChatPromptReplacesEmptyGreetingFallback(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{}, {}}}
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "hello world", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if record.Summary != "Hi! How can I help you with your server or repo today?" {
+		t.Fatalf("unexpected greeting summary %q", record.Summary)
+	}
+}
+
+func TestRunChatPromptRetriesWithDirectPromptAfterSyntheticFallback(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	fake := &fakeProvider{responses: []core.LLMResponse{
+		{},
+		{},
+		{Summary: "Hello, world!"},
+	}}
+	engine.Provider = fake
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "hellow world", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if record.Summary != "Hello, world!" {
+		t.Fatalf("unexpected recovered summary %q", record.Summary)
+	}
+	if len(fake.requests) != 3 {
+		t.Fatalf("expected fallback recovery request, got %d requests", len(fake.requests))
+	}
+	lastMessages := fake.requests[2].Messages
+	if len(lastMessages) != 1 || lastMessages[0].Content != "hellow world" {
+		t.Fatalf("expected direct prompt retry, got %#v", lastMessages)
+	}
+}
+
+func TestRunChatPromptEmitsNarrativeEventsWhenEnabled(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{
+		Summary: "Inspecting tests.",
+		Narration: &core.Narration{
+			TurnIntent: "I found an existing test file, so I'll inspect it before editing.",
+			ActionHints: []core.NarrationActionHint{{
+				ActionID: "read-tests",
+				Text:     "Let me read the current tests first.",
+			}},
+		},
+		Actions: []core.Action{{
+			ID:      "read-tests",
+			Type:    core.ActionRunShell,
+			Title:   "pwd",
+			Command: "pwd",
+			Reason:  "inspect current location",
+		}},
+	}}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "inspect tests", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if len(renderer.narrativeEvents) < 3 {
+		t.Fatalf("expected narrative events, got %#v", renderer.narrativeEvents)
+	}
+	if renderer.narrativeEvents[0].Kind != core.NarrativeTurnStarted {
+		t.Fatalf("expected first event to be turn_started, got %#v", renderer.narrativeEvents[0])
+	}
+	foundIntent := false
+	for _, event := range renderer.narrativeEvents {
+		if event.Kind == core.NarrativeIntent && strings.Contains(event.Text, "existing test file") {
+			foundIntent = true
+			break
+		}
+	}
+	if !foundIntent {
+		t.Fatalf("expected model-authored turn intent in events %#v", renderer.narrativeEvents)
+	}
+}
+
+func TestExecuteTurnUsesModelAuthoredActionHint(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	response := core.LLMResponse{
+		Summary: "Inspecting tests.",
+		Narration: &core.Narration{
+			ActionHints: []core.NarrationActionHint{{
+				ActionID: "read-tests",
+				Text:     "Let me read the current tests first.",
+			}},
+		},
+		Actions: []core.Action{{
+			ID:      "read-tests",
+			Type:    core.ActionRunShell,
+			Title:   "pwd",
+			Command: "pwd",
+			Reason:  "inspect current location",
+		}},
+	}
+
+	if _, _, err := engine.executeTurnWithNarrator(context.Background(), response, newTurnNarrator(5, response.Narration)); err != nil {
+		t.Fatalf("executeTurnWithNarrator() error = %v", err)
+	}
+	foundHint := false
+	for _, event := range renderer.narrativeEvents {
+		if event.Kind == core.NarrativeActionStarted && strings.Contains(event.Text, "read the current tests first") {
+			foundHint = true
+			break
+		}
+	}
+	if !foundHint {
+		t.Fatalf("expected model-authored action hint in events %#v", renderer.narrativeEvents)
+	}
+}
+
+func TestExecuteTurnSynthesizesNarrationWithoutModelHints(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	response := core.LLMResponse{
+		Summary: "Inspecting files.",
+		Actions: []core.Action{
+			{ID: "1", Type: core.ActionRunShell, Title: "pwd", Command: "pwd", Reason: "inspect cwd"},
+			{ID: "2", Type: core.ActionRunShell, Title: "ls", Command: "ls", Reason: "inspect files"},
+		},
+	}
+
+	narrator := newTurnNarrator(7, nil)
+	if _, _, err := engine.executeTurnWithNarrator(context.Background(), response, narrator); err != nil {
+		t.Fatalf("executeTurnWithNarrator() error = %v", err)
+	}
+	started := []core.NarrativeEvent{}
+	for _, event := range renderer.narrativeEvents {
+		if event.Kind == core.NarrativeActionStarted {
+			started = append(started, event)
+		}
+	}
+	if len(started) != 2 {
+		t.Fatalf("expected two action_started events, got %#v", renderer.narrativeEvents)
+	}
+	if !strings.Contains(started[0].Text, "pwd") || !strings.Contains(started[1].Text, "ls") {
+		t.Fatalf("expected synthesized text to reference action targets, got %#v", started)
+	}
+	if started[0].Text == started[1].Text {
+		t.Fatalf("expected varied synthesized narration, got %#v", started)
+	}
+}
+
+func TestExecuteTurnNarratesBlockedInput(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{
+		inputResults: []core.ActionResult{{
+			InputKind:    core.InputText,
+			FieldKey:     "token",
+			ResponseMode: core.InputResponseSubmitted,
+			InputValue:   "abc",
+		}},
+	}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	response := core.LLMResponse{
+		Summary: "Need input.",
+		Actions: []core.Action{{
+			ID:           "ask-1",
+			Type:         core.ActionAskUser,
+			InputKind:    core.InputText,
+			FieldKey:     "token",
+			Prompt:       "Paste the token",
+			Reason:       "I need your input before I can continue.",
+			Alternatives: []string{"submit", "skip", "follow_up"},
+		}},
+	}
+
+	if _, _, err := engine.executeTurnWithNarrator(context.Background(), response, newTurnNarrator(11, nil)); err != nil {
+		t.Fatalf("executeTurnWithNarrator() error = %v", err)
+	}
+	if len(renderer.narrativeEvents) == 0 || renderer.narrativeEvents[0].Kind != core.NarrativeBlocked {
+		t.Fatalf("expected blocked event before collecting input, got %#v", renderer.narrativeEvents)
+	}
+}
+
+func TestRunTaskRepromptsWhenModelClaimsNextStepButReturnsNoActions(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary:  "Proceeding to inspect the host for any OpenClaw installation.",
+			Findings: []string{"Will look for installed binaries and related containers."},
+		},
+		{
+			Summary: "Inspecting host.",
+			Actions: []core.Action{{
+				ID:      "inspect-host",
+				Type:    core.ActionRunShell,
+				Title:   "List containers",
+				Command: "pwd",
+				Reason:  "perform the promised inspection step",
+			}},
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Runtime.Config.Tools.MaxTurns = 2
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "inspect openclaw", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("expected minimal-context retry to continue execution, got %d provider requests", len(provider.requests))
+	}
+	lastMessages := provider.requests[1].Messages
+	if len(lastMessages) == 0 {
+		t.Fatalf("expected second provider request messages, got %#v", provider.requests[1])
+	}
+	last := lastMessages[len(lastMessages)-1].Content
+	if !strings.Contains(last, "returned no executable actions") {
+		t.Fatalf("expected second request to ask for a concrete next action, got %q", last)
+	}
+}
+
+func TestRunChatRepromptsWhenModelClaimsNextStepButReturnsNoActions(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{prompts: []string{"inspect openclaw", "quit"}}
+	engine.Renderer = renderer
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary:  "Proceeding to inspect the host for any OpenClaw installation.",
+			Findings: []string{"Will look for installed binaries and related containers."},
+		},
+		{
+			Summary: "Inspecting host.",
+			Actions: []core.Action{{
+				ID:      "inspect-host",
+				Type:    core.ActionRunShell,
+				Title:   "List containers",
+				Command: "pwd",
+				Reason:  "perform the promised inspection step",
+			}},
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Runtime.Config.Tools.MaxTurns = 2
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunChat(context.Background(), "", nil); err != nil {
+		t.Fatalf("RunChat() error = %v", err)
+	}
+	if len(provider.requests) < 2 {
+		t.Fatalf("expected chat recovery reprompt, got %d provider requests", len(provider.requests))
+	}
+	found := false
+	for _, req := range provider.requests {
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content, "returned no executable actions") {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected missing action continuation message, got %#v", provider.requests)
 	}
 }
 
@@ -482,7 +891,9 @@ type fakeProvider struct {
 }
 
 func (f *fakeProvider) Generate(ctx context.Context, req provider.Request) (core.LLMResponse, error) {
-	f.requests = append(f.requests, req)
+	reqCopy := req
+	reqCopy.Messages = append([]core.ConversationMessage(nil), req.Messages...)
+	f.requests = append(f.requests, reqCopy)
 	if len(f.responses) == 0 {
 		return core.LLMResponse{}, nil
 	}
@@ -499,6 +910,7 @@ type trackingRenderer struct {
 	endCalls            int
 	clearCalls          int
 	approvalPromptCalls int
+	narrativeEvents     []core.NarrativeEvent
 	lastApproval        core.ApprovalMode
 	lastInteraction     core.InteractionMode
 	prompts             []string
@@ -515,18 +927,22 @@ func (r *trackingRenderer) ActionProgress(action core.Action)                   
 func (r *trackingRenderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
 	r.approvalPromptCalls++
 }
-func (r *trackingRenderer) Result(result core.ActionResult)                {}
-func (r *trackingRenderer) BeginThinking(label string)                     { r.beginCalls++ }
-func (r *trackingRenderer) EndThinking()                                   { r.endCalls++ }
-func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)       { r.lastInteraction = mode }
-func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)             { r.lastApproval = mode }
-func (r *trackingRenderer) SetSecretVisibility(visible bool)               {}
-func (r *trackingRenderer) SecretVisibility() string                       { return "visible" }
-func (r *trackingRenderer) ClearScreen()                                   { r.clearCalls++ }
-func (r *trackingRenderer) Sessions(records []sessions.Record) error       { return nil }
-func (r *trackingRenderer) Patches(records []patches.Record) error         { return nil }
-func (r *trackingRenderer) Checkpoints(records []checkpoints.Record) error { return nil }
-func (r *trackingRenderer) PromptChoice() (string, error)                  { return "1", nil }
+func (r *trackingRenderer) Result(result core.ActionResult) {}
+func (r *trackingRenderer) Narrate(event core.NarrativeEvent) {
+	r.narrativeEvents = append(r.narrativeEvents, event)
+}
+func (r *trackingRenderer) BeginThinking(label string)                               { r.beginCalls++ }
+func (r *trackingRenderer) EndThinking()                                             { r.endCalls++ }
+func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)                 { r.lastInteraction = mode }
+func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)                       { r.lastApproval = mode }
+func (r *trackingRenderer) SetModelContext(provider, model string, options []string) {}
+func (r *trackingRenderer) SetSecretVisibility(visible bool)                         {}
+func (r *trackingRenderer) SecretVisibility() string                                 { return "visible" }
+func (r *trackingRenderer) ClearScreen()                                             { r.clearCalls++ }
+func (r *trackingRenderer) Sessions(records []sessions.Record) error                 { return nil }
+func (r *trackingRenderer) Patches(records []patches.Record) error                   { return nil }
+func (r *trackingRenderer) Checkpoints(records []checkpoints.Record) error           { return nil }
+func (r *trackingRenderer) PromptChoice() (string, error)                            { return "1", nil }
 func (r *trackingRenderer) PromptApprovalChoice() (string, error) {
 	if len(r.approvalChoices) == 0 {
 		return "1", nil

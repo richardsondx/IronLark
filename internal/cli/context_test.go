@@ -130,6 +130,35 @@ func TestPlanFlagSelectsPlanFirstInteraction(t *testing.T) {
 	}
 }
 
+func TestModelCommandShowsCurrentAndOptions(t *testing.T) {
+	temp := t.TempDir()
+	project := filepath.Join(temp, "project")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+	t.Setenv("HOME", temp)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(temp, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(temp, ".local", "share"))
+	t.Chdir(project)
+
+	output := captureStdout(t, func() error {
+		cmd := NewRootCommand()
+		cmd.SetArgs([]string{"model"})
+		return cmd.Execute()
+	})
+
+	for _, fragment := range []string{
+		"Current model: gpt-5-mini",
+		"Available model options:",
+		"openai: gpt-4.1-mini, gpt-5-mini",
+		"openrouter: openai/gpt-4.1-mini",
+	} {
+		if !strings.Contains(output, fragment) {
+			t.Fatalf("expected %q in output, got %q", fragment, output)
+		}
+	}
+}
+
 func TestPolicyCommands(t *testing.T) {
 	temp := t.TempDir()
 	project := filepath.Join(temp, "project")

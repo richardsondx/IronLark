@@ -21,8 +21,8 @@ func TestAgentHeaderUsesCompactModeForShortTerminals(t *testing.T) {
 	if len(compact) != 1 {
 		t.Fatalf("expected compact header with 1 line, got %d", len(compact))
 	}
-	if len(full) != 2 {
-		t.Fatalf("expected full header with 2 lines, got %d", len(full))
+	if len(full) != 1 {
+		t.Fatalf("expected full header with 1 line, got %d", len(full))
 	}
 }
 
@@ -50,6 +50,34 @@ func TestUpDownScrollTranscriptWhenNoOverlayIsOpen(t *testing.T) {
 	}
 }
 
+func TestTabOpensHistoryOverlayAndRecallsPrompt(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.promptHistory = []string{"first prompt", "second prompt"}
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyTab}); submitted != "" || done {
+		t.Fatalf("expected history overlay only, got %q %t", submitted, done)
+	}
+	if renderer.overlay != overlayHistory {
+		t.Fatalf("expected history overlay, got %q", renderer.overlay)
+	}
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyDown}); submitted != "" || done {
+		t.Fatalf("expected history selection move only, got %q %t", submitted, done)
+	}
+	if renderer.overlayIndex != 1 {
+		t.Fatalf("expected second history item selected, got %d", renderer.overlayIndex)
+	}
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); submitted != "" || done {
+		t.Fatalf("expected recall into composer only, got %q %t", submitted, done)
+	}
+	if renderer.overlay != overlayNone {
+		t.Fatalf("expected overlay to close, got %q", renderer.overlay)
+	}
+	if got := string(renderer.composer); got != "first prompt" {
+		t.Fatalf("expected selected prompt in composer, got %q", got)
+	}
+}
+
 func TestDrawLockedLimitsTranscriptToViewportHeightWhenScrolled(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.BeginRawTestPrompt()
@@ -70,8 +98,8 @@ func TestDrawLockedLimitsTranscriptToViewportHeightWhenScrolled(t *testing.T) {
 	output := renderer.Out.(*bytes.Buffer).String()
 	renderer.mu.Unlock()
 
-	if count := strings.Count(output, "line\033[K"); count != 8 {
-		t.Fatalf("expected 8 visible transcript lines, got %d in output %q", count, output)
+	if count := strings.Count(output, "line\033[K"); count != 7 {
+		t.Fatalf("expected 7 visible transcript lines, got %d in output %q", count, output)
 	}
 }
 
@@ -92,11 +120,83 @@ func TestDrawLockedKeepsCursorOnPromptLine(t *testing.T) {
 	if !strings.Contains(output, "> \033[K") {
 		t.Fatalf("expected output to contain prompt line before footer, got %q", output)
 	}
+	if !strings.Contains(output, "--------------------------------------------------------------------------------\033[K") {
+		t.Fatalf("expected output to contain input border line, got %q", output)
+	}
 	if !strings.HasSuffix(output, "\033[24;1H") {
 		t.Fatalf("expected output to end by positioning the cursor on the last row, got %q", output)
 	}
 	if !strings.Contains(output, "IronLark Agent") {
 		t.Fatalf("expected output to end on footer line, got %q", output)
+	}
+}
+
+func TestDrawLockedFreshSessionShowsWelcomeTitle(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.meta.WelcomeBack = false
+
+	renderer.mu.Lock()
+	renderer.Out = &bytes.Buffer{}
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("drawLocked() error = %v", err)
+	}
+	output := renderer.Out.(*bytes.Buffer).String()
+	renderer.mu.Unlock()
+
+	if !strings.Contains(output, "Welcome!") {
+		t.Fatalf("expected first-launch welcome title, got %q", output)
+	}
+}
+
+func TestDrawLockedReturningSessionShowsWelcomeBackTitle(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.meta.WelcomeBack = true
+	renderer.sizeFn = func() (int, int) { return 120, 24 }
+
+	renderer.mu.Lock()
+	renderer.Out = &bytes.Buffer{}
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("drawLocked() error = %v", err)
+	}
+	output := renderer.Out.(*bytes.Buffer).String()
+	renderer.mu.Unlock()
+
+	if !strings.Contains(output, "Welcome back!") {
+		t.Fatalf("expected returning-user welcome title, got %q", output)
+	}
+	if !strings.Contains(output, "┌") || !strings.Contains(output, "│") {
+		t.Fatalf("expected welcome box framing, got %q", output)
+	}
+	if !strings.Contains(output, "IronLark v") {
+		t.Fatalf("expected titled frame, got %q", output)
+	}
+	if !strings.Contains(output, "gpt-5-mini") {
+		t.Fatalf("expected model line, got %q", output)
+	}
+	if !strings.Contains(output, "/opt/app") {
+		t.Fatalf("expected compact cwd line, got %q", output)
+	}
+}
+
+func TestDrawLockedBottomAlignsTranscriptNearInput(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.Message("latest line")
+
+	renderer.mu.Lock()
+	renderer.Out = &bytes.Buffer{}
+	renderer.sizeFn = func() (int, int) { return 80, 12 }
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("drawLocked() error = %v", err)
+	}
+	output := renderer.Out.(*bytes.Buffer).String()
+	renderer.mu.Unlock()
+
+	if !strings.Contains(output, "\033[8;1Hlatest line") {
+		t.Fatalf("expected transcript close to input area, got %q", output)
 	}
 }
 
@@ -135,7 +235,7 @@ func TestDrawLockedAvoidsFullClearOnIncrementalRedraw(t *testing.T) {
 func TestFooterLineUsesGreenBarWithAgentLabel(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.Color = true
-	line := renderer.footerLineLocked(48)
+	line := renderer.footerLineLocked(96)
 
 	if !strings.Contains(line, ansiBgGreen) {
 		t.Fatalf("expected green background in footer, got %q", line)
@@ -143,11 +243,137 @@ func TestFooterLineUsesGreenBarWithAgentLabel(t *testing.T) {
 	if !strings.Contains(line, "IronLark Agent") {
 		t.Fatalf("expected agent label in footer, got %q", line)
 	}
+	if !strings.Contains(line, "approval=confirm  mode=execute-first") {
+		t.Fatalf("expected approval and mode in footer, got %q", line)
+	}
 	if !strings.Contains(line, "\"srv-1\"  thread-1") {
 		t.Fatalf("expected host and thread id in footer, got %q", line)
 	}
-	if visibleWidth(line) != 48 {
-		t.Fatalf("expected padded footer width 48, got %d", visibleWidth(line))
+	if visibleWidth(line) != 96 {
+		t.Fatalf("expected padded footer width 96, got %d", visibleWidth(line))
+	}
+}
+
+func TestAgentResponseUsesConversationalAssistantLayout(t *testing.T) {
+	renderer := newTestAgentRenderer()
+
+	if err := renderer.Response(core.LLMResponse{
+		Summary:  "IronLark is a Go-based SSH-first AI terminal assistant.",
+		Findings: []string{"Build and install are managed through the Makefile."},
+	}); err != nil {
+		t.Fatalf("Response() error = %v", err)
+	}
+
+	transcript := strings.Join(renderer.transcript, "\n")
+	if !strings.Contains(transcript, "⏹ IronLark is a Go-based SSH-first AI terminal assistant.") {
+		t.Fatalf("expected assistant marker prefix, got %q", transcript)
+	}
+	if strings.Contains(transcript, "## Lark") || strings.Contains(transcript, "Findings:") || strings.Contains(transcript, "Summary:") {
+		t.Fatalf("expected conversational response layout, got %q", transcript)
+	}
+	if !strings.Contains(transcript, "- Build and install are managed through the Makefile.") {
+		t.Fatalf("expected findings folded into response details, got %q", transcript)
+	}
+}
+
+func TestAgentResponseDropsRepetitiveFindings(t *testing.T) {
+	renderer := newTestAgentRenderer()
+
+	if err := renderer.Response(core.LLMResponse{
+		Summary: "IronLark is a Go-based SSH-first AI terminal assistant.",
+		Findings: []string{
+			"IronLark is a Go-based SSH-first AI terminal assistant.",
+			"The project is a Go-based SSH-first AI terminal assistant",
+			"Build and install are managed through the Makefile.",
+			"Build and install are managed through the Makefile.",
+		},
+	}); err != nil {
+		t.Fatalf("Response() error = %v", err)
+	}
+
+	transcript := strings.Join(renderer.transcript, "\n")
+	if strings.Contains(transcript, "- IronLark is a Go-based SSH-first AI terminal assistant.") {
+		t.Fatalf("expected summary-duplicate findings to be dropped, got %q", transcript)
+	}
+	if count := strings.Count(transcript, "- Build and install are managed through the Makefile."); count != 1 {
+		t.Fatalf("expected distinct finding once, got %d in %q", count, transcript)
+	}
+}
+
+func TestWrapWithWidthWrapsAnsiStyledLines(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.Color = true
+
+	line := renderer.assistantPrefix() + "The project setup uses a Go binary, a Makefile, and a local config directory."
+	wrapped := renderer.wrapWithWidth(line, 30)
+
+	if len(wrapped) < 2 {
+		t.Fatalf("expected styled line to wrap, got %#v", wrapped)
+	}
+	for _, part := range wrapped {
+		if visibleWidth(part) > 30 {
+			t.Fatalf("expected wrapped segment width <= 30, got %d for %q", visibleWidth(part), part)
+		}
+	}
+}
+
+func TestUserEntryUsesHighlightedChipLayout(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.Color = true
+	renderer.writeUserInput("hi")
+
+	transcript := strings.Join(renderer.transcript, "\n")
+	if !strings.Contains(transcript, "› hi ") {
+		t.Fatalf("expected highlighted user chip, got %q", transcript)
+	}
+	if !strings.Contains(transcript, ansiBgWhite) {
+		t.Fatalf("expected user chip highlight style, got %q", transcript)
+	}
+}
+
+func TestVisibleWidthCountsUnicodeRunes(t *testing.T) {
+	if got := visibleWidth("┌──⏹──┐"); got != 7 {
+		t.Fatalf("expected rune-aware width, got %d", got)
+	}
+}
+
+func TestRenderPromptValueStripsControlAndEscapeSequences(t *testing.T) {
+	value := "abc\x12\x1b[A\x1b[Bdef"
+	got := renderPromptValue(value)
+
+	if got != "abcdef" {
+		t.Fatalf("expected sanitized prompt value, got %q", got)
+	}
+}
+
+func TestRenderPromptValueStripsCaretControlLeakNotation(t *testing.T) {
+	value := "abc^P^N^R^[[A^[[Bdef"
+	got := renderPromptValue(value)
+
+	if got != "abcdef" {
+		t.Fatalf("expected leaked caret notation removed, got %q", got)
+	}
+}
+
+func TestInsertTextLockedStripsControlAndEscapeSequences(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.mu.Lock()
+	renderer.insertTextLocked("abc\x12\x1b[A\x1b[Bdef")
+	renderer.mu.Unlock()
+
+	if string(renderer.composer) != "abcdef" {
+		t.Fatalf("expected sanitized composer, got %q", string(renderer.composer))
+	}
+}
+
+func TestInsertTextLockedStripsCaretControlLeakNotation(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.mu.Lock()
+	renderer.insertTextLocked("abc^P^N^R^[[A^[[Bdef")
+	renderer.mu.Unlock()
+
+	if string(renderer.composer) != "abcdef" {
+		t.Fatalf("expected leaked caret notation removed from composer, got %q", string(renderer.composer))
 	}
 }
 
@@ -212,6 +438,42 @@ func TestSlashMenuApprovalOpensApprovalOverlay(t *testing.T) {
 	}
 }
 
+func TestSlashMenuModelOpensModelOverlay(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: '/'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'm'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'o'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'd'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'e'})
+	renderer.handleKey(keyPress{Kind: keyPrintable, Rune: 'l'})
+
+	commands := renderer.filteredSlashCommandsLockedForTest()
+	foundModel := false
+	for _, command := range commands {
+		if command.Execute == "/model" {
+			foundModel = true
+			break
+		}
+	}
+	if !foundModel {
+		t.Fatalf("unexpected filtered commands %#v", commands)
+	}
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); submitted != "" || done {
+		t.Fatalf("expected model overlay open, got %q %t", submitted, done)
+	}
+	if renderer.overlay != overlayModel {
+		t.Fatalf("expected model overlay, got %q", renderer.overlay)
+	}
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyUp}); submitted != "" || done {
+		t.Fatalf("expected selection move, got %q %t", submitted, done)
+	}
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); !done || submitted != "/model gpt-5" {
+		t.Fatalf("expected model command, got %q %t", submitted, done)
+	}
+}
+
 func TestSlashMenuSecretToggleSubmitsHiddenByDefault(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.BeginRawTestPrompt()
@@ -266,12 +528,13 @@ func TestSetInteractionUpdatesHeaderStatus(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.SetInteraction(core.InteractionPlanFirst)
 
-	header := renderer.headerLines(120, 40)
-	if header[0] == "" || !containsString(header[0], "mode=plan-first") {
-		t.Fatalf("expected plan-first in header, got %q", header[0])
+	footer := renderer.footerLineLocked(120)
+	if !containsString(footer, "mode=plan-first") {
+		t.Fatalf("expected plan-first in footer, got %q", footer)
 	}
-	if containsString(strings.Join(header, " "), "host=") || containsString(strings.Join(header, " "), "thread=") || containsString(strings.Join(header, " "), "model=") {
-		t.Fatalf("expected compact header metadata to be removed, got %#v", header)
+	header := renderer.headerLines(120, 40)
+	if containsString(strings.Join(header, " "), "approval=") || containsString(strings.Join(header, " "), "mode=") {
+		t.Fatalf("expected mode metadata removed from header, got %#v", header)
 	}
 }
 
@@ -306,6 +569,37 @@ func TestThinkingIndicatorAnimatesAndStopsCleanly(t *testing.T) {
 	}
 }
 
+func TestActionStatusAnimatesAndStopsCleanly(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.redrawInterval = 5 * time.Millisecond
+	renderer.setActionStatus("Running action...")
+	time.Sleep(20 * time.Millisecond)
+
+	renderer.mu.Lock()
+	frame := renderer.actionFrame
+	status := renderer.statusLineLocked(80)
+	renderer.mu.Unlock()
+
+	if frame == 0 {
+		t.Fatalf("expected action frame to advance")
+	}
+	if !containsString(status, "Running action...") {
+		t.Fatalf("expected action label in status line, got %q", status)
+	}
+
+	renderer.setActionStatus("")
+	renderer.mu.Lock()
+	actionActive := renderer.actionStatus
+	idleStatus := renderer.statusLineLocked(80)
+	renderer.mu.Unlock()
+	if actionActive != "" {
+		t.Fatal("expected action status to clear")
+	}
+	if containsString(idleStatus, "Running action...") {
+		t.Fatalf("expected idle status line, got %q", idleStatus)
+	}
+}
+
 func TestAgentResultUsesColoredOutputBlocks(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.Color = true
@@ -327,6 +621,88 @@ func TestAgentResultUsesColoredOutputBlocks(t *testing.T) {
 	}
 	if !containsString(joined, "  "+ansiBold+ansiRed+"│"+ansiReset+" "+ansiRed+"warning line"+ansiReset) {
 		t.Fatalf("expected colored stderr prefix, got %q", joined)
+	}
+}
+
+func TestNarratedProgressRendersTimelineEntries(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	renderer.Narrate(core.NarrativeEvent{
+		Kind:   core.NarrativeIntent,
+		Phase:  "Reading files",
+		Text:   "I found a likely starting point in README.md, so I'm checking that first.",
+		Status: core.NarrativeDone,
+	})
+	renderer.ActionProgress(core.Action{
+		ID:     "readme",
+		Type:   core.ActionReadFiles,
+		Path:   "README.md",
+		Reason: "inspect current docs",
+	})
+	renderer.Result(core.ActionResult{
+		Action:  core.Action{ID: "readme", Type: core.ActionReadFiles, Path: "README.md"},
+		Summary: "read 1 file(s)",
+		Stdout:  strings.Repeat("line\n", 8),
+	})
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	joined := strings.Join(renderer.transcript, "\n")
+	if !containsString(joined, "o I found a likely starting point") {
+		t.Fatalf("expected narration line, got %q", joined)
+	}
+	if !containsString(joined, "Read(README.md)") {
+		t.Fatalf("expected action timeline title, got %q", joined)
+	}
+	if !containsString(joined, "detail line(s) hidden") {
+		t.Fatalf("expected collapsed detail summary, got %q", joined)
+	}
+}
+
+func TestNarratedProgressUsesNarrativePhaseInStatusLine(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	renderer.Narrate(core.NarrativeEvent{
+		Kind:   core.NarrativeActionStarted,
+		Phase:  "Reading files",
+		Text:   "Let me read the current tests first.",
+		Status: core.NarrativeRunning,
+	})
+	renderer.redrawInterval = 5 * time.Millisecond
+	renderer.ActionProgress(core.Action{ID: "read-tests", Type: core.ActionReadFiles, Path: "tests.go"})
+	time.Sleep(20 * time.Millisecond)
+
+	renderer.mu.Lock()
+	status := renderer.statusLineLocked(80)
+	renderer.mu.Unlock()
+	if !containsString(status, "Reading files") {
+		t.Fatalf("expected phase label in status line, got %q", status)
+	}
+}
+
+func TestNarratedProgressShiftTabTogglesLatestDetails(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.Result(core.ActionResult{
+		Action:  core.Action{ID: "show-output", Title: "Show output"},
+		Summary: "Collected output",
+		Stdout:  strings.Repeat("line\n", 8),
+	})
+
+	renderer.mu.Lock()
+	before := strings.Join(renderer.transcript, "\n")
+	renderer.mu.Unlock()
+	if !containsString(before, "detail line(s) hidden") {
+		t.Fatalf("expected collapsed result details, got %q", before)
+	}
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyShiftTab}); submitted != "" || done {
+		t.Fatalf("expected toggle only, got %q %t", submitted, done)
+	}
+
+	renderer.mu.Lock()
+	after := strings.Join(renderer.transcript, "\n")
+	renderer.mu.Unlock()
+	if containsString(after, "detail line(s) hidden") {
+		t.Fatalf("expected details to expand after tab, got %q", after)
 	}
 }
 
@@ -571,11 +947,30 @@ func newTestAgentRenderer() *AgentRenderer {
 	renderer := NewAgent(nil, discardWriter{}, discardWriter{}, "never", AgentMeta{
 		Host:          "srv-1",
 		CWD:           "/opt/app",
+		Provider:      "openai",
 		Model:         "gpt-5-mini",
+		ModelOptions:  []string{"gpt-4.1-mini", "gpt-5", "gpt-5-mini"},
 		ApprovalMode:  "confirm",
 		ThreadID:      "thread-1",
 		CompactAtRows: 28,
 		Interaction:   core.InteractionExecuteFirst,
+	})
+	renderer.sizeFn = func() (int, int) { return 80, 24 }
+	return renderer
+}
+
+func newNarratedTestAgentRenderer() *AgentRenderer {
+	renderer := NewAgent(nil, discardWriter{}, discardWriter{}, "never", AgentMeta{
+		Host:             "srv-1",
+		CWD:              "/opt/app",
+		Provider:         "openai",
+		Model:            "gpt-5-mini",
+		ModelOptions:     []string{"gpt-4.1-mini", "gpt-5", "gpt-5-mini"},
+		ApprovalMode:     "confirm",
+		ThreadID:         "thread-1",
+		CompactAtRows:    28,
+		Interaction:      core.InteractionExecuteFirst,
+		NarratedProgress: true,
 	})
 	renderer.sizeFn = func() (int, int) { return 80, 24 }
 	return renderer

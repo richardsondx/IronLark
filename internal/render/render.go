@@ -32,10 +32,12 @@ type UI interface {
 	ActionProgress(action core.Action)
 	ApprovalPrompt(action core.Action, report core.RiskReport)
 	Result(result core.ActionResult)
+	Narrate(event core.NarrativeEvent)
 	BeginThinking(label string)
 	EndThinking()
 	SetInteraction(mode core.InteractionMode)
 	SetApproval(mode core.ApprovalMode)
+	SetModelContext(provider, model string, options []string)
 	SetSecretVisibility(visible bool)
 	SecretVisibility() string
 	ClearScreen()
@@ -222,6 +224,8 @@ func (r *Renderer) Result(result core.ActionResult) {
 	}
 }
 
+func (r *Renderer) Narrate(event core.NarrativeEvent) {}
+
 func (r *Renderer) BeginThinking(label string) {}
 
 func (r *Renderer) EndThinking() {}
@@ -229,6 +233,8 @@ func (r *Renderer) EndThinking() {}
 func (r *Renderer) SetInteraction(mode core.InteractionMode) {}
 
 func (r *Renderer) SetApproval(mode core.ApprovalMode) {}
+
+func (r *Renderer) SetModelContext(provider, model string, options []string) {}
 
 func (r *Renderer) SetSecretVisibility(visible bool) {}
 
@@ -550,6 +556,22 @@ func shouldUseColor(out io.Writer, jsonOutput bool, colorMode string) bool {
 	return term.IsTerminal(int(os.Stdout.Fd())) || term.IsTerminal(int(os.Stderr.Fd()))
 }
 
+func shouldUseAgentColor(out io.Writer, colorMode string) bool {
+	switch strings.TrimSpace(strings.ToLower(colorMode)) {
+	case "always":
+		return true
+	case "never":
+		return false
+	}
+	if forceColorEnabled() {
+		return true
+	}
+	if termEnv := strings.TrimSpace(os.Getenv("TERM")); termEnv == "dumb" {
+		return false
+	}
+	return true
+}
+
 func colorize(value, code string) string {
 	return code + value + ansiReset
 }
@@ -574,5 +596,6 @@ const (
 	ansiBlue    = "\033[34m"
 	ansiGray    = "\033[90m"
 	ansiCyan    = "\033[36m"
+	ansiBgWhite = "\033[47m"
 	ansiBgGreen = "\033[42m"
 )

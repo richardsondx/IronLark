@@ -217,6 +217,8 @@ Relevant config keys in `~/.config/lark/config.yaml`:
 
 ```yaml
 interaction_mode: execute-first
+ui:
+  narrated_progress: false
 thread:
   enabled: true
   scope: auto-shell
@@ -226,6 +228,8 @@ thread:
   max_result_chars: 1200
   auto_compact: true
 ```
+
+Set `ui.narrated_progress: true` to enable the narrated progress timeline in the interactive `lk agent` TUI. Plain one-shot output and JSON mode keep the existing behavior.
 
 ### Machine Policy
 

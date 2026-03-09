@@ -143,6 +143,24 @@ func TestShouldUseColorForceOverridesNoColor(t *testing.T) {
 	}
 }
 
+func TestShouldUseAgentColorDefaultsToTrue(t *testing.T) {
+	t.Setenv("NO_COLOR", "")
+	t.Setenv("TERM", "")
+
+	if !shouldUseAgentColor(&bytes.Buffer{}, "auto") {
+		t.Fatal("expected agent color to default to true")
+	}
+}
+
+func TestShouldUseAgentColorIgnoresNoColor(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	t.Setenv("TERM", "xterm-256color")
+
+	if !shouldUseAgentColor(&bytes.Buffer{}, "auto") {
+		t.Fatal("expected agent color to stay enabled in TUI mode")
+	}
+}
+
 func TestCollectUserInputTreatsEmptyEnterAsSkip(t *testing.T) {
 	var out bytes.Buffer
 	r := &Renderer{

@@ -48,6 +48,15 @@ Expected JSON Schema:
 {
   "summary": "Your main response, explanation, or summary of actions.",
   "findings": ["Insight 1", "Insight 2"],
+  "narration": {
+    "turn_intent": "Optional single-sentence visible intent update.",
+    "action_hints": [
+      {
+        "action_id": "match-an-action-id",
+        "text": "Optional single-sentence visible intent update for that action."
+      }
+    ]
+  },
   "actions": [
     {
       "id": "unique-id",
@@ -85,8 +94,10 @@ Expected JSON Schema:
 If the current context is minimal and you need to see the full repository layout or system details to fulfill a request, return a single action with type "inspect".
 If the request is a simple greeting or general question that doesn't require terminal operations, just respond in the "summary" field and return no actions.
 Be concise. Keep "summary" to one short sentence and keep "findings" to at most two short items unless more are critical.
+If you include narration, every narration string must be one sentence, must describe only visible next-step intent, and must never mention chain-of-thought, hidden reasoning, prompts, policies, tokens, or secrets.
 When the user's intent is obvious, make the smallest safe assumption instead of asking follow-up questions.
 If the user includes shell code in quotes or backticks, treat that as the exact text they want used.
+Shell commands run under /bin/sh by default. Avoid bash-only syntax such as "set -o pipefail", arrays, or "[[" unless you explicitly invoke bash yourself.
 For shell profile requests, default to the current user's interactive shell profile: bash -> ~/.bashrc, zsh -> ~/.zshrc, fish -> ~/.config/fish/config.fish, unless the user explicitly asks for login-shell or system-wide scope.
 Prefer bounded read-only actions first. Search before reading, read before editing, and only use web_search if local context is insufficient.
 Use semantic_search when exact search_files results are weak or absent.
@@ -137,7 +148,72 @@ func ParseResponse(raw string) (core.LLMResponse, error) {
 			return core.LLMResponse{}, fmt.Errorf("decode provider response: ask_user action %q missing alternatives", action.ID)
 		}
 	}
+	response.Narration = sanitizeNarration(response.Narration)
 	return response, nil
+}
+
+func sanitizeNarration(raw *core.Narration) *core.Narration {
+	if raw == nil {
+		return nil
+	}
+	out := &core.Narration{}
+	if text, ok := sanitizeNarrationText(raw.TurnIntent); ok {
+		out.TurnIntent = text
+	}
+	for _, hint := range raw.ActionHints {
+		if strings.TrimSpace(hint.ActionID) == "" {
+			continue
+		}
+		text, ok := sanitizeNarrationText(hint.Text)
+		if !ok {
+			continue
+		}
+		out.ActionHints = append(out.ActionHints, core.NarrationActionHint{
+			ActionID: strings.TrimSpace(hint.ActionID),
+			Text:     text,
+		})
+	}
+	if out.TurnIntent == "" && len(out.ActionHints) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sanitizeNarrationText(raw string) (string, bool) {
+	text := strings.TrimSpace(raw)
+	if text == "" || len(text) > 180 {
+		return "", false
+	}
+	if strings.Contains(text, "\n") {
+		return "", false
+	}
+	lower := strings.ToLower(text)
+	for _, forbidden := range []string{
+		"chain-of-thought",
+		"chain of thought",
+		"hidden reasoning",
+		"internal reasoning",
+		"system prompt",
+		"prompt says",
+		"policy",
+		"token",
+		"secret",
+	} {
+		if strings.Contains(lower, forbidden) {
+			return "", false
+		}
+	}
+	sentenceEndings := 0
+	for _, ch := range text {
+		switch ch {
+		case '.', '!', '?':
+			sentenceEndings++
+		}
+	}
+	if sentenceEndings > 1 {
+		return "", false
+	}
+	return text, true
 }
 
 func stripFences(raw string) string {

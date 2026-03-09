@@ -19,6 +19,7 @@ type Config struct {
 	ApprovalMode    string                    `yaml:"approval_mode,omitempty"`
 	InteractionMode string                    `yaml:"interaction_mode,omitempty"`
 	Agent           AgentConfig               `yaml:"agent,omitempty"`
+	UI              UIConfig                  `yaml:"ui,omitempty"`
 	Context         ContextConfig             `yaml:"context,omitempty"`
 	Thread          ThreadConfig              `yaml:"thread,omitempty"`
 	Graph           GraphConfig               `yaml:"graph,omitempty"`
@@ -56,6 +57,10 @@ type AgentConfig struct {
 	SessionPrefix   string `yaml:"session_prefix,omitempty"`
 	AttachPolicy    string `yaml:"attach_policy,omitempty"`
 	CompactModeRows int    `yaml:"compact_mode_rows,omitempty"`
+}
+
+type UIConfig struct {
+	NarratedProgress bool `yaml:"narrated_progress,omitempty"`
 }
 
 type ThreadConfig struct {
@@ -152,6 +157,9 @@ func DefaultConfig() Config {
 			SessionPrefix:   "ironlark",
 			AttachPolicy:    "host-cwd",
 			CompactModeRows: 28,
+		},
+		UI: UIConfig{
+			NarratedProgress: false,
 		},
 		Context: ContextConfig{
 			AutoCollect:           true,
@@ -398,6 +406,7 @@ func mergeConfig(base Config, override Config) Config {
 	if override.Agent.CompactModeRows != 0 {
 		out.Agent.CompactModeRows = override.Agent.CompactModeRows
 	}
+	out.UI.NarratedProgress = override.UI.NarratedProgress || out.UI.NarratedProgress
 	if override.Context.MaxFileBytes != 0 {
 		out.Context.MaxFileBytes = override.Context.MaxFileBytes
 	}
@@ -547,6 +556,8 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.Agent.AttachPolicy = value
 	case "agent.compact_mode_rows":
 		cfg.Agent.CompactModeRows = parseInt(value)
+	case "ui.narrated_progress":
+		cfg.UI.NarratedProgress = parseBool(value)
 	case "thread.enabled":
 		cfg.Thread.Enabled = boolPtr(parseBool(value))
 	case "thread.scope":

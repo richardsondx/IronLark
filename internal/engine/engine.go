@@ -16,6 +16,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
 	"github.com/richardsondx/IronLark/internal/graph"
+	"github.com/richardsondx/IronLark/internal/models"
 	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/render"
@@ -74,7 +75,9 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		maxTurns = 5
 	}
 	for turn := 0; turn < maxTurns; turn++ {
-		e.Renderer.BeginThinking(e.thinkingLabel())
+		narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn), nil)
+		e.narrate(narrator.turnStarted())
+		e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
 		response, err := e.Provider.Generate(ctx, provider.Request{
 			Model:       e.Runtime.Model,
 			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
@@ -85,6 +88,9 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		if err != nil {
 			return err
 		}
+		response = normalizedResponse(response)
+		narrator = newTurnNarrator(time.Now().UnixNano()+int64(turn), response.Narration)
+		e.narrate(narrator.intent(response))
 
 		// Check if the model wants to inspect or if we are doing actions for the first time on minimal context
 		needsFullContext := false
@@ -96,6 +102,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			if !e.Runtime.JSONOutput {
 				e.Renderer.Message("Inspecting context and reframing plan...")
 			}
+			e.narrate(narrator.contextShift())
 			fullSnapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
 			if err != nil {
 				return err
@@ -112,13 +119,14 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		record.Actions = append(record.Actions, response.Actions...)
 		record.NeedsUserInput = response.NeedsUserInput
 		record.Confidence = response.Confidence
+		response = ensureVisibleResponse(response)
 		finalSummary = response.Summary
 
 		if err := e.Renderer.Response(response); err != nil {
 			return err
 		}
 
-		results, stop, err := e.executeTurn(ctx, response)
+		results, stop, err := e.executeTurnWithNarrator(ctx, response, narrator)
 		if err != nil {
 			return err
 		}
@@ -135,7 +143,13 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			Content: string(rawResponse),
 		})
 
+		if shouldNudgeForExecutableStep(response, results) {
+			history = append(history, missingActionContinuationMessage(response))
+			continue
+		}
+
 		if stop || len(results) == 0 || reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures) {
+			e.narrate(narrator.turnFinished(finalSummary))
 			break
 		}
 		history = append(history, buildContinuationMessage(results))
@@ -251,9 +265,18 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 			case "/model":
 				if len(args) > 0 {
 					e.Runtime.Model = args[0]
+					e.Renderer.SetModelContext(
+						e.Runtime.ProviderName,
+						e.Runtime.Model,
+						models.SuggestedForProvider(e.Runtime.Config, e.Runtime.ProviderName),
+					)
 					e.Renderer.Message(fmt.Sprintf("Model set to: %s", e.Runtime.Model))
 				} else {
-					e.Renderer.Message(fmt.Sprintf("Current model: %s. Use /model <name> to change.", e.Runtime.Model))
+					e.Renderer.Message(models.FormatCurrent(
+						e.Runtime.Config,
+						e.Runtime.ProviderName,
+						e.Runtime.Model,
+					))
 				}
 				continue
 			case "/provider":
@@ -265,6 +288,11 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 						if apiKey, keyErr := e.Runtime.APIKey(); keyErr == nil {
 							if providerCfg.Type == "openai-compatible" {
 								e.Provider = provider.OpenAICompatibleFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+								e.Renderer.SetModelContext(
+									e.Runtime.ProviderName,
+									e.Runtime.Model,
+									models.SuggestedForProvider(e.Runtime.Config, e.Runtime.ProviderName),
+								)
 								e.Renderer.Message(fmt.Sprintf("Provider set to: %s", e.Runtime.ProviderName))
 							} else {
 								e.Renderer.Message(fmt.Sprintf("Provider %s uses an unsupported type: %s", e.Runtime.ProviderName, providerCfg.Type))
@@ -315,31 +343,99 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 }
 
 func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte, history *[]core.ConversationMessage, record *sessions.Record, threadState *threads.Thread, threadRef threads.ThreadRef) error {
-	snapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
+	prompt = strings.TrimSpace(prompt)
+	if isSimpleGreetingPrompt(prompt) {
+		response := core.LLMResponse{Summary: greetingSummary(prompt)}
+		record.Prompt += "\n" + prompt
+		record.Summary = response.Summary
+		if err := e.Renderer.Response(response); err != nil {
+			return err
+		}
+		rawResponse, _ := json.Marshal(response)
+		*history = append(*history, core.ConversationMessage{
+			Role:    "user",
+			Content: prompt,
+		}, core.ConversationMessage{
+			Role:    "assistant",
+			Content: string(rawResponse),
+		})
+		record.Messages = sanitizeMessages(*history)
+		record.FinishedAt = time.Now().UTC()
+		return e.Sessions.Save(*record)
+	}
+	snapshot, err := e.Collector.CollectMinimal(ctx, e.Runtime, stdin)
 	if err != nil {
 		return err
 	}
+	minimalSnapshot := snapshot
 	graphDigest := e.ensureGraphDigest(ctx, graph.ModeLight)
+	turnStart := len(*history)
 	*history = append(*history, core.ConversationMessage{
 		Role:    "user",
 		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
 	})
-	e.Renderer.BeginThinking(e.thinkingLabel())
-	response, stopped, err := e.generateResponse(ctx, provider.Request{
-		Model:       e.Runtime.Model,
-		System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
-		Messages:    *history,
-		Temperature: 0.1,
-	})
-	e.Renderer.EndThinking()
-	if err != nil {
-		return err
-	}
-	if stopped {
-		return errTurnStopped
+	var response core.LLMResponse
+	usingFullContext := false
+	usingDirectRetry := false
+	for attempts := 0; attempts < 4; attempts++ {
+		narrator := newTurnNarrator(time.Now().UnixNano()+int64(attempts), nil)
+		e.narrate(narrator.turnStarted())
+		e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
+		var stopped bool
+		response, stopped, err = e.generateResponse(ctx, provider.Request{
+			Model:       e.Runtime.Model,
+			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
+			Messages:    *history,
+			Temperature: 0.1,
+		})
+		e.Renderer.EndThinking()
+		if err != nil {
+			return err
+		}
+		if stopped {
+			e.narrate(narrator.interrupted())
+			return errTurnStopped
+		}
+		response = normalizedResponse(response)
+		if shouldReplaceWithGreetingSummary(prompt, response) {
+			response = greetingOnlyResponse(prompt)
+		}
+		if !usingFullContext && len(response.Actions) > 0 {
+			fullSnapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
+			if err != nil {
+				return err
+			}
+			usingFullContext = true
+			snapshot = fullSnapshot
+			(*history)[len(*history)-1].Content = buildInitialPrompt(prompt, snapshot, graphDigest)
+			e.narrate(narrator.contextShift())
+			continue
+		}
+		if !usingDirectRetry && isSyntheticFallbackResponse(response) {
+			usingDirectRetry = true
+			snapshot = minimalSnapshot
+			*history = append((*history)[:turnStart], core.ConversationMessage{
+				Role:    "user",
+				Content: prompt,
+			})
+			continue
+		}
+		narrator = newTurnNarrator(time.Now().UnixNano()+int64(attempts), response.Narration)
+		e.narrate(narrator.intent(response))
+		if attempts == 0 && shouldNudgeForExecutableStep(response, nil) {
+			rawResponse, _ := json.Marshal(response)
+			*history = append(*history, core.ConversationMessage{
+				Role:    "assistant",
+				Content: string(rawResponse),
+			})
+			*history = append(*history, missingActionContinuationMessage(response))
+			continue
+		}
+		break
 	}
 	record.Prompt += "\n" + prompt
 	record.ContextJSON = snapshot.JSON()
+	response = ensureVisibleResponse(response)
 	record.Findings = append(record.Findings, response.Findings...)
 	record.Actions = append(record.Actions, response.Actions...)
 	record.Summary = response.Summary
@@ -348,10 +444,12 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	if err := e.Renderer.Response(response); err != nil {
 		return err
 	}
-	results, _, err := e.executeTurn(ctx, response)
+	narrator := newTurnNarrator(time.Now().UnixNano(), response.Narration)
+	results, _, err := e.executeTurnWithNarrator(ctx, response, narrator)
 	if err != nil {
 		return err
 	}
+	e.narrate(narrator.turnFinished(response.Summary))
 	record.Results = append(record.Results, sanitizeResults(results)...)
 	rawResponse, _ := json.Marshal(response)
 	*history = append(*history, core.ConversationMessage{
@@ -380,38 +478,60 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 }
 
 func (e *Engine) generateResponse(ctx context.Context, request provider.Request) (core.LLMResponse, bool, error) {
-	generateCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	req := request
+	for attempt := 0; attempt < 2; attempt++ {
+		generateCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
-	defer signal.Stop(signals)
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, os.Interrupt)
+		defer signal.Stop(signals)
 
-	var stopped atomic.Bool
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		select {
-		case <-signals:
-			stopped.Store(true)
-			cancel()
-		case <-generateCtx.Done():
+		var stopped atomic.Bool
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			select {
+			case <-signals:
+				stopped.Store(true)
+				cancel()
+			case <-generateCtx.Done():
+			}
+		}()
+
+		response, err := e.Provider.Generate(generateCtx, req)
+		cancel()
+		<-done
+		if err != nil {
+			if stopped.Load() && errors.Is(err, context.Canceled) {
+				return core.LLMResponse{}, true, nil
+			}
+			return core.LLMResponse{}, false, err
 		}
-	}()
-
-	response, err := e.Provider.Generate(generateCtx, request)
-	cancel()
-	<-done
-	if err != nil {
-		if stopped.Load() && errors.Is(err, context.Canceled) {
-			return core.LLMResponse{}, true, nil
+		if responseHasVisibleContent(response) {
+			return normalizedResponse(response), false, nil
 		}
-		return core.LLMResponse{}, false, err
+		rawResponse, _ := json.Marshal(response)
+		req.Messages = append(append([]core.ConversationMessage{}, req.Messages...), core.ConversationMessage{
+			Role:    "assistant",
+			Content: string(rawResponse),
+		}, core.ConversationMessage{
+			Role:    "user",
+			Content: "Your last JSON response had an empty summary and no visible answer. Return the full JSON again with a non-empty summary sentence. If you need a tool step, include it in actions.",
+		})
 	}
-	return response, false, nil
+	return normalizedResponse(core.LLMResponse{}), false, nil
+}
+
+func ensureVisibleResponse(response core.LLMResponse) core.LLMResponse {
+	return normalizedResponse(response)
 }
 
 func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]core.ActionResult, bool, error) {
+	return e.executeTurnWithNarrator(ctx, response, nil)
+}
+
+func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMResponse, narrator *turnNarrator) ([]core.ActionResult, bool, error) {
 	if len(response.Actions) == 0 && len(response.Verification) == 0 {
 		return nil, true, nil
 	}
@@ -436,6 +556,9 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	}
 	if e.Runtime.Interaction == core.InteractionPlanFirst {
 		e.Renderer.PlannedActions(response.Actions, previews)
+	}
+	if narrator != nil && len(response.Actions) > 1 {
+		e.narrate(narrator.actionGroup(response.Actions))
 	}
 	if len(response.Verification) > 0 && !e.Runtime.JSONOutput && e.Runtime.Interaction == core.InteractionPlanFirst {
 		e.Renderer.Message("\nVerification planned after execution.")
@@ -474,6 +597,9 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			continue
 		}
 		if action.Type == core.ActionAskUser {
+			if narrator != nil {
+				e.narrate(narrator.blocked(action, firstNonEmpty(action.Prompt, action.Reason, "I need your input before I can continue."), core.NarrativeRunning))
+			}
 			result, err := e.Renderer.CollectUserInput(action)
 			if err != nil {
 				return results, false, err
@@ -482,10 +608,16 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			result.Risk = report
 			result.Approved = true
 			e.Renderer.Result(redactActionResult(result))
+			if narrator != nil {
+				e.narrate(narrator.actionFinished(result))
+			}
 			results = append(results, result)
 			continue
 		}
 		if match.Matched && match.Decision == policy.DecisionDeny {
+			if narrator != nil {
+				e.narrate(narrator.blocked(action, "Machine policy blocked that step.", core.NarrativeSkipped))
+			}
 			results = append(results, core.ActionResult{
 				Action:   action,
 				Risk:     report,
@@ -499,7 +631,7 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			continue
 		}
 
-		result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst)
+		result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst, narrator)
 		if !stop {
 			results = append(results, result)
 		}
@@ -531,7 +663,10 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 			if err != nil {
 				return results, false, err
 			}
-			result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, false)
+			if narrator != nil {
+				e.narrate(narrator.verificationStarted(action))
+			}
+			result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, false, narrator)
 			if !stop {
 				results = append(results, result)
 			}
@@ -547,7 +682,7 @@ func (e *Engine) executeTurn(ctx context.Context, response core.LLMResponse) ([]
 	return results, false, nil
 }
 
-func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, match policy.Match, strategy string, readOnly bool, showProgress bool) (core.ActionResult, bool, error) {
+func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, match policy.Match, strategy string, readOnly bool, showProgress bool, narrator *turnNarrator) (core.ActionResult, bool, error) {
 	if match.Matched && match.Decision == policy.DecisionDeny {
 		result := core.ActionResult{
 			Action:   action,
@@ -558,6 +693,9 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 		}
 		if !e.Runtime.JSONOutput {
 			e.Renderer.Result(result)
+		}
+		if narrator != nil {
+			e.narrate(narrator.blocked(action, "Machine policy blocked that step.", core.NarrativeSkipped))
 		}
 		return result, false, nil
 	}
@@ -595,13 +733,22 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 		if !e.Runtime.JSONOutput {
 			e.Renderer.Result(result)
 		}
+		if narrator != nil {
+			e.narrate(narrator.blocked(action, "That action was skipped because approval was denied.", core.NarrativeSkipped))
+		}
 		return result, false, nil
+	}
+	if narrator != nil {
+		e.narrate(narrator.actionStarted(action))
 	}
 	if showProgress && !e.Runtime.JSONOutput {
 		e.Renderer.ActionProgress(action)
 	}
 	result, err := e.Executor.Execute(ctx, action, readOnly)
 	e.Renderer.Result(result)
+	if narrator != nil {
+		e.narrate(narrator.actionFinished(result))
+	}
 	return result, false, err
 }
 
@@ -678,6 +825,54 @@ func buildContinuationMessage(results []core.ActionResult) core.ConversationMess
 		Role: "user",
 		Content: "Action results:\n" + string(resultsJSON) +
 			"\nIf the issue is resolved, finish. Otherwise propose the next smallest safe step.",
+	}
+}
+
+func shouldNudgeForExecutableStep(response core.LLMResponse, results []core.ActionResult) bool {
+	if len(results) > 0 || len(response.Actions) > 0 || len(response.Verification) > 0 || response.NeedsUserInput {
+		return false
+	}
+	if response.Confidence >= 0.85 {
+		return false
+	}
+	summary := strings.ToLower(strings.TrimSpace(response.Summary))
+	if summary == "" {
+		return false
+	}
+	intentPhrases := []string{
+		"will ",
+		"going to ",
+		"proceed",
+		"inspect",
+		"check",
+		"look for",
+		"list ",
+		"verify",
+		"search",
+		"read ",
+		"run ",
+	}
+	for _, phrase := range intentPhrases {
+		if strings.Contains(summary, phrase) {
+			return true
+		}
+	}
+	for _, finding := range response.Findings {
+		line := strings.ToLower(finding)
+		for _, phrase := range intentPhrases {
+			if strings.Contains(line, phrase) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func missingActionContinuationMessage(response core.LLMResponse) core.ConversationMessage {
+	return core.ConversationMessage{
+		Role: "user",
+		Content: fmt.Sprintf("Your last response described a next step but returned no executable actions or verification.\nSummary: %s\nReturn the smallest concrete next action now, or return a finish action if the task is already complete.",
+			response.Summary),
 	}
 }
 
@@ -758,6 +953,13 @@ func (e *Engine) thinkingLabel() string {
 		return "Planning..."
 	}
 	return "Thinking..."
+}
+
+func (e *Engine) thinkingLabelWithPhase(phase string) string {
+	if strings.TrimSpace(phase) != "" {
+		return phase
+	}
+	return e.thinkingLabel()
 }
 
 func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot, graphDigest string) string {

@@ -19,6 +19,7 @@ import (
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/graph"
+	"github.com/richardsondx/IronLark/internal/models"
 	policypkg "github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/state"
@@ -950,7 +951,11 @@ func renderCurrentModel(flags *rootFlags) error {
 			"profile":  application.Runtime.Profile,
 		})
 	}
-	application.Renderer.Message(application.Runtime.Model)
+	application.Renderer.Message(models.FormatCurrent(
+		application.Runtime.Config,
+		application.Runtime.ProviderName,
+		application.Runtime.Model,
+	))
 	return nil
 }
 

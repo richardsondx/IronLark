@@ -161,7 +161,8 @@ func (e *Executor) Execute(ctx context.Context, action core.Action, readOnly boo
 		}
 		record, err := e.PatchStore.Apply(firstNonEmpty(action.Path, firstPath(paths)), action.PatchUnifiedDiff)
 		if err != nil {
-			result.Error = err.Error()
+			result.Error = explainEditPatchError(err)
+			result.Summary = "the generated edit patch was invalid"
 			finalize(&result, startedAt)
 			return result, err
 		}
@@ -248,11 +249,26 @@ func (e *Executor) runCommand(ctx context.Context, action core.Action) (string, 
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(runCtx, "sh", "-lc", action.Command)
-	cmd.Dir = e.WorkingDir
+	dir := e.WorkingDir
 	if action.CWD != "" {
-		cmd.Dir = action.CWD
+		dir = action.CWD
 	}
+
+	stdout, stderr, exitCode, err := e.runShell(runCtx, dir, "sh", action.Command)
+	if err == nil {
+		return stdout, stderr, exitCode, nil
+	}
+	if shouldRetryWithBash(action.Command, stderr) {
+		if _, lookErr := exec.LookPath("bash"); lookErr == nil {
+			return e.runShell(runCtx, dir, "bash", action.Command)
+		}
+	}
+	return stdout, stderr, exitCode, err
+}
+
+func (e *Executor) runShell(ctx context.Context, dir, shell, command string) (string, string, int, error) {
+	cmd := exec.CommandContext(ctx, shell, "-lc", command)
+	cmd.Dir = dir
 
 	stdoutBuf := &cappedBuffer{limit: e.MaxOutputBytes}
 	stderrBuf := &cappedBuffer{limit: e.MaxOutputBytes}
@@ -274,6 +290,15 @@ func (e *Executor) runCommand(ctx context.Context, action core.Action) (string, 
 	}
 
 	return stdout, stderr, 0, nil
+}
+
+func shouldRetryWithBash(command, stderr string) bool {
+	normalizedCommand := strings.ToLower(command)
+	normalizedErr := strings.ToLower(stderr)
+	return strings.Contains(normalizedCommand, "pipefail") &&
+		(strings.Contains(normalizedErr, "illegal option -o pipefail") ||
+			strings.Contains(normalizedErr, "bad option: -o pipefail") ||
+			strings.Contains(normalizedErr, "invalid option") && strings.Contains(normalizedErr, "pipefail"))
 }
 
 func (e *Executor) grepFiles(root, pattern string) ([]string, error) {
@@ -339,6 +364,23 @@ func summarize(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func explainEditPatchError(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Error())
+	switch {
+	case strings.Contains(message, "invalid unified diff hunk header"):
+		return "The model generated an invalid unified diff hunk header. edit_file patches must use standard ranged headers like @@ -12,3 +12,4 @@."
+	case strings.Contains(message, "patch does not contain any unified diff hunks"):
+		return "The model generated an edit patch without any valid unified diff hunks. edit_file patches must include ---/+++ file headers and at least one @@ -old,+new @@ hunk."
+	case strings.Contains(message, "standard unified diff"):
+		return "The model generated an edit patch in the wrong format. edit_file only accepts standard unified diffs with ---/+++ file headers and @@ -old,+new @@ hunks."
+	default:
+		return message
+	}
 }
 
 func finalize(result *core.ActionResult, startedAt time.Time) {

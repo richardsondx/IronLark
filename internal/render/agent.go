@@ -7,12 +7,16 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
+	"github.com/richardsondx/IronLark/internal/buildinfo"
 	"github.com/richardsondx/IronLark/internal/checkpoints"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
 	"github.com/richardsondx/IronLark/internal/core"
@@ -23,22 +27,29 @@ import (
 )
 
 type AgentMeta struct {
-	Host          string
-	CWD           string
-	Model         string
-	ApprovalMode  core.ApprovalMode
-	ThreadID      string
-	CompactAtRows int
-	Interaction   core.InteractionMode
-	PolicyStore   policy.Store
+	Host             string
+	CWD              string
+	Provider         string
+	Model            string
+	ModelOptions     []string
+	RecentPrompts    []string
+	WelcomeBack      bool
+	ApprovalMode     core.ApprovalMode
+	ThreadID         string
+	CompactAtRows    int
+	Interaction      core.InteractionMode
+	NarratedProgress bool
+	PolicyStore      policy.Store
 }
 
 type overlayKind string
 
 const (
 	overlayNone     overlayKind = ""
+	overlayHistory  overlayKind = "history"
 	overlayMode     overlayKind = "mode"
 	overlayApproval overlayKind = "approval"
+	overlayModel    overlayKind = "model"
 	overlayPolicy   overlayKind = "policy"
 	overlaySlash    overlayKind = "slash"
 	overlayBlocker  overlayKind = "blocker"
@@ -54,6 +65,8 @@ const (
 	keyBackspace
 	keyUp
 	keyDown
+	keyPageUp
+	keyPageDown
 	keyEscape
 	keyTab
 	keyShiftTab
@@ -99,9 +112,13 @@ type AgentRenderer struct {
 
 	mu             sync.Mutex
 	transcript     []string
+	entries        []TranscriptEntry
 	scrollOffset   int
 	composer       []rune
 	cursor         int
+	promptHistory  []string
+	historyIndex   int
+	historyDraft   []rune
 	overlay        overlayKind
 	overlayIndex   int
 	thinking       bool
@@ -109,6 +126,9 @@ type AgentRenderer struct {
 	thinkingFrame  int
 	thinkingStop   chan struct{}
 	actionStatus   string
+	actionFrame    int
+	actionStop     chan struct{}
+	activePhase    string
 	lastPrompt     string
 	slashCommands  []slashCommand
 	secretVisible  bool
@@ -128,7 +148,7 @@ func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta
 		In:             bufio.NewReader(in),
 		Out:            out,
 		Err:            err,
-		Color:          shouldUseColor(out, false, colorMode),
+		Color:          shouldUseAgentColor(out, colorMode),
 		meta:           meta,
 		redrawInterval: 100 * time.Millisecond,
 		secretVisible:  true,
@@ -159,14 +179,21 @@ func (r *AgentRenderer) Snapshot(snapshot ctxpkg.Snapshot) error {
 }
 
 func (r *AgentRenderer) Response(response core.LLMResponse) error {
-	lines := []string{r.agentLabel("Summary") + ": " + response.Summary}
-	if len(response.Findings) > 0 {
-		lines = append(lines, r.agentHeading("Findings")+":")
-		for idx, finding := range response.Findings {
-			lines = append(lines, fmt.Sprintf("%s %s", r.agentAccent(fmt.Sprintf("%d.", idx+1)), finding))
+	details := make([]string, 0, len(response.Findings))
+	for _, finding := range distinctFindings(response.Summary, response.Findings) {
+		if strings.TrimSpace(finding) == "" {
+			continue
 		}
+		details = append(details, "- "+finding)
 	}
-	r.writeBlock("Lark", lines)
+	r.mu.Lock()
+	r.appendEntryLocked(TranscriptEntry{
+		Kind:    transcriptEntryAssistant,
+		Summary: response.Summary,
+		Details: details,
+	})
+	_ = r.drawLocked()
+	r.mu.Unlock()
 	r.setActionStatus("")
 	return nil
 }
@@ -205,18 +232,32 @@ func (r *AgentRenderer) PlannedActions(actions []core.Action, previews []core.Ri
 }
 
 func (r *AgentRenderer) ActionProgress(action core.Action) {
-	target := action.Title
-	if target == "" {
-		target = action.Command
+	if !r.meta.NarratedProgress {
+		target := action.Title
+		if target == "" {
+			target = action.Command
+		}
+		if target == "" {
+			target = action.Path
+		}
+		if target == "" {
+			target = string(action.Type)
+		}
+		r.setActionStatus("Running action...")
+		r.writeBlock("Run", []string{fmt.Sprintf("%s %s", r.agentActionTag(string(action.Type)), target)})
+		return
 	}
-	if target == "" {
-		target = action.Path
-	}
-	if target == "" {
-		target = string(action.Type)
-	}
-	r.setActionStatus("Running action...")
-	r.writeBlock("Run", []string{fmt.Sprintf("%s %s", r.agentActionTag(string(action.Type)), target)})
+	r.setActionStatus(firstNonEmpty(r.activePhase, "Running action..."))
+	r.mu.Lock()
+	r.appendEntryLocked(TranscriptEntry{
+		Kind:     transcriptEntryAction,
+		Title:    actionTimelineTitle(action),
+		Summary:  action.Reason,
+		Status:   string(core.NarrativeRunning),
+		ActionID: action.ID,
+	})
+	_ = r.drawLocked()
+	r.mu.Unlock()
 }
 
 func (r *AgentRenderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
@@ -244,33 +285,60 @@ func (r *AgentRenderer) Result(result core.ActionResult) {
 	if result.Skipped {
 		status = "skipped"
 	}
-	lines := []string{fmt.Sprintf("%s %s", r.agentResultTag(status), result.Action.Title)}
-	if result.Summary != "" {
-		lines = append(lines, r.agentLabel("Summary")+": "+result.Summary)
-	}
-	if result.Stdout != "" {
-		lines = append(lines, r.agentLabel("Output")+":")
-		for _, line := range strings.Split(strings.TrimRight(result.Stdout, "\n"), "\n") {
-			lines = append(lines, "  "+r.agentOutputPrefix(ansiGray)+" "+r.agentOutputLine(line, ansiGray))
+	if !r.meta.NarratedProgress {
+		lines := []string{fmt.Sprintf("%s %s", r.agentResultTag(status), result.Action.Title)}
+		if result.Summary != "" {
+			lines = append(lines, r.agentLabel("Summary")+": "+result.Summary)
 		}
-	}
-	if result.Stderr != "" {
-		lines = append(lines, r.agentLabel("Stderr")+":")
-		for _, line := range strings.Split(strings.TrimRight(result.Stderr, "\n"), "\n") {
-			lines = append(lines, "  "+r.agentOutputPrefix(ansiRed)+" "+r.agentOutputLine(line, ansiRed))
+		if result.Stdout != "" {
+			lines = append(lines, r.agentLabel("Output")+":")
+			for _, line := range strings.Split(strings.TrimRight(result.Stdout, "\n"), "\n") {
+				lines = append(lines, "  "+r.agentOutputPrefix(ansiGray)+" "+r.agentOutputLine(line, ansiGray))
+			}
 		}
-	}
-	if result.Error != "" {
-		lines = append(lines, r.agentLabel("Error")+": "+r.agentOutputLine(strings.TrimSpace(result.Error), ansiRed))
-	}
-	if result.PatchID != "" {
-		lines = append(lines, r.agentLabel("Patch ID")+": "+result.PatchID)
-	}
-	if result.CheckpointID != "" {
-		lines = append(lines, r.agentLabel("Checkpoint ID")+": "+result.CheckpointID)
+		if result.Stderr != "" {
+			lines = append(lines, r.agentLabel("Stderr")+":")
+			for _, line := range strings.Split(strings.TrimRight(result.Stderr, "\n"), "\n") {
+				lines = append(lines, "  "+r.agentOutputPrefix(ansiRed)+" "+r.agentOutputLine(line, ansiRed))
+			}
+		}
+		if result.Error != "" {
+			lines = append(lines, r.agentLabel("Error")+": "+r.agentOutputLine(strings.TrimSpace(result.Error), ansiRed))
+		}
+		if result.PatchID != "" {
+			lines = append(lines, r.agentLabel("Patch ID")+": "+result.PatchID)
+		}
+		if result.CheckpointID != "" {
+			lines = append(lines, r.agentLabel("Checkpoint ID")+": "+result.CheckpointID)
+		}
+		r.setActionStatus("")
+		r.writeBlock("Result", lines)
+		return
 	}
 	r.setActionStatus("")
-	r.writeBlock("Result", lines)
+	details, expanded := resultDetailLines(r, result)
+	summary := firstNonEmpty(result.Summary, result.Action.Title)
+	r.mu.Lock()
+	r.appendEntryLocked(TranscriptEntry{
+		Kind:     transcriptEntryResult,
+		Summary:  fmt.Sprintf("%s (%s)", summary, status),
+		Details:  details,
+		Expanded: expanded,
+		Status:   status,
+		ActionID: result.Action.ID,
+	})
+	_ = r.drawLocked()
+	r.mu.Unlock()
+}
+
+func (r *AgentRenderer) Narrate(event core.NarrativeEvent) {
+	if !r.meta.NarratedProgress {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.appendNarrativeLocked(event)
+	_ = r.drawLocked()
 }
 
 func (r *AgentRenderer) BeginThinking(label string) {
@@ -331,6 +399,15 @@ func (r *AgentRenderer) SetApproval(mode core.ApprovalMode) {
 	_ = r.drawLocked()
 }
 
+func (r *AgentRenderer) SetModelContext(provider, model string, options []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.meta.Provider = provider
+	r.meta.Model = model
+	r.meta.ModelOptions = append([]string(nil), options...)
+	_ = r.drawLocked()
+}
+
 func (r *AgentRenderer) SetSecretVisibility(visible bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -350,16 +427,18 @@ func (r *AgentRenderer) SecretVisibility() string {
 func (r *AgentRenderer) ClearScreen() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.entries = nil
 	r.transcript = nil
 	r.scrollOffset = 0
 	r.resetComposerLocked()
 	r.overlay = overlayNone
 	r.overlayIndex = 0
 	r.blocker = nil
-	r.actionStatus = ""
+	r.stopActionStatusLocked()
 	r.stopThinkingLocked()
 	r.lastFrame = nil
 	r.lastWidth = 0
+	r.activePhase = ""
 	_ = r.drawLocked()
 }
 
@@ -672,9 +751,13 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		r.overlay = overlayNone
 	case keyUp:
 		switch r.overlay {
+		case overlayHistory:
+			r.moveOverlayLocked(-1)
 		case overlayMode:
 			r.moveOverlayLocked(-1)
 		case overlayApproval:
+			r.moveOverlayLocked(-1)
+		case overlayModel:
 			r.moveOverlayLocked(-1)
 		case overlayPolicy:
 			r.moveOverlayLocked(-1)
@@ -685,9 +768,13 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		}
 	case keyDown:
 		switch r.overlay {
+		case overlayHistory:
+			r.moveOverlayLocked(1)
 		case overlayMode:
 			r.moveOverlayLocked(1)
 		case overlayApproval:
+			r.moveOverlayLocked(1)
+		case overlayModel:
 			r.moveOverlayLocked(1)
 		case overlayPolicy:
 			r.moveOverlayLocked(1)
@@ -696,22 +783,69 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		default:
 			r.scrollLocked(-1)
 		}
-	case keyTab, keyShiftTab:
-		// Ignore in the main composer; blocker mode handles keyboard focus.
+	case keyPageUp:
+		r.scrollLocked(1)
+	case keyPageDown:
+		r.scrollLocked(-1)
+	case keyTab:
+		switch r.overlay {
+		case overlayHistory:
+			r.moveOverlayLocked(1)
+		case overlayNone:
+			r.openHistoryOverlayLocked()
+		default:
+			if r.meta.NarratedProgress && len(r.composer) == 0 && r.overlay == overlayNone && r.toggleLatestExpandableLocked() {
+				_ = r.drawLocked()
+				return "", false
+			}
+		}
+	case keyShiftTab:
+		switch r.overlay {
+		case overlayHistory:
+			r.moveOverlayLocked(-1)
+		default:
+			if r.meta.NarratedProgress && len(r.composer) == 0 && r.overlay == overlayNone && r.toggleLatestExpandableLocked() {
+				_ = r.drawLocked()
+				return "", false
+			}
+		}
 	case keyEnter:
 		switch r.overlay {
+		case overlayHistory:
+			prompt := r.selectedHistoryPromptLocked()
+			r.overlay = overlayNone
+			if prompt != "" {
+				r.composer = []rune(prompt)
+				r.cursor = len(r.composer)
+			}
+			_ = r.drawLocked()
+			return "", false
 		case overlayMode:
 			command := r.selectedModeCommandLocked()
 			r.overlay = overlayNone
+			r.recordPromptHistoryLocked(command)
 			r.writeUserInputLocked(command)
 			_ = r.drawLocked()
 			return command, true
 		case overlayApproval:
 			command := r.selectedApprovalCommandLocked()
 			r.overlay = overlayNone
+			r.recordPromptHistoryLocked(command)
 			r.writeUserInputLocked(command)
 			_ = r.drawLocked()
 			return command, true
+		case overlayModel:
+			command := r.selectedModelCommandLocked()
+			if command != "" {
+				r.overlay = overlayNone
+				r.recordPromptHistoryLocked(command)
+				r.writeUserInputLocked(command)
+				_ = r.drawLocked()
+				return command, true
+			}
+			r.overlay = overlayNone
+			_ = r.drawLocked()
+			return "", false
 		case overlayPolicy:
 			r.toggleSelectedPolicyRuleLocked()
 			_ = r.drawLocked()
@@ -723,6 +857,11 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 				_ = r.drawLocked()
 				return "", false
 			}
+			if command == "/model" {
+				r.openModelOverlayLocked()
+				_ = r.drawLocked()
+				return "", false
+			}
 			if command == "/policy" {
 				r.openPolicyOverlayLocked()
 				_ = r.drawLocked()
@@ -731,6 +870,7 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 			if command != "" {
 				r.resetComposerLocked()
 				r.overlay = overlayNone
+				r.recordPromptHistoryLocked(command)
 				r.writeUserInputLocked(command)
 				_ = r.drawLocked()
 				return command, true
@@ -740,6 +880,7 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 			r.resetComposerLocked()
 			r.overlay = overlayNone
 			if prompt != "" {
+				r.recordPromptHistoryLocked(prompt)
 				r.writeUserInputLocked(prompt)
 			}
 			_ = r.drawLocked()
@@ -843,11 +984,18 @@ func (r *AgentRenderer) currentModeLabel() string {
 }
 
 func (r *AgentRenderer) insertRuneLocked(ch rune) {
+	if ch < 32 || ch == 127 {
+		return
+	}
 	r.composer = append(r.composer, ch)
 	r.cursor = len(r.composer)
 }
 
 func (r *AgentRenderer) insertTextLocked(text string) {
+	text = sanitizeComposerText(text)
+	if text == "" {
+		return
+	}
 	r.composer = append(r.composer, []rune(text)...)
 	r.cursor = len(r.composer)
 }
@@ -869,9 +1017,19 @@ func (r *AgentRenderer) openModeOverlayLocked() {
 	}
 }
 
+func (r *AgentRenderer) openHistoryOverlayLocked() {
+	r.overlay = overlayHistory
+	r.overlayIndex = 0
+}
+
 func (r *AgentRenderer) openApprovalOverlayLocked() {
 	r.overlay = overlayApproval
 	r.overlayIndex = r.approvalIndexLocked()
+}
+
+func (r *AgentRenderer) openModelOverlayLocked() {
+	r.overlay = overlayModel
+	r.overlayIndex = r.modelIndexLocked()
 }
 
 func (r *AgentRenderer) openPolicyOverlayLocked() {
@@ -882,7 +1040,7 @@ func (r *AgentRenderer) openPolicyOverlayLocked() {
 
 func (r *AgentRenderer) updateOverlayLocked() {
 	composer := string(r.composer)
-	if r.overlay == overlayMode || r.overlay == overlayApproval || r.overlay == overlayPolicy || r.overlay == overlayBlocker {
+	if r.overlay == overlayHistory || r.overlay == overlayMode || r.overlay == overlayApproval || r.overlay == overlayModel || r.overlay == overlayPolicy || r.overlay == overlayBlocker {
 		return
 	}
 	if strings.HasPrefix(composer, "/") {
@@ -909,10 +1067,14 @@ func (r *AgentRenderer) updateOverlayLocked() {
 func (r *AgentRenderer) moveOverlayLocked(delta int) {
 	var size int
 	switch r.overlay {
+	case overlayHistory:
+		size = len(r.promptHistory)
 	case overlayMode:
 		size = 2
 	case overlayApproval:
 		size = len(approvalModes)
+	case overlayModel:
+		size = len(r.meta.ModelOptions)
 	case overlayPolicy:
 		size = len(r.policyRulesLocked())
 	case overlaySlash:
@@ -934,6 +1096,20 @@ func (r *AgentRenderer) selectedModeCommandLocked() string {
 	return "/mode execute-first"
 }
 
+func (r *AgentRenderer) selectedHistoryPromptLocked() string {
+	if len(r.promptHistory) == 0 {
+		return ""
+	}
+	if r.overlayIndex < 0 || r.overlayIndex >= len(r.promptHistory) {
+		r.overlayIndex = 0
+	}
+	idx := len(r.promptHistory) - 1 - r.overlayIndex
+	if idx < 0 || idx >= len(r.promptHistory) {
+		return ""
+	}
+	return r.promptHistory[idx]
+}
+
 func (r *AgentRenderer) secretToggleCommandLocked() slashCommand {
 	if r.secretVisible {
 		return slashCommand{
@@ -952,6 +1128,25 @@ func (r *AgentRenderer) selectedApprovalCommandLocked() string {
 		r.overlayIndex = 0
 	}
 	return "/approval " + string(approvalModes[r.overlayIndex])
+}
+
+func (r *AgentRenderer) modelIndexLocked() int {
+	for idx, model := range r.meta.ModelOptions {
+		if model == r.meta.Model {
+			return idx
+		}
+	}
+	return 0
+}
+
+func (r *AgentRenderer) selectedModelCommandLocked() string {
+	if len(r.meta.ModelOptions) == 0 {
+		return ""
+	}
+	if r.overlayIndex < 0 || r.overlayIndex >= len(r.meta.ModelOptions) {
+		r.overlayIndex = 0
+	}
+	return "/model " + r.meta.ModelOptions[r.overlayIndex]
 }
 
 func (r *AgentRenderer) selectedSlashCommandLocked() string {
@@ -1022,18 +1217,76 @@ func (r *AgentRenderer) writeUserInput(prompt string) {
 
 func (r *AgentRenderer) writeUserInputLocked(prompt string) {
 	lines := splitMessageLines(prompt)
-	for idx, line := range lines {
-		prefix := "  "
-		if idx == 0 {
-			prefix = "> "
-		}
-		r.transcript = append(r.transcript, prefix+line)
+	r.appendEntryLocked(TranscriptEntry{
+		Kind:    transcriptEntryUser,
+		Details: lines,
+	})
+}
+
+func (r *AgentRenderer) recordPromptHistoryLocked(prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		r.historyIndex = 0
+		r.historyDraft = nil
+		return
 	}
+	if len(r.promptHistory) == 0 || r.promptHistory[len(r.promptHistory)-1] != prompt {
+		r.promptHistory = append(r.promptHistory, prompt)
+	}
+	r.historyIndex = 0
+	r.historyDraft = nil
 }
 
 func (r *AgentRenderer) resetComposerLocked() {
 	r.composer = nil
 	r.cursor = 0
+}
+
+func (r *AgentRenderer) movePromptHistoryLocked(delta int) {
+	if len(r.promptHistory) == 0 {
+		return
+	}
+	if delta < 0 {
+		if r.historyIndex == 0 {
+			r.historyDraft = append([]rune(nil), r.composer...)
+		}
+		if r.historyIndex < len(r.promptHistory) {
+			r.historyIndex++
+		}
+	} else if delta > 0 {
+		if r.historyIndex == 0 {
+			return
+		}
+		r.historyIndex--
+	}
+
+	if r.historyIndex == 0 {
+		r.composer = append([]rune(nil), r.historyDraft...)
+		r.cursor = len(r.composer)
+		return
+	}
+
+	idx := len(r.promptHistory) - r.historyIndex
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(r.promptHistory) {
+		idx = len(r.promptHistory) - 1
+	}
+	r.composer = []rune(r.promptHistory[idx])
+	r.cursor = len(r.composer)
+}
+
+func (r *AgentRenderer) historyOverlayLinesLocked() []string {
+	if len(r.promptHistory) == 0 {
+		return []string{"History", "  no prompts yet"}
+	}
+	lines := []string{"History"}
+	for idx := len(r.promptHistory) - 1; idx >= 0; idx-- {
+		lines = append(lines, r.overlayOptionLocked(len(r.promptHistory)-1-idx, r.promptHistory[idx], ""))
+	}
+	lines = append(lines, "  enter recalls selected prompt")
+	return lines
 }
 
 func (r *AgentRenderer) advanceBlockerFocusLocked(delta int) {
@@ -1056,7 +1309,36 @@ func (r *AgentRenderer) advanceBlockerFocusLocked(delta int) {
 func (r *AgentRenderer) setActionStatus(status string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.actionStatus = status
+	if status == "" {
+		r.stopActionStatusLocked()
+	} else {
+		r.actionStatus = status
+		r.actionFrame = 0
+		if r.actionStop != nil {
+			close(r.actionStop)
+		}
+		stop := make(chan struct{})
+		r.actionStop = stop
+		go func() {
+			ticker := time.NewTicker(r.tickInterval())
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					r.mu.Lock()
+					if r.actionStatus == "" || r.actionStop != stop {
+						r.mu.Unlock()
+						return
+					}
+					r.actionFrame++
+					_ = r.drawLocked()
+					r.mu.Unlock()
+				case <-stop:
+					return
+				}
+			}
+		}()
+	}
 	_ = r.drawLocked()
 }
 
@@ -1070,30 +1352,33 @@ func (r *AgentRenderer) stopThinkingLocked() {
 	}
 }
 
+func (r *AgentRenderer) stopActionStatusLocked() {
+	r.actionStatus = ""
+	r.actionFrame = 0
+	if r.actionStop != nil {
+		close(r.actionStop)
+		r.actionStop = nil
+	}
+}
+
 func (r *AgentRenderer) writeBlock(title string, lines []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(lines) == 0 {
 		lines = []string{""}
 	}
-	r.transcript = append(r.transcript, "")
-	r.transcript = append(r.transcript, "## "+title)
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			r.transcript = append(r.transcript, "")
-			continue
-		}
-		for _, wrapped := range r.wrapWithWidth(line, r.bodyWidth()) {
-			r.transcript = append(r.transcript, wrapped)
-		}
-	}
+	r.appendEntryLocked(TranscriptEntry{
+		Kind:    transcriptEntryBlock,
+		Title:   title,
+		Details: lines,
+	})
 	_ = r.drawLocked()
 }
 
 func (r *AgentRenderer) drawLocked() error {
 	width, height := r.sizeFn()
 	header := r.headerLines(width, height)
-	bodyHeight := height - len(header) - 3
+	bodyHeight := height - len(header) - 4
 	if bodyHeight < 4 {
 		bodyHeight = 4
 	}
@@ -1123,17 +1408,22 @@ func (r *AgentRenderer) drawLocked() error {
 		end = start + bodyHeight
 	}
 	body := r.transcript[start:end]
+	if r.shouldShowWelcomeLocked() {
+		body = r.welcomeLinesLocked(width, bodyHeight)
+	}
 
 	r.ensureAltScreenLocked()
 	frame := make([]string, 0, height)
 	for _, line := range header {
 		frame = append(frame, truncateDisplay(line, width))
 	}
+	if len(body) < bodyHeight {
+		for i := 0; i < bodyHeight-len(body); i++ {
+			frame = append(frame, "")
+		}
+	}
 	for _, line := range body {
 		frame = append(frame, truncateDisplay(line, width))
-	}
-	for i := len(body); i < bodyHeight; i++ {
-		frame = append(frame, "")
 	}
 	for _, line := range overlayLines {
 		frame = append(frame, truncateDisplay(line, width))
@@ -1141,6 +1431,7 @@ func (r *AgentRenderer) drawLocked() error {
 	frame = append(frame,
 		truncateDisplay(r.statusLineLocked(width), width),
 		truncateDisplay(r.promptLineLocked(width), width),
+		truncateDisplay(r.inputBorderLineLocked(width), width),
 		truncateDisplay(r.footerLineLocked(width), width),
 	)
 
@@ -1156,14 +1447,117 @@ func (r *AgentRenderer) drawLocked() error {
 }
 
 func (r *AgentRenderer) headerLines(width, height int) []string {
-	statusLine := fmt.Sprintf(" approval=%s  mode=%s ", r.meta.ApprovalMode, r.currentModeLabel())
-	if r.meta.CompactAtRows > 0 && height <= r.meta.CompactAtRows {
-		return []string{truncateDisplay(statusLine, width)}
-	}
 	return []string{
-		truncateDisplay(statusLine, width),
-		truncateDisplay(" SSH-first operator workspace. Up/down scrolls output. Type / for command menu. ", width),
+		truncateDisplay(" SSH-first ai agent. Tab opens prompt history. Type / for command menu. ", width),
 	}
+}
+
+func (r *AgentRenderer) shouldShowWelcomeLocked() bool {
+	if r.overlay != overlayNone {
+		return false
+	}
+	if len(r.entries) > 0 || len(r.transcript) > 0 {
+		return false
+	}
+	return strings.TrimSpace(string(r.composer)) == ""
+}
+
+func (r *AgentRenderer) welcomeLinesLocked(width, bodyHeight int) []string {
+	title := "Welcome!"
+	if r.meta.WelcomeBack {
+		title = "Welcome back!"
+	}
+	cardWidth := clamp(minInt(width-6, 88), 44, max(44, width-2))
+	innerWidth := max(28, cardWidth-2)
+	titleLabel := fmt.Sprintf(" IronLark v%s ", buildinfo.NormalizeVersion(buildinfo.Version))
+	frameColor := ""
+	if r.Color {
+		frameColor = ansiGreen
+	}
+	lines := []string{
+		title,
+		"",
+	}
+	lines = append(lines, r.larkMarkLines()...)
+	lines = append(lines, "", firstNonEmpty(r.meta.Model, "model unavailable"), compactHomePath(r.meta.CWD))
+	box := make([]string, 0, len(lines)+2)
+	box = append(box, r.centerLine(colorize(topBorderWithTitle(innerWidth, titleLabel), frameColor), width))
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			box = append(box, r.centerLine(colorize("│", frameColor)+strings.Repeat(" ", innerWidth)+colorize("│", frameColor), width))
+			continue
+		}
+		for _, wrapped := range r.wrapWithWidth(line, innerWidth-6) {
+			box = append(box, r.centerLine(colorize("│", frameColor)+centerInside(wrapped, innerWidth)+colorize("│", frameColor), width))
+		}
+	}
+	box = append(box, r.centerLine(colorize("└"+strings.Repeat("─", innerWidth)+"┘", frameColor), width))
+	out := make([]string, 0, len(box))
+	out = append(out, box...)
+	if len(out) > bodyHeight {
+		return out[len(out)-bodyHeight:]
+	}
+	return out
+}
+
+func (r *AgentRenderer) centerLine(value string, width int) string {
+	visible := visibleWidth(value)
+	if visible >= width {
+		return value
+	}
+	pad := (width - visible) / 2
+	return strings.Repeat(" ", pad) + value
+}
+
+func centerInside(value string, width int) string {
+	visible := visibleWidth(value)
+	if visible >= width {
+		return truncateDisplay(value, width)
+	}
+	left := (width - visible) / 2
+	right := width - visible - left
+	return strings.Repeat(" ", left) + value + strings.Repeat(" ", right)
+}
+
+func topBorderWithTitle(innerWidth int, title string) string {
+	titleWidth := visibleWidth(title)
+	if innerWidth <= titleWidth+2 {
+		return "┌" + strings.Repeat("─", max(0, innerWidth)) + "┐"
+	}
+	left := 2
+	right := innerWidth - titleWidth - left
+	if right < 1 {
+		right = 1
+	}
+	return "┌" + strings.Repeat("─", left) + title + strings.Repeat("─", right) + "┐"
+}
+
+func (r *AgentRenderer) larkMark() string {
+	mark := []string{
+		"▟██▙  ▟██▙",
+		"██  ███  ██",
+		"██  ▀▀  ▄██",
+		" ▀██▄▄██▀",
+	}
+	if !r.Color {
+		return strings.Join(mark, "\n")
+	}
+	painted := make([]string, 0, len(mark))
+	for _, line := range mark {
+		painted = append(painted, ansiBold+ansiYellow+line+ansiReset)
+	}
+	return strings.Join(painted, "\n")
+}
+
+func (r *AgentRenderer) larkMarkLines() []string {
+	return splitMessageLines(r.larkMark())
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (r *AgentRenderer) statusLineLocked(width int) string {
@@ -1173,7 +1567,8 @@ func (r *AgentRenderer) statusLineLocked(width int) string {
 		label := thinkingFrames[r.thinkingFrame%len(thinkingFrames)] + " " + r.thinkingLabel + "  Ctrl+C to stop"
 		return truncate(statusWithLabel(width, label), width)
 	case r.actionStatus != "":
-		return truncate(statusWithLabel(width, r.actionStatus), width)
+		label := thinkingFrames[r.actionFrame%len(thinkingFrames)] + " " + r.actionStatus
+		return truncate(statusWithLabel(width, label), width)
 	default:
 		return base
 	}
@@ -1193,8 +1588,12 @@ func (r *AgentRenderer) promptLineLocked(width int) string {
 	return "> " + renderPromptValue(string(r.composer))
 }
 
+func (r *AgentRenderer) inputBorderLineLocked(width int) string {
+	return strings.Repeat("-", clamp(width, 12, width))
+}
+
 func (r *AgentRenderer) footerLineLocked(width int) string {
-	left := " IronLark Agent "
+	left := fmt.Sprintf(" IronLark Agent | approval=%s  mode=%s ", r.meta.ApprovalMode, r.currentModeLabel())
 	right := fmt.Sprintf(" \"%s\"  %s ", shortHost(r.meta.Host), r.meta.ThreadID)
 	label := joinFooterSides(left, right, width)
 	if !r.Color {
@@ -1205,6 +1604,8 @@ func (r *AgentRenderer) footerLineLocked(width int) string {
 
 func (r *AgentRenderer) overlayLinesLocked(width int) []string {
 	switch r.overlay {
+	case overlayHistory:
+		return r.wrapOverlayLines(width, r.historyOverlayLinesLocked())
 	case overlayMode:
 		return r.wrapOverlayLines(width, []string{
 			"Mode",
@@ -1215,6 +1616,18 @@ func (r *AgentRenderer) overlayLinesLocked(width int) []string {
 		lines := []string{"Approval"}
 		for idx, mode := range approvalModes {
 			lines = append(lines, r.overlayOptionLocked(idx, "approval: "+string(mode), ""))
+		}
+		return r.wrapOverlayLines(width, lines)
+	case overlayModel:
+		if len(r.meta.ModelOptions) == 0 {
+			return r.wrapOverlayLines(width, []string{"Models", "  no models configured for the active provider"})
+		}
+		lines := []string{fmt.Sprintf("Models (%s)", firstNonEmpty(r.meta.Provider, "default"))}
+		for idx, model := range r.meta.ModelOptions {
+			if model == r.meta.Model {
+				model += " *"
+			}
+			lines = append(lines, r.overlayOptionLocked(idx, model, ""))
 		}
 		return r.wrapOverlayLines(width, lines)
 	case overlayPolicy:
@@ -1368,16 +1781,17 @@ func (r *AgentRenderer) toggleSelectedPolicyRuleLocked() {
 }
 
 func (r *AgentRenderer) wrapWithWidth(line string, width int) []string {
-	if strings.Contains(line, "\033[") {
-		return []string{line}
-	}
 	if width <= 0 || visibleWidth(line) <= width {
 		return []string{line}
 	}
 	out := []string{}
 	for visibleWidth(line) > width {
-		out = append(out, line[:width])
-		line = line[width:]
+		head, rest := splitVisiblePrefix(line, width)
+		if head == "" {
+			break
+		}
+		out = append(out, head)
+		line = rest
 	}
 	if line != "" {
 		out = append(out, line)
@@ -1501,6 +1915,14 @@ func (r *AgentRenderer) readKey() (keyPress, error) {
 				return keyPress{Kind: keyUp}, nil
 			case 'B':
 				return keyPress{Kind: keyDown}, nil
+			case '5':
+				if r.readEscapeSequence("~") {
+					return keyPress{Kind: keyPageUp}, nil
+				}
+			case '6':
+				if r.readEscapeSequence("~") {
+					return keyPress{Kind: keyPageDown}, nil
+				}
 			case 'Z':
 				return keyPress{Kind: keyShiftTab}, nil
 			case '2':
@@ -1574,9 +1996,42 @@ func (r *AgentRenderer) readEscByte() (byte, bool) {
 }
 
 func renderPromptValue(value string) string {
+	value = sanitizeComposerText(value)
 	value = strings.ReplaceAll(value, "\r\n", "\n")
 	value = strings.ReplaceAll(value, "\r", "\n")
 	return strings.ReplaceAll(value, "\n", "\\n")
+}
+
+func sanitizeComposerText(value string) string {
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < len(value); {
+		if value[i] == 27 {
+			if end := ansiSequenceEnd(value, i); end > i {
+				i = end
+				continue
+			}
+			i++
+			continue
+		}
+		r := rune(value[i])
+		if r == '\n' || r == '\t' || (r >= 32 && r != 127) {
+			b.WriteByte(value[i])
+		}
+		i++
+	}
+	return stripLeakedControlNotation(b.String())
+}
+
+var leakedControlNotationPattern = regexp.MustCompile(`\^\[\[?[0-9;?]*[A-Za-z~]|\^[A-Z]`)
+
+func stripLeakedControlNotation(value string) string {
+	if value == "" {
+		return ""
+	}
+	return leakedControlNotationPattern.ReplaceAllString(value, "")
 }
 
 func (r *AgentRenderer) tickInterval() time.Duration {
@@ -1640,14 +2095,56 @@ func truncateVisible(value string, width int) string {
 		if visible >= width {
 			break
 		}
-		b.WriteByte(value[i])
-		i++
+		r, size := utf8.DecodeRuneInString(value[i:])
+		if r == utf8.RuneError && size == 1 {
+			i++
+			continue
+		}
+		b.WriteString(value[i : i+size])
+		i += size
 		visible++
 	}
 	if strings.Contains(b.String(), "\033[") && !strings.HasSuffix(b.String(), ansiReset) {
 		b.WriteString(ansiReset)
 	}
 	return b.String()
+}
+
+func splitVisiblePrefix(value string, width int) (string, string) {
+	if width <= 0 {
+		return "", value
+	}
+	var b strings.Builder
+	visible := 0
+	index := 0
+	for index < len(value) {
+		if value[index] == 27 {
+			end := ansiSequenceEnd(value, index)
+			if end <= index {
+				index++
+				continue
+			}
+			b.WriteString(value[index:end])
+			index = end
+			continue
+		}
+		if visible >= width {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(value[index:])
+		if r == utf8.RuneError && size == 1 {
+			index++
+			continue
+		}
+		b.WriteString(value[index : index+size])
+		index += size
+		visible++
+	}
+	head := b.String()
+	if strings.Contains(head, "\033[") && !strings.HasSuffix(head, ansiReset) {
+		head += ansiReset
+	}
+	return head, value[index:]
 }
 
 func padVisibleRight(value string, width int) string {
@@ -1704,7 +2201,11 @@ func visibleWidth(value string) int {
 			i = end
 			continue
 		}
-		i++
+		_, size := utf8.DecodeRuneInString(value[i:])
+		if size <= 0 {
+			size = 1
+		}
+		i += size
 		width++
 	}
 	return width
@@ -1777,6 +2278,121 @@ func (r *AgentRenderer) agentLabel(text string) string {
 
 func (r *AgentRenderer) agentAccent(text string) string {
 	return r.agentStyle(text, ansiCyan)
+}
+
+func (r *AgentRenderer) assistantPrefix() string {
+	label := "⏹ "
+	if !r.Color {
+		return label
+	}
+	return ansiBold + ansiYellow + label + ansiReset
+}
+
+func (r *AgentRenderer) userChip(text string) string {
+	label := "› " + text + " "
+	if !r.Color {
+		return label
+	}
+	return ansiBlack + ansiBgWhite + label + ansiReset
+}
+
+func compactHomePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	home = filepath.Clean(home)
+	path = filepath.Clean(path)
+	if path == home {
+		return "~"
+	}
+	prefix := home + string(os.PathSeparator)
+	if strings.HasPrefix(path, prefix) {
+		return "~" + string(os.PathSeparator) + strings.TrimPrefix(path, prefix)
+	}
+	return path
+}
+
+func distinctFindings(summary string, findings []string) []string {
+	summaryNorm := normalizeFindingText(summary)
+	out := make([]string, 0, len(findings))
+	seen := map[string]struct{}{}
+	for _, finding := range findings {
+		trimmed := strings.TrimSpace(finding)
+		if trimmed == "" {
+			continue
+		}
+		norm := normalizeFindingText(trimmed)
+		if norm == "" {
+			continue
+		}
+		if _, ok := seen[norm]; ok {
+			continue
+		}
+		if summaryNorm != "" && (norm == summaryNorm || strings.Contains(summaryNorm, norm) || strings.Contains(norm, summaryNorm) || tokenOverlapRatio(summaryNorm, norm) >= 0.8) {
+			continue
+		}
+		seen[norm] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func normalizeFindingText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return ""
+	}
+	var b strings.Builder
+	lastSpace := false
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastSpace = false
+		case lastSpace:
+			continue
+		default:
+			b.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func tokenOverlapRatio(left, right string) float64 {
+	leftTokens := strings.Fields(left)
+	rightTokens := strings.Fields(right)
+	if len(leftTokens) == 0 || len(rightTokens) == 0 {
+		return 0
+	}
+	leftSet := map[string]struct{}{}
+	for _, token := range leftTokens {
+		leftSet[token] = struct{}{}
+	}
+	overlap := 0
+	rightSeen := map[string]struct{}{}
+	for _, token := range rightTokens {
+		if _, ok := rightSeen[token]; ok {
+			continue
+		}
+		rightSeen[token] = struct{}{}
+		if _, ok := leftSet[token]; ok {
+			overlap++
+		}
+	}
+	denominator := len(rightSeen)
+	if len(leftSet) > denominator {
+		denominator = len(leftSet)
+	}
+	if denominator == 0 {
+		return 0
+	}
+	return float64(overlap) / float64(denominator)
 }
 
 func (r *AgentRenderer) agentActionTag(text string) string {

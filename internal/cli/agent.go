@@ -10,7 +10,9 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/richardsondx/IronLark/internal/agent"
+	"github.com/richardsondx/IronLark/internal/models"
 	"github.com/richardsondx/IronLark/internal/render"
+	"github.com/richardsondx/IronLark/internal/sessions"
 	"github.com/richardsondx/IronLark/internal/threads"
 )
 
@@ -119,6 +121,7 @@ func newAgentStopCommand(flags *rootFlags) *cobra.Command {
 func newAgentUICommand(flags *rootFlags) *cobra.Command {
 	var workspaceKey string
 	var initialPrompt string
+	var welcomeBack bool
 	cmd := &cobra.Command{
 		Use:    "__agent-ui",
 		Short:  "Internal agent UI runner",
@@ -138,18 +141,23 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 			if err := os.Chdir(workspace.CWD); err != nil {
 				return err
 			}
+			recentPrompts := recentAgentPrompts(application.Sessions)
 			application.Renderer = render.NewAgent(os.Stdin, os.Stdout, os.Stderr, flags.color, render.AgentMeta{
-				Host:          workspace.Host,
-				CWD:           workspace.CWD,
-				Model:         application.Runtime.Model,
-				ApprovalMode:  application.Runtime.ApprovalMode,
-				ThreadID:      workspace.ThreadID,
-				CompactAtRows: application.Runtime.Config.Agent.CompactModeRows,
-				Interaction:   application.Runtime.Interaction,
-				PolicyStore:   application.PolicyStore,
+				Host:             workspace.Host,
+				CWD:              workspace.CWD,
+				Provider:         application.Runtime.ProviderName,
+				Model:            application.Runtime.Model,
+				ModelOptions:     models.SuggestedForProvider(application.Runtime.Config, application.Runtime.ProviderName),
+				RecentPrompts:    recentPrompts,
+				WelcomeBack:      welcomeBack,
+				ApprovalMode:     application.Runtime.ApprovalMode,
+				ThreadID:         workspace.ThreadID,
+				CompactAtRows:    application.Runtime.Config.Agent.CompactModeRows,
+				Interaction:      application.Runtime.Interaction,
+				NarratedProgress: application.Runtime.Config.UI.NarratedProgress,
+				PolicyStore:      application.PolicyStore,
 			})
 			defer fmt.Fprint(os.Stdout, "\033[?25h\033[?2004l\033[?1049l")
-			application.Renderer.Message("Remote operator workspace ready.")
 			if err := application.Agents.Save(workspace); err != nil {
 				return err
 			}
@@ -158,6 +166,7 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&workspaceKey, "workspace", "", "workspace key")
 	cmd.Flags().StringVar(&initialPrompt, "prompt", "", "initial prompt")
+	cmd.Flags().BoolVar(&welcomeBack, "welcome-back", false, "render returning-user welcome state")
 	_ = cmd.MarkFlagRequired("workspace")
 	return cmd
 }
@@ -165,6 +174,7 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 func newAgentRunnerCommand(flags *rootFlags) *cobra.Command {
 	var workspaceKey string
 	var initialPrompt string
+	var welcomeBack bool
 	cmd := &cobra.Command{
 		Use:    "__agent-runner",
 		Short:  "Internal detached agent session runner",
@@ -204,6 +214,9 @@ func newAgentRunnerCommand(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(initialPrompt) != "" {
 				uiArgs = append(uiArgs, "--prompt", initialPrompt)
 			}
+			if welcomeBack {
+				uiArgs = append(uiArgs, "--welcome-back")
+			}
 			runner := agent.RunnerServer{
 				Store:      application.Agents,
 				Workspace:  workspace,
@@ -215,6 +228,7 @@ func newAgentRunnerCommand(flags *rootFlags) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&workspaceKey, "workspace", "", "workspace key")
 	cmd.Flags().StringVar(&initialPrompt, "prompt", "", "initial prompt")
+	cmd.Flags().BoolVar(&welcomeBack, "welcome-back", false, "render returning-user welcome state")
 	_ = cmd.MarkFlagRequired("workspace")
 	return cmd
 }
@@ -230,14 +244,16 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 		return err
 	}
 	workspace := agent.BuildWorkspace(application.Runtime.Config.Agent.SessionPrefix, application.Loaded.Paths.AgentDir, userName, host, application.Runtime.WorkingDir, ref.ThreadID)
+	hadExistingWorkspace := false
 	if existing, err := application.Agents.Load(workspace.Key); err == nil && existing.Key != "" {
+		hadExistingWorkspace = true
 		workspace = mergeWorkspaceDefaults(existing, workspace)
 	}
 	if strings.TrimSpace(workspace.ThreadID) == "" {
 		workspace.ThreadID = ref.ThreadID
 	}
 
-	executable, runnerArgs, err := agentRunnerCommand(flags, workspace, initialPrompt)
+	executable, runnerArgs, err := agentRunnerCommand(flags, workspace, initialPrompt, hadExistingWorkspace)
 	if err != nil {
 		return err
 	}
@@ -249,7 +265,7 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 	return manager.Attach(ctx, workspace)
 }
 
-func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialPrompt string) (string, []string, error) {
+func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialPrompt string, welcomeBack bool) (string, []string, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return "", nil, err
@@ -272,6 +288,9 @@ func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialProm
 	}
 	if strings.TrimSpace(initialPrompt) != "" {
 		args = append(args, "--prompt", initialPrompt)
+	}
+	if welcomeBack {
+		args = append(args, "--welcome-back")
 	}
 	return executable, args, nil
 }
@@ -317,4 +336,42 @@ func mergeWorkspaceDefaults(existing, generated agent.Workspace) agent.Workspace
 		existing.State = generated.State
 	}
 	return existing
+}
+
+func recentAgentPrompts(store sessions.Store) []string {
+	records, err := store.List()
+	if err != nil || len(records) == 0 {
+		return nil
+	}
+	prompts := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for _, record := range records {
+		prompt := strings.TrimSpace(lastPromptLine(record.Prompt))
+		if prompt == "" {
+			continue
+		}
+		if _, ok := seen[prompt]; ok {
+			continue
+		}
+		seen[prompt] = struct{}{}
+		prompts = append(prompts, prompt)
+		if len(prompts) == 4 {
+			break
+		}
+	}
+	return prompts
+}
+
+func lastPromptLine(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	for idx := len(lines) - 1; idx >= 0; idx-- {
+		if trimmed := strings.TrimSpace(lines[idx]); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
