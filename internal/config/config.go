@@ -159,7 +159,7 @@ func DefaultConfig() Config {
 			CompactModeRows: 28,
 		},
 		UI: UIConfig{
-			NarratedProgress: false,
+			NarratedProgress: true,
 		},
 		Context: ContextConfig{
 			AutoCollect:           true,

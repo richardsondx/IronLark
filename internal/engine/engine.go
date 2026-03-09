@@ -76,9 +76,13 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 	if maxTurns <= 0 {
 		maxTurns = 5
 	}
+	skipTurnStartNarration := false
 	for turn := 0; turn < maxTurns; turn++ {
 		narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn), nil)
-		e.narrate(narrator.turnStarted())
+		if !skipTurnStartNarration {
+			e.narrate(narrator.turnStarted())
+		}
+		skipTurnStartNarration = false
 		e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
 		response, err := e.Provider.Generate(ctx, provider.Request{
 			Model:       e.Runtime.Model,
@@ -94,13 +98,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		narrator = newTurnNarrator(time.Now().UnixNano()+int64(turn), response.Narration)
 		e.narrate(narrator.intent(response))
 
-		// Check if the model wants to inspect or if we are doing actions for the first time on minimal context
-		needsFullContext := false
-		if isMinimalContext && len(response.Actions) > 0 {
-			needsFullContext = true
-		}
-
-		if needsFullContext && isMinimalContext {
+		if isMinimalContext && shouldCollectFullContextBeforeActions(response, e.Runtime.Interaction) {
 			if !e.Runtime.JSONOutput {
 				e.Renderer.Message("Inspecting context and reframing plan...")
 			}
@@ -111,6 +109,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			}
 			isMinimalContext = false
 			record.ContextJSON = fullSnapshot.JSON()
+			skipTurnStartNarration = true
 
 			// Replace initial user message with full context and re-run the generation
 			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot, graphDigest)
@@ -366,6 +365,25 @@ func isChatInputClosedError(err error) bool {
 		strings.Contains(message, "use of closed network connection")
 }
 
+func shouldCollectFullContextBeforeActions(response core.LLMResponse, interaction core.InteractionMode) bool {
+	if len(response.Actions) == 0 {
+		return false
+	}
+	if containsInspectAction(response.Actions) {
+		return true
+	}
+	return interaction == core.InteractionPlanFirst
+}
+
+func containsInspectAction(actions []core.Action) bool {
+	for _, action := range actions {
+		if action.Type == core.ActionInspect {
+			return true
+		}
+	}
+	return false
+}
+
 func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte, history *[]core.ConversationMessage, record *sessions.Record, threadState *threads.Thread, threadRef threads.ThreadRef) error {
 	prompt = strings.TrimSpace(prompt)
 	if isSimpleGreetingPrompt(prompt) {
@@ -414,9 +432,13 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 
 	for turn := 0; turn < maxTurns; turn++ {
 		var response core.LLMResponse
+		turnStartNarrated := false
 		for attempts := 0; attempts < 4; attempts++ {
 			narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn*10+attempts), nil)
-			e.narrate(narrator.turnStarted())
+			if !turnStartNarrated {
+				e.narrate(narrator.turnStarted())
+				turnStartNarrated = true
+			}
 			e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
 			var stopped bool
 			response, stopped, err = e.generateResponse(ctx, provider.Request{
@@ -437,7 +459,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 			if shouldReplaceWithGreetingSummary(prompt, response) {
 				response = greetingOnlyResponse(prompt)
 			}
-			if !usingFullContext && len(response.Actions) > 0 {
+			if !usingFullContext && shouldCollectFullContextBeforeActions(response, e.Runtime.Interaction) {
 				fullSnapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
 				if err != nil {
 					return err

@@ -417,6 +417,43 @@ func TestRunChatPromptContinuesUntilClosingAnswer(t *testing.T) {
 	}
 }
 
+func TestRunChatPromptExecuteFirstRunsActionWithoutFullContextRetry(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "Checking Docker.",
+			Actions: []core.Action{{
+				ID:      "check-docker",
+				Type:    core.ActionRunShell,
+				Title:   "Check Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "check whether Docker is installed",
+			}},
+		},
+		{
+			Summary: "Docker is installed.",
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "is docker installed?", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("expected action execution without full-context retry, got %d provider requests", len(provider.requests))
+	}
+}
+
 func TestRunChatPromptSynthesizesClosingAnswerWhenModelStopsAfterResults(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	renderer := &trackingRenderer{}
@@ -478,17 +515,6 @@ func TestRunChatPromptResumesAfterStructuredUserInput(t *testing.T) {
 	}
 	engine.Renderer = renderer
 	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
-		{
-			Summary: "I need the token first.",
-			Actions: []core.Action{{
-				ID:           "ask-token",
-				Type:         core.ActionAskUser,
-				InputKind:    core.InputText,
-				FieldKey:     "token",
-				Prompt:       "Paste the token",
-				Alternatives: []string{"submit", "skip", "follow_up"},
-			}},
-		},
 		{
 			Summary: "I need the token first.",
 			Actions: []core.Action{{
@@ -628,6 +654,56 @@ func TestExecuteTurnNarratesBlockedInput(t *testing.T) {
 	}
 }
 
+func TestRunChatDoesNotRepeatTurnStartedDuringExplicitInspectRetry(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I need a wider view.",
+			Actions: []core.Action{{
+				ID:     "inspect-host",
+				Type:   core.ActionInspect,
+				Title:  "Inspect host",
+				Reason: "collect broader context first",
+			}},
+		},
+		{
+			Summary: "Done.",
+		},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+
+	if err := engine.runChatPrompt(context.Background(), "inspect host", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+
+	turnStarted := 0
+	contextShift := 0
+	for _, event := range renderer.narrativeEvents {
+		if event.Kind == core.NarrativeTurnStarted {
+			turnStarted++
+		}
+		if event.Kind == core.NarrativeContextShift {
+			contextShift++
+		}
+	}
+	if contextShift == 0 {
+		t.Fatalf("expected context shift event, got %#v", renderer.narrativeEvents)
+	}
+	if turnStarted != 1 {
+		t.Fatalf("expected one turn-start event before context retry, got %d (%#v)", turnStarted, renderer.narrativeEvents)
+	}
+}
+
 func TestRunTaskRepromptsWhenModelClaimsNextStepButReturnsNoActions(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	provider := &fakeProvider{responses: []core.LLMResponse{
@@ -668,6 +744,85 @@ func TestRunTaskRepromptsWhenModelClaimsNextStepButReturnsNoActions(t *testing.T
 	last := lastMessages[len(lastMessages)-1].Content
 	if !strings.Contains(last, "returned no executable actions") {
 		t.Fatalf("expected second request to ask for a concrete next action, got %q", last)
+	}
+}
+
+func TestRunTaskExecuteFirstRunsActionWithoutFullContextRetry(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "Checking Docker.",
+			Actions: []core.Action{{
+				ID:      "check-docker",
+				Type:    core.ActionRunShell,
+				Title:   "Check Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "check whether Docker is installed",
+			}},
+		},
+		{
+			Summary: "Docker is installed.",
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "is docker installed?", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	if len(provider.requests) > 2 {
+		t.Fatalf("expected execute-first to avoid a pre-action full-context retry, got %d provider requests", len(provider.requests))
+	}
+}
+
+func TestRunChatPromptCollectsFullContextForExplicitInspectAction(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I need a wider view.",
+			Actions: []core.Action{{
+				ID:     "inspect-1",
+				Type:   core.ActionInspect,
+				Title:  "Inspect workspace",
+				Reason: "collect broader context first",
+			}},
+		},
+		{
+			Summary: "Done.",
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "inspect workspace", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("expected explicit inspect action to trigger full-context retry, got %d provider requests", len(provider.requests))
+	}
+	foundContextShift := false
+	for _, event := range renderer.narrativeEvents {
+		if event.Kind == core.NarrativeContextShift {
+			foundContextShift = true
+			break
+		}
+	}
+	if !foundContextShift {
+		t.Fatalf("expected context shift event for explicit inspect action, got %#v", renderer.narrativeEvents)
 	}
 }
 
@@ -850,18 +1005,6 @@ func TestRunTaskResumesAfterStructuredUserInput(t *testing.T) {
 				DestinationHint: "IronLark will export it for the next command",
 			}},
 		},
-		{
-			Summary: "Need a token.",
-			Actions: []core.Action{{
-				ID:              "ask-1",
-				Type:            core.ActionAskUser,
-				InputKind:       core.InputText,
-				FieldKey:        "bot_token",
-				Prompt:          "Paste the bot token",
-				Alternatives:    []string{"submit", "skip", "follow_up"},
-				DestinationHint: "IronLark will export it for the next command",
-			}},
-		},
 		{Summary: "Configured."},
 	}}
 	engine.Runtime.NoContext = true
@@ -948,19 +1091,6 @@ func TestRunTaskUsesStructuredInputForConcreteTextValue(t *testing.T) {
 				Alternatives:    []string{"submit", "skip", "follow_up"},
 			}},
 		},
-		{
-			Summary: "I need the service name.",
-			Actions: []core.Action{{
-				ID:              "ask-structured",
-				Type:            core.ActionAskUser,
-				InputKind:       core.InputText,
-				FieldKey:        "service_name",
-				Prompt:          "Which service should I inspect?",
-				DestinationHint: "IronLark will use it in the next command.",
-				ExpectsValue:    true,
-				Alternatives:    []string{"submit", "skip", "follow_up"},
-			}},
-		},
 		{Summary: "Checked the service."},
 	}}
 	engine.Runtime.NoContext = true
@@ -991,17 +1121,6 @@ func TestRunTaskRedactsSecretUserInputInSessionStorage(t *testing.T) {
 	}
 	engine.Renderer = renderer
 	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
-		{
-			Summary: "Need an API key.",
-			Actions: []core.Action{{
-				ID:           "ask-secret",
-				Type:         core.ActionAskUser,
-				InputKind:    core.InputSecret,
-				FieldKey:     "api_key",
-				Prompt:       "Paste the API key",
-				Alternatives: []string{"submit", "skip", "follow_up"},
-			}},
-		},
 		{
 			Summary: "Need an API key.",
 			Actions: []core.Action{{

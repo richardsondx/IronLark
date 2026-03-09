@@ -23,3 +23,10 @@ func TestResolveRejectsUnsupportedOpenAIModel(t *testing.T) {
 		t.Fatalf("expected guidance toward gpt-5-mini, got %v", err)
 	}
 }
+
+func TestDefaultConfigEnablesNarratedProgress(t *testing.T) {
+	cfg := config.DefaultConfig()
+	if !cfg.UI.NarratedProgress {
+		t.Fatal("expected narrated progress to be enabled by default")
+	}
+}

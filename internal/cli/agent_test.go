@@ -4,8 +4,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/richardsondx/IronLark/internal/agent"
 )
 
 func TestRootCommandSilencesUsageAndErrors(t *testing.T) {
@@ -33,5 +36,26 @@ func TestRecoverableAgentAttachError(t *testing.T) {
 	}
 	if isRecoverableAgentAttachError(errors.New("permission denied")) {
 		t.Fatalf("expected unrelated error to remain fatal")
+	}
+}
+
+func TestAgentRunnerCommandKeepsInitialPromptOutOfRunnerArgs(t *testing.T) {
+	flags := &rootFlags{
+		provider: "openai",
+		model:    "gpt-5",
+		color:    "always",
+	}
+	workspace := agent.Workspace{
+		Key:      "abc123",
+		ThreadID: "thread-1",
+	}
+
+	_, args, err := agentRunnerCommand(flags, workspace, true)
+	if err != nil {
+		t.Fatalf("agentRunnerCommand() error = %v", err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "--prompt") || strings.Contains(joined, "check docker") {
+		t.Fatalf("expected initial prompt to be injected after attach, got args %#v", args)
 	}
 }

@@ -153,6 +153,10 @@ func (m SessionManager) EnsureWorkspace(ctx context.Context, workspace Workspace
 }
 
 func (m SessionManager) Attach(ctx context.Context, workspace Workspace) error {
+	return m.AttachWithPrompt(ctx, workspace, "")
+}
+
+func (m SessionManager) AttachWithPrompt(ctx context.Context, workspace Workspace, initialPrompt string) error {
 	workspace, err := m.Inspect(ctx, workspace)
 	if err != nil {
 		return err
@@ -182,6 +186,12 @@ func (m SessionManager) Attach(ctx context.Context, workspace Workspace) error {
 		return err
 	}
 	defer term.Restore(fd, oldState)
+
+	if strings.TrimSpace(initialPrompt) != "" {
+		if _, err := io.WriteString(conn, initialPrompt+"\r"); err != nil && !isIgnorableAttachIOError(err) {
+			return err
+		}
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)

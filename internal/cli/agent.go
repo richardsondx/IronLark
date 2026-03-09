@@ -218,9 +218,6 @@ func newAgentRunnerCommand(flags *rootFlags) *cobra.Command {
 			if strings.TrimSpace(flags.color) != "" {
 				uiArgs = append(uiArgs, "--color", flags.color)
 			}
-			if strings.TrimSpace(initialPrompt) != "" {
-				uiArgs = append(uiArgs, "--prompt", initialPrompt)
-			}
 			if welcomeBack {
 				uiArgs = append(uiArgs, "--welcome-back")
 			}
@@ -260,7 +257,7 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 		workspace.ThreadID = ref.ThreadID
 	}
 
-	executable, runnerArgs, err := agentRunnerCommand(flags, workspace, initialPrompt, hadExistingWorkspace)
+	executable, runnerArgs, err := agentRunnerCommand(flags, workspace, hadExistingWorkspace)
 	if err != nil {
 		return err
 	}
@@ -269,7 +266,7 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 	if err != nil {
 		return err
 	}
-	if err := manager.Attach(ctx, workspace); err != nil {
+	if err := manager.AttachWithPrompt(ctx, workspace, initialPrompt); err != nil {
 		if !isRecoverableAgentAttachError(err) {
 			return err
 		}
@@ -280,12 +277,12 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 		if err != nil {
 			return err
 		}
-		return manager.Attach(ctx, workspace)
+		return manager.AttachWithPrompt(ctx, workspace, initialPrompt)
 	}
 	return nil
 }
 
-func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialPrompt string, welcomeBack bool) (string, []string, error) {
+func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, welcomeBack bool) (string, []string, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return "", nil, err
@@ -305,9 +302,6 @@ func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialProm
 	}
 	if strings.TrimSpace(flags.color) != "" {
 		args = append(args, "--color", flags.color)
-	}
-	if strings.TrimSpace(initialPrompt) != "" {
-		args = append(args, "--prompt", initialPrompt)
 	}
 	if welcomeBack {
 		args = append(args, "--welcome-back")

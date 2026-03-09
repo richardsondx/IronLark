@@ -61,14 +61,18 @@ func (n *turnNarrator) event(kind core.NarrativeKind, phase, text, actionID, tar
 }
 
 func (n *turnNarrator) turnStarted() core.NarrativeEvent {
-	return n.event(core.NarrativeTurnStarted, "Understanding the task", "Let me inspect the current context before I commit to a next step.", "", "", core.NarrativeRunning)
+	return n.event(core.NarrativeTurnStarted, "Understanding the task", n.pick([]string{
+		"Let me inspect the current context before I commit to a next step.",
+		"I’m taking a quick look at the current context before I move.",
+		"I want one fast pass over the context before I take the next step.",
+	}), "", "", core.NarrativeRunning)
 }
 
 func (n *turnNarrator) contextShift() core.NarrativeEvent {
 	templates := []string{
 		"I need the fuller repo and machine context before I take the next step.",
-		"The first pass was too thin, so I’m pulling in the broader context now.",
-		"I need a wider view of the workspace before I continue.",
+		"The first pass was too thin, so I’m collecting the broader context now.",
+		"I need a wider workspace and system view before I continue.",
 	}
 	return n.event(core.NarrativeContextShift, "Inspecting more context", n.pick(templates), "", "", core.NarrativeRunning)
 }
