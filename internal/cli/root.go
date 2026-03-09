@@ -44,10 +44,12 @@ type rootFlags struct {
 func NewRootCommand() *cobra.Command {
 	flags := &rootFlags{}
 	cmd := &cobra.Command{
-		Use:     "lark [task]",
-		Short:   "Lark is an SSH-first AI CLI for server and repo operations",
-		Args:    cobra.ArbitraryArgs,
-		Version: buildinfo.Version,
+		Use:           "lark [task]",
+		Short:         "Lark is an SSH-first AI CLI for server and repo operations",
+		Args:          cobra.ArbitraryArgs,
+		Version:       buildinfo.Version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			application, err := buildApp(flags)
 			if err != nil {

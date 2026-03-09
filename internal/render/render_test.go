@@ -119,6 +119,37 @@ func TestResultSeparatesSummaryFromCapturedOutput(t *testing.T) {
 	}
 }
 
+func TestStreamActionOutputPrintsIncrementalLinesAndSuppressesDuplicateResultOutput(t *testing.T) {
+	var out bytes.Buffer
+	r := &Renderer{
+		In:    bufio.NewReader(strings.NewReader("")),
+		Out:   &out,
+		Color: true,
+	}
+
+	action := core.Action{ID: "stream", Type: core.ActionRunShell, Title: "Tail logs"}
+	r.ActionProgress(action)
+	r.StreamActionOutput(action, core.ActionOutputChunk{ActionID: "stream", Stream: core.ActionOutputStdout, Text: "line one"})
+	r.StreamActionOutput(action, core.ActionOutputChunk{ActionID: "stream", Stream: core.ActionOutputStderr, Text: "warning line"})
+	r.Result(core.ActionResult{
+		Action:  action,
+		Summary: "Collected logs",
+		Stdout:  "line one",
+		Stderr:  "warning line",
+	})
+
+	got := out.String()
+	if strings.Count(got, ansiBold+"Output"+ansiReset+":") != 1 {
+		t.Fatalf("expected streamed output header once, got %q", got)
+	}
+	if strings.Count(got, ansiBold+"Stderr"+ansiReset+":") != 1 {
+		t.Fatalf("expected streamed stderr header once, got %q", got)
+	}
+	if !strings.Contains(got, ansiBold+"Summary"+ansiReset+": Collected logs") {
+		t.Fatalf("expected result summary after streamed output, got %q", got)
+	}
+}
+
 func TestForceColorEnabled(t *testing.T) {
 	t.Setenv("FORCE_COLOR", "1")
 	t.Setenv("NO_COLOR", "")

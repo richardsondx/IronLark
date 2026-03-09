@@ -149,7 +149,7 @@ func DefaultConfig() Config {
 	return Config{
 		Version:         1,
 		DefaultProvider: "openai",
-		DefaultModel:    "gpt-5-mini",
+		DefaultModel:    "gpt-4.1-mini",
 		DefaultProfile:  "strong",
 		ApprovalMode:    "confirm",
 		InteractionMode: "execute-first",
@@ -223,7 +223,7 @@ func DefaultConfig() Config {
 				Type:         "openai-compatible",
 				BaseURL:      "https://api.openai.com/v1",
 				APIKeyEnv:    "OPENAI_API_KEY",
-				DefaultModel: "gpt-5-mini",
+				DefaultModel: "gpt-4.1-mini",
 			},
 			"openrouter": {
 				Type:         "openai-compatible",
@@ -243,7 +243,7 @@ func DefaultConfig() Config {
 			},
 			"strong": {
 				Provider: "openai",
-				Model:    "gpt-5-mini",
+				Model:    "gpt-4.1-mini",
 			},
 			"local": {
 				Provider: "openai",

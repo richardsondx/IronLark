@@ -172,7 +172,7 @@ func TestDrawLockedReturningSessionShowsWelcomeBackTitle(t *testing.T) {
 	if !strings.Contains(output, "IronLark v") {
 		t.Fatalf("expected titled frame, got %q", output)
 	}
-	if !strings.Contains(output, "gpt-5-mini") {
+	if !strings.Contains(output, "gpt-4.1-mini") {
 		t.Fatalf("expected model line, got %q", output)
 	}
 	if !strings.Contains(output, "/opt/app") {
@@ -469,7 +469,7 @@ func TestSlashMenuModelOpensModelOverlay(t *testing.T) {
 	if submitted, done := renderer.handleKey(keyPress{Kind: keyUp}); submitted != "" || done {
 		t.Fatalf("expected selection move, got %q %t", submitted, done)
 	}
-	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); !done || submitted != "/model gpt-5" {
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); !done || submitted != "/model gpt-5-mini" {
 		t.Fatalf("expected model command, got %q %t", submitted, done)
 	}
 }
@@ -703,6 +703,36 @@ func TestNarratedProgressShiftTabTogglesLatestDetails(t *testing.T) {
 	renderer.mu.Unlock()
 	if containsString(after, "detail line(s) hidden") {
 		t.Fatalf("expected details to expand after tab, got %q", after)
+	}
+}
+
+func TestStreamActionOutputMergesIntoActiveActionEntry(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	action := core.Action{ID: "inspect-openclaw", Type: core.ActionRunShell, Title: "Inspect OpenClaw", Command: "printf ok"}
+
+	renderer.ActionProgress(action)
+	renderer.StreamActionOutput(action, core.ActionOutputChunk{
+		ActionID: action.ID,
+		Stream:   core.ActionOutputStdout,
+		Text:     "openclaw found",
+	})
+	renderer.Result(core.ActionResult{
+		Action:  action,
+		Summary: "OpenClaw appears to be installed",
+		Stdout:  "openclaw found",
+	})
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	joined := strings.Join(renderer.transcript, "\n")
+	if !containsString(joined, "Run(printf ok)") {
+		t.Fatalf("expected action entry in transcript, got %q", joined)
+	}
+	if !containsString(joined, "openclaw found") {
+		t.Fatalf("expected streamed output in transcript, got %q", joined)
+	}
+	if !containsString(joined, "OpenClaw appears to be installed") {
+		t.Fatalf("expected merged result summary, got %q", joined)
 	}
 }
 
@@ -948,7 +978,7 @@ func newTestAgentRenderer() *AgentRenderer {
 		Host:          "srv-1",
 		CWD:           "/opt/app",
 		Provider:      "openai",
-		Model:         "gpt-5-mini",
+		Model:         "gpt-4.1-mini",
 		ModelOptions:  []string{"gpt-4.1-mini", "gpt-5", "gpt-5-mini"},
 		ApprovalMode:  "confirm",
 		ThreadID:      "thread-1",
@@ -964,7 +994,7 @@ func newNarratedTestAgentRenderer() *AgentRenderer {
 		Host:             "srv-1",
 		CWD:              "/opt/app",
 		Provider:         "openai",
-		Model:            "gpt-5-mini",
+		Model:            "gpt-4.1-mini",
 		ModelOptions:     []string{"gpt-4.1-mini", "gpt-5", "gpt-5-mini"},
 		ApprovalMode:     "confirm",
 		ThreadID:         "thread-1",

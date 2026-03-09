@@ -136,7 +136,7 @@ lk history
 lk version
 lk update
 lk model
-lk model gpt-5-mini
+lk model gpt-4.1-mini
 lk edit ./README.md "rewrite the first sentence to be clearer"
 ```
 
@@ -211,6 +211,7 @@ lk context drop
 lk --no-context "run this statelessly"
 lk --new-thread "start a fresh thread for this run"
 lk --thread incident-123 "continue a specific thread"
+lk --narrated-progress on   # show status/timeline updates in `lk agent`
 ```
 
 Relevant config keys in `~/.config/lark/config.yaml`:

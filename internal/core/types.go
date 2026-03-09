@@ -154,6 +154,19 @@ type NarrativeEvent struct {
 	Timestamp time.Time       `json:"timestamp,omitempty"`
 }
 
+type ActionOutputStream string
+
+const (
+	ActionOutputStdout ActionOutputStream = "stdout"
+	ActionOutputStderr ActionOutputStream = "stderr"
+)
+
+type ActionOutputChunk struct {
+	ActionID string             `json:"action_id,omitempty"`
+	Stream   ActionOutputStream `json:"stream"`
+	Text     string             `json:"text"`
+}
+
 type Verification struct {
 	Type        ActionType `json:"type"`
 	Command     string     `json:"command,omitempty"`

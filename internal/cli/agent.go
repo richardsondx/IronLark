@@ -2,10 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -18,9 +22,10 @@ import (
 
 func newAgentCommand(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "agent [initial prompt]",
-		Short: "Start or resume the SSH-first agent workspace",
-		Args:  cobra.ArbitraryArgs,
+		Use:          "agent [initial prompt]",
+		Short:        "Start or resume the SSH-first agent workspace",
+		Args:         cobra.ArbitraryArgs,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAgentWorkspace(cmd.Context(), flags, strings.Join(args, " "))
 		},
@@ -123,9 +128,10 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 	var initialPrompt string
 	var welcomeBack bool
 	cmd := &cobra.Command{
-		Use:    "__agent-ui",
-		Short:  "Internal agent UI runner",
-		Hidden: true,
+		Use:          "__agent-ui",
+		Short:        "Internal agent UI runner",
+		Hidden:       true,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			application, err := buildApp(flags)
 			if err != nil {
@@ -176,9 +182,10 @@ func newAgentRunnerCommand(flags *rootFlags) *cobra.Command {
 	var initialPrompt string
 	var welcomeBack bool
 	cmd := &cobra.Command{
-		Use:    "__agent-runner",
-		Short:  "Internal detached agent session runner",
-		Hidden: true,
+		Use:          "__agent-runner",
+		Short:        "Internal detached agent session runner",
+		Hidden:       true,
+		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			application, err := buildApp(flags)
 			if err != nil {
@@ -262,7 +269,20 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 	if err != nil {
 		return err
 	}
-	return manager.Attach(ctx, workspace)
+	if err := manager.Attach(ctx, workspace); err != nil {
+		if !isRecoverableAgentAttachError(err) {
+			return err
+		}
+		_ = manager.Stop(ctx, workspace)
+		_ = application.Agents.Delete(workspace.Key)
+		workspace = agent.BuildWorkspace(application.Runtime.Config.Agent.SessionPrefix, application.Loaded.Paths.AgentDir, userName, host, application.Runtime.WorkingDir, workspace.ThreadID)
+		workspace, err = manager.EnsureWorkspace(ctx, workspace, executable, runnerArgs)
+		if err != nil {
+			return err
+		}
+		return manager.Attach(ctx, workspace)
+	}
+	return nil
 }
 
 func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, initialPrompt string, welcomeBack bool) (string, []string, error) {
@@ -374,4 +394,17 @@ func lastPromptLine(value string) string {
 		}
 	}
 	return ""
+}
+
+func isRecoverableAgentAttachError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "use of closed network connection")
 }

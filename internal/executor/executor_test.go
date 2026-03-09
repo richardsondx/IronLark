@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +78,51 @@ func TestExecuteEditFileReportsHelpfulUnifiedDiffError(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamEmitsShellOutputChunks(t *testing.T) {
+	exec := testExecutor(t)
+	var chunks []core.ActionOutputChunk
+
+	result, err := exec.ExecuteStream(context.Background(), core.Action{
+		ID:      "stream-shell",
+		Type:    core.ActionRunShell,
+		Command: "printf 'out-line\\n'; printf 'err-line\\n' 1>&2",
+	}, false, func(chunk core.ActionOutputChunk) {
+		chunks = append(chunks, chunk)
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("expected zero exit code, got %d", result.ExitCode)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("expected stdout and stderr chunks, got %#v", chunks)
+	}
+	if chunks[0].ActionID != "stream-shell" || chunks[1].ActionID != "stream-shell" {
+		t.Fatalf("expected action id on chunks, got %#v", chunks)
+	}
+	streams := []core.ActionOutputStream{chunks[0].Stream, chunks[1].Stream}
+	if !(containsStream(streams, core.ActionOutputStdout) && containsStream(streams, core.ActionOutputStderr)) {
+		t.Fatalf("expected both stdout and stderr streams, got %#v", chunks)
+	}
+}
+
+func TestIgnorableStreamReadError(t *testing.T) {
+	cases := []error{
+		io.EOF,
+		os.ErrClosed,
+		fmt.Errorf("read |0: file already closed"),
+	}
+	for _, err := range cases {
+		if !isIgnorableStreamReadError(err) {
+			t.Fatalf("expected %v to be ignored", err)
+		}
+	}
+	if isIgnorableStreamReadError(fmt.Errorf("permission denied")) {
+		t.Fatalf("expected unrelated error to remain visible")
+	}
+}
+
 func testExecutor(t *testing.T) *Executor {
 	t.Helper()
 	root := t.TempDir()
@@ -89,4 +136,13 @@ func testExecutor(t *testing.T) *Executor {
 		Classifier:     classifier,
 		Searcher:       search.Searcher{UserAgent: "lark-term/test"},
 	}
+}
+
+func containsStream(streams []core.ActionOutputStream, target core.ActionOutputStream) bool {
+	for _, stream := range streams {
+		if stream == target {
+			return true
+		}
+	}
+	return false
 }

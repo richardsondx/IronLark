@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -361,6 +362,168 @@ func TestRunChatPromptEmitsNarrativeEventsWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestRunChatPromptContinuesUntilClosingAnswer(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I'll inspect the host for an OpenClaw install.",
+			Actions: []core.Action{{
+				ID:      "inspect-openclaw",
+				Type:    core.ActionRunShell,
+				Title:   "Detect OpenClaw",
+				Command: "printf 'openclaw found\\n'",
+				Reason:  "check the host",
+			}},
+		},
+		{
+			Summary: "I'll inspect the host for an OpenClaw install.",
+			Actions: []core.Action{{
+				ID:      "inspect-openclaw",
+				Type:    core.ActionRunShell,
+				Title:   "Detect OpenClaw",
+				Command: "printf 'openclaw found\\n'",
+				Reason:  "check the host",
+			}},
+		},
+		{
+			Summary: "OpenClaw appears to be installed on this host.",
+			Findings: []string{
+				"The shell check reported an OpenClaw installation marker.",
+			},
+		},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "is openclaw installed?", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if len(engine.Provider.(*fakeProvider).requests) < 2 {
+		t.Fatalf("expected follow-up provider call after action results")
+	}
+	if record.Summary != "OpenClaw appears to be installed on this host." {
+		t.Fatalf("expected final closing summary, got %q", record.Summary)
+	}
+	if len(renderer.responses) == 0 || renderer.responses[len(renderer.responses)-1].Summary != record.Summary {
+		t.Fatalf("expected closing response to be rendered, got %#v", renderer.responses)
+	}
+}
+
+func TestRunChatPromptSynthesizesClosingAnswerWhenModelStopsAfterResults(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I'll inspect the host.",
+			Actions: []core.Action{{
+				ID:      "inspect-root",
+				Type:    core.ActionRunShell,
+				Title:   "List root",
+				Command: "printf '/root/.openclaw\\n'",
+				Reason:  "look for an installation directory",
+			}},
+		},
+		{
+			Summary: "I'll inspect the host.",
+			Actions: []core.Action{{
+				ID:      "inspect-root",
+				Type:    core.ActionRunShell,
+				Title:   "List root",
+				Command: "printf '/root/.openclaw\\n'",
+				Reason:  "look for an installation directory",
+			}},
+		},
+		{},
+		{},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Runtime.Config.Tools.MaxTurns = 2
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "inspect root", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if !strings.Contains(record.Summary, "I completed the latest step:") {
+		t.Fatalf("expected synthesized closing summary, got %q", record.Summary)
+	}
+	if len(renderer.responses) == 0 || renderer.responses[len(renderer.responses)-1].Summary != record.Summary {
+		t.Fatalf("expected synthesized response to render, got %#v", renderer.responses)
+	}
+}
+
+func TestRunChatPromptResumesAfterStructuredUserInput(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{
+		inputResults: []core.ActionResult{{
+			InputKind:    core.InputText,
+			FieldKey:     "token",
+			ResponseMode: core.InputResponseSubmitted,
+			InputValue:   "123:abc",
+		}},
+	}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I need the token first.",
+			Actions: []core.Action{{
+				ID:           "ask-token",
+				Type:         core.ActionAskUser,
+				InputKind:    core.InputText,
+				FieldKey:     "token",
+				Prompt:       "Paste the token",
+				Alternatives: []string{"submit", "skip", "follow_up"},
+			}},
+		},
+		{
+			Summary: "I need the token first.",
+			Actions: []core.Action{{
+				ID:           "ask-token",
+				Type:         core.ActionAskUser,
+				InputKind:    core.InputText,
+				FieldKey:     "token",
+				Prompt:       "Paste the token",
+				Alternatives: []string{"submit", "skip", "follow_up"},
+			}},
+		},
+		{
+			Summary: "The token is in place and the task can continue.",
+		},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	record := &sessions.Record{}
+	var history []core.ConversationMessage
+	if err := engine.runChatPrompt(context.Background(), "configure openclaw", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
+		t.Fatalf("runChatPrompt() error = %v", err)
+	}
+	if len(renderer.blockerActions) != 1 {
+		t.Fatalf("expected one blocker action, got %d", len(renderer.blockerActions))
+	}
+	if record.Summary != "The token is in place and the task can continue." {
+		t.Fatalf("expected final summary after input, got %q", record.Summary)
+	}
+}
+
 func TestExecuteTurnUsesModelAuthoredActionHint(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	renderer := &trackingRenderer{}
@@ -620,6 +783,49 @@ func TestRunChatClearCommandClearsRendererScreen(t *testing.T) {
 	}
 }
 
+func TestRunChatContinuesAfterProviderError(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{prompts: []string{"check docker", "quit"}}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{
+		errs: []error{errors.New("provider request failed: context deadline exceeded")},
+	}
+	engine.Runtime.NoContext = true
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunChat(context.Background(), "", nil); err != nil {
+		t.Fatalf("RunChat() error = %v", err)
+	}
+	if len(renderer.messages) == 0 {
+		t.Fatalf("expected provider error message to be rendered")
+	}
+	if !strings.Contains(renderer.messages[0], "provider request failed") {
+		t.Fatalf("expected provider error message, got %#v", renderer.messages)
+	}
+}
+
+func TestRunChatExitsCleanlyWhenPromptInputCloses(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{
+		prompts:   []string{"check docker"},
+		promptErr: os.ErrClosed,
+	}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{Summary: "Done"}}}
+	engine.Runtime.NoContext = true
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunChat(context.Background(), "", nil); err != nil {
+		t.Fatalf("RunChat() error = %v", err)
+	}
+}
+
 func TestRunTaskResumesAfterStructuredUserInput(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	renderer := &trackingRenderer{
@@ -680,6 +886,95 @@ func TestRunTaskResumesAfterStructuredUserInput(t *testing.T) {
 	}
 	if len(records[0].Results) == 0 || records[0].Results[0].InputValue != "123:abc" {
 		t.Fatalf("expected non-secret input to persist in record results, got %#v", records[0].Results)
+	}
+}
+
+func TestRunChatDoesNotOpenStructuredInputForPlainClarification(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{prompts: []string{"quit"}}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{
+		Summary: "You sent \"1\"; what command should I run next?",
+		Actions: []core.Action{{
+			ID:           "clarify-1",
+			Type:         core.ActionAskUser,
+			InputKind:    core.InputText,
+			FieldKey:     "next_task",
+			Prompt:       "What should I do next?",
+			Alternatives: []string{"submit", "skip", "follow_up"},
+			ExpectsValue: false,
+		}},
+	}}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunChat(context.Background(), "1", nil); err != nil {
+		t.Fatalf("RunChat() error = %v", err)
+	}
+	if len(renderer.blockerActions) != 0 {
+		t.Fatalf("expected plain clarification to stay in chat, got blocker actions %#v", renderer.blockerActions)
+	}
+	if len(renderer.responses) == 0 || !strings.Contains(renderer.responses[0].Summary, "what command should I run next") {
+		t.Fatalf("expected conversational clarification response, got %#v", renderer.responses)
+	}
+}
+
+func TestRunTaskUsesStructuredInputForConcreteTextValue(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{
+		inputResults: []core.ActionResult{{
+			InputKind:    core.InputText,
+			FieldKey:     "service_name",
+			ResponseMode: core.InputResponseSubmitted,
+			InputValue:   "nginx",
+		}},
+	}
+	engine.Renderer = renderer
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "I need the service name.",
+			Actions: []core.Action{{
+				ID:              "ask-structured",
+				Type:            core.ActionAskUser,
+				InputKind:       core.InputText,
+				FieldKey:        "service_name",
+				Prompt:          "Which service should I inspect?",
+				DestinationHint: "IronLark will use it in the next command.",
+				ExpectsValue:    true,
+				Alternatives:    []string{"submit", "skip", "follow_up"},
+			}},
+		},
+		{
+			Summary: "I need the service name.",
+			Actions: []core.Action{{
+				ID:              "ask-structured",
+				Type:            core.ActionAskUser,
+				InputKind:       core.InputText,
+				FieldKey:        "service_name",
+				Prompt:          "Which service should I inspect?",
+				DestinationHint: "IronLark will use it in the next command.",
+				ExpectsValue:    true,
+				Alternatives:    []string{"submit", "skip", "follow_up"},
+			}},
+		},
+		{Summary: "Checked the service."},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "inspect a service", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	if len(renderer.blockerActions) != 1 {
+		t.Fatalf("expected structured text input to open blocker UI, got %d", len(renderer.blockerActions))
 	}
 }
 
@@ -886,6 +1181,7 @@ func testEngine(t *testing.T, interaction core.InteractionMode) (*Engine, *bytes
 
 type fakeProvider struct {
 	responses []core.LLMResponse
+	errs      []error
 	index     int
 	requests  []provider.Request
 }
@@ -894,6 +1190,15 @@ func (f *fakeProvider) Generate(ctx context.Context, req provider.Request) (core
 	reqCopy := req
 	reqCopy.Messages = append([]core.ConversationMessage(nil), req.Messages...)
 	f.requests = append(f.requests, reqCopy)
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		if len(f.errs) > 1 {
+			f.errs = f.errs[1:]
+		}
+		if err != nil {
+			return core.LLMResponse{}, err
+		}
+	}
 	if len(f.responses) == 0 {
 		return core.LLMResponse{}, nil
 	}
@@ -911,19 +1216,29 @@ type trackingRenderer struct {
 	clearCalls          int
 	approvalPromptCalls int
 	narrativeEvents     []core.NarrativeEvent
+	responses           []core.LLMResponse
+	streamChunks        []core.ActionOutputChunk
 	lastApproval        core.ApprovalMode
 	lastInteraction     core.InteractionMode
 	prompts             []string
 	approvalChoices     []string
 	inputResults        []core.ActionResult
 	blockerActions      []core.Action
+	messages            []string
+	promptErr           error
 	index               int
 }
 
-func (r *trackingRenderer) Snapshot(snapshot ctxpkg.Snapshot) error                          { return nil }
-func (r *trackingRenderer) Response(response core.LLMResponse) error                         { return nil }
+func (r *trackingRenderer) Snapshot(snapshot ctxpkg.Snapshot) error { return nil }
+func (r *trackingRenderer) Response(response core.LLMResponse) error {
+	r.responses = append(r.responses, response)
+	return nil
+}
 func (r *trackingRenderer) PlannedActions(actions []core.Action, previews []core.RiskReport) {}
 func (r *trackingRenderer) ActionProgress(action core.Action)                                {}
+func (r *trackingRenderer) StreamActionOutput(action core.Action, chunk core.ActionOutputChunk) {
+	r.streamChunks = append(r.streamChunks, chunk)
+}
 func (r *trackingRenderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
 	r.approvalPromptCalls++
 }
@@ -961,9 +1276,15 @@ func (r *trackingRenderer) CollectUserInput(action core.Action) (core.ActionResu
 }
 func (r *trackingRenderer) Confirm(label string, double bool) (bool, error) { return true, nil }
 func (r *trackingRenderer) ReadPrompt(prefix string) (string, error) {
+	if r.index >= len(r.prompts) {
+		if r.promptErr != nil {
+			return "", r.promptErr
+		}
+		return "quit", nil
+	}
 	p := r.prompts[r.index]
 	r.index++
 	return p, nil
 }
-func (r *trackingRenderer) Message(text string)     {}
+func (r *trackingRenderer) Message(text string)     { r.messages = append(r.messages, text) }
 func (r *trackingRenderer) MessageJSON(v any) error { return nil }

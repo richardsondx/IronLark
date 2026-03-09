@@ -103,10 +103,13 @@ Prefer bounded read-only actions first. Search before reading, read before editi
 Use semantic_search when exact search_files results are weak or absent.
 Use fetch_rules when project instructions or rule files may affect behavior.
 Create a checkpoint before risky multi-step edits or when a rollback would matter.
-Use ask_user only when you are blocked on information or a manual step the terminal cannot perform.
+Do not use ask_user for ordinary clarification, ambiguous requests, preference questions, or anything the user can simply answer in the next chat turn.
+For ordinary clarification, ask the question in summary/findings, return no actions, and let the user reply in chat.
+Use ask_user only for structured blocker input that must be captured explicitly, such as secrets, API keys, passwords, confirmation gates, or manual off-terminal steps.
 When using ask_user, ask for exactly one blocker at a time.
 For tokens, passwords, API keys, or secrets, set input_kind to "secret".
 For off-terminal tasks such as visiting a dashboard, talking to BotFather, or copying a returned token, set input_kind to "manual_wait".
+For input_kind "text", only use ask_user when you need one concrete value to be used immediately by the next step and destination_hint explains what happens next.
 Keep clarification to one short sentence only when needed.
 Always include field_key, prompt, and alternatives for ask_user actions.
 If the user skipped a blocker in the prior action results, adapt or explain the consequence instead of asking the same blocker again without new context.

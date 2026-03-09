@@ -232,22 +232,21 @@ func (r *AgentRenderer) PlannedActions(actions []core.Action, previews []core.Ri
 }
 
 func (r *AgentRenderer) ActionProgress(action core.Action) {
+	label := firstNonEmpty(action.Title, action.Command, action.Path, action.Query, string(action.Type))
 	if !r.meta.NarratedProgress {
-		target := action.Title
-		if target == "" {
-			target = action.Command
-		}
-		if target == "" {
-			target = action.Path
-		}
-		if target == "" {
-			target = string(action.Type)
-		}
-		r.setActionStatus("Running action...")
-		r.writeBlock("Run", []string{fmt.Sprintf("%s %s", r.agentActionTag(string(action.Type)), target)})
+		r.setActionStatus("Running " + label + "...")
+		r.mu.Lock()
+		r.appendEntryLocked(TranscriptEntry{
+			Kind:     transcriptEntryBlock,
+			Title:    "Run",
+			Details:  []string{fmt.Sprintf("%s %s", r.agentActionTag(string(action.Type)), label)},
+			ActionID: action.ID,
+		})
+		_ = r.drawLocked()
+		r.mu.Unlock()
 		return
 	}
-	r.setActionStatus(firstNonEmpty(r.activePhase, "Running action..."))
+	r.setActionStatus(firstNonEmpty(r.activePhase, "Running "+label+"..."))
 	r.mu.Lock()
 	r.appendEntryLocked(TranscriptEntry{
 		Kind:     transcriptEntryAction,
@@ -258,6 +257,15 @@ func (r *AgentRenderer) ActionProgress(action core.Action) {
 	})
 	_ = r.drawLocked()
 	r.mu.Unlock()
+}
+
+func (r *AgentRenderer) StreamActionOutput(action core.Action, chunk core.ActionOutputChunk) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.appendActionStreamLocked(action, chunk) {
+		return
+	}
+	_ = r.drawLocked()
 }
 
 func (r *AgentRenderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
@@ -285,6 +293,14 @@ func (r *AgentRenderer) Result(result core.ActionResult) {
 	if result.Skipped {
 		status = "skipped"
 	}
+	r.setActionStatus("")
+	r.mu.Lock()
+	if r.mergeResultIntoEntryLocked(result) {
+		_ = r.drawLocked()
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
 	if !r.meta.NarratedProgress {
 		lines := []string{fmt.Sprintf("%s %s", r.agentResultTag(status), result.Action.Title)}
 		if result.Summary != "" {
@@ -311,11 +327,9 @@ func (r *AgentRenderer) Result(result core.ActionResult) {
 		if result.CheckpointID != "" {
 			lines = append(lines, r.agentLabel("Checkpoint ID")+": "+result.CheckpointID)
 		}
-		r.setActionStatus("")
 		r.writeBlock("Result", lines)
 		return
 	}
-	r.setActionStatus("")
 	details, expanded := resultDetailLines(r, result)
 	summary := firstNonEmpty(result.Summary, result.Action.Title)
 	r.mu.Lock()
@@ -2431,6 +2445,14 @@ func (r *AgentRenderer) agentOutputPrefix(lineColor string) string {
 
 func (r *AgentRenderer) agentOutputLine(text, lineColor string) string {
 	return r.agentStyle(text, lineColor)
+}
+
+func (r *AgentRenderer) streamLine(chunk core.ActionOutputChunk) string {
+	lineColor := ansiGray
+	if chunk.Stream == core.ActionOutputStderr {
+		lineColor = ansiRed
+	}
+	return "  " + r.agentOutputPrefix(lineColor) + " " + r.agentOutputLine(strings.TrimSpace(chunk.Text), lineColor)
 }
 
 func (r *AgentRenderer) agentStyle(text string, codes ...string) string {

@@ -3,9 +3,11 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -144,5 +146,23 @@ func TestSessionSocketPathUsesAgentDirAndKey(t *testing.T) {
 	path := sessionSocketPath(filepath.Join(string(os.PathSeparator), "tmp", "agents"), "abc123")
 	if path != filepath.Join(string(os.PathSeparator), "tmp", "agents", "abc123.sock") {
 		t.Fatalf("unexpected socket path %q", path)
+	}
+}
+
+func TestIgnorableAttachIOError(t *testing.T) {
+	cases := []error{
+		io.EOF,
+		net.ErrClosed,
+		os.ErrClosed,
+		syscall.EPIPE,
+		fmt.Errorf("read |0: file already closed"),
+	}
+	for _, err := range cases {
+		if !isIgnorableAttachIOError(err) {
+			t.Fatalf("expected %v to be ignored", err)
+		}
+	}
+	if isIgnorableAttachIOError(fmt.Errorf("permission denied")) {
+		t.Fatalf("expected unrelated error to remain visible")
 	}
 }

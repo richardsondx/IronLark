@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -203,10 +204,10 @@ func (m SessionManager) Attach(ctx context.Context, workspace Workspace) error {
 	}()
 	_, stdoutErr := io.Copy(os.Stdout, conn)
 	stdinErr := <-copyErr
-	if stdoutErr != nil && !errors.Is(stdoutErr, net.ErrClosed) && !errors.Is(stdoutErr, io.EOF) {
+	if stdoutErr != nil && !isIgnorableAttachIOError(stdoutErr) {
 		return stdoutErr
 	}
-	if stdinErr != nil && !errors.Is(stdinErr, net.ErrClosed) && !errors.Is(stdinErr, io.EOF) {
+	if stdinErr != nil && !isIgnorableAttachIOError(stdinErr) {
 		return stdinErr
 	}
 	return nil
@@ -331,6 +332,19 @@ func firstState(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func isIgnorableAttachIOError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) || errors.Is(err, fs.ErrClosed) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file already closed") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "use of closed network connection")
 }
 
 type ringBuffer struct {

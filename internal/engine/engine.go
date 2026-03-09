@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/richardsondx/IronLark/internal/agent"
@@ -199,13 +201,21 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 	var history []core.ConversationMessage
 	if initialPrompt != "" {
 		if err := e.runChatPrompt(ctx, initialPrompt, stdin, &history, &record, threadState, threadRef); err != nil {
-			return err
+			if errors.Is(err, errTurnStopped) {
+				e.Renderer.Message("Stopped current turn.")
+			} else {
+				e.Renderer.Message(err.Error())
+			}
 		}
 	}
 
 	for {
 		promptRaw, err := e.Renderer.ReadPrompt("> ")
 		if err != nil {
+			if isChatInputClosedError(err) {
+				record.FinishedAt = time.Now().UTC()
+				return e.Sessions.Save(record)
+			}
 			return err
 		}
 
@@ -337,9 +347,23 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 				e.Renderer.Message("Stopped current turn.")
 				continue
 			}
-			return err
+			e.Renderer.Message(err.Error())
+			continue
 		}
 	}
+}
+
+func isChatInputClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file already closed") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "use of closed network connection")
 }
 
 func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte, history *[]core.ConversationMessage, record *sessions.Record, threadState *threads.Thread, threadRef threads.ThreadRef) error {
@@ -374,98 +398,160 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 		Role:    "user",
 		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
 	})
-	var response core.LLMResponse
+
+	maxTurns := e.Runtime.Config.Tools.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 5
+	}
 	usingFullContext := false
 	usingDirectRetry := false
-	for attempts := 0; attempts < 4; attempts++ {
-		narrator := newTurnNarrator(time.Now().UnixNano()+int64(attempts), nil)
-		e.narrate(narrator.turnStarted())
-		e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
-		var stopped bool
-		response, stopped, err = e.generateResponse(ctx, provider.Request{
-			Model:       e.Runtime.Model,
-			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
-			Messages:    *history,
-			Temperature: 0.1,
-		})
-		e.Renderer.EndThinking()
-		if err != nil {
-			return err
-		}
-		if stopped {
-			e.narrate(narrator.interrupted())
-			return errTurnStopped
-		}
-		response = normalizedResponse(response)
-		if shouldReplaceWithGreetingSummary(prompt, response) {
-			response = greetingOnlyResponse(prompt)
-		}
-		if !usingFullContext && len(response.Actions) > 0 {
-			fullSnapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
+
+	var finalResponse core.LLMResponse
+	allResults := make([]core.ActionResult, 0)
+	consecutiveFailures := 0
+	executedActions := false
+	hadClosingAnswer := false
+
+	for turn := 0; turn < maxTurns; turn++ {
+		var response core.LLMResponse
+		for attempts := 0; attempts < 4; attempts++ {
+			narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn*10+attempts), nil)
+			e.narrate(narrator.turnStarted())
+			e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
+			var stopped bool
+			response, stopped, err = e.generateResponse(ctx, provider.Request{
+				Model:       e.Runtime.Model,
+				System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
+				Messages:    *history,
+				Temperature: 0.1,
+			})
+			e.Renderer.EndThinking()
 			if err != nil {
 				return err
 			}
-			usingFullContext = true
-			snapshot = fullSnapshot
-			(*history)[len(*history)-1].Content = buildInitialPrompt(prompt, snapshot, graphDigest)
-			e.narrate(narrator.contextShift())
+			if stopped {
+				e.narrate(narrator.interrupted())
+				return errTurnStopped
+			}
+			response = normalizedResponse(response)
+			if shouldReplaceWithGreetingSummary(prompt, response) {
+				response = greetingOnlyResponse(prompt)
+			}
+			if !usingFullContext && len(response.Actions) > 0 {
+				fullSnapshot, err := e.Collector.Collect(ctx, e.Runtime, stdin)
+				if err != nil {
+					return err
+				}
+				usingFullContext = true
+				snapshot = fullSnapshot
+				(*history)[len(*history)-1].Content = buildInitialPrompt(prompt, snapshot, graphDigest)
+				e.narrate(narrator.contextShift())
+				continue
+			}
+			if !usingDirectRetry && isSyntheticFallbackResponse(response) {
+				usingDirectRetry = true
+				snapshot = minimalSnapshot
+				*history = append((*history)[:turnStart], core.ConversationMessage{
+					Role:    "user",
+					Content: prompt,
+				})
+				continue
+			}
+			narrator = newTurnNarrator(time.Now().UnixNano()+int64(turn*10+attempts), response.Narration)
+			e.narrate(narrator.intent(response))
+			if turn == 0 && attempts == 0 && shouldNudgeForExecutableStep(response, nil) {
+				rawResponse, _ := json.Marshal(response)
+				*history = append(*history, core.ConversationMessage{
+					Role:    "assistant",
+					Content: string(rawResponse),
+				})
+				*history = append(*history, missingActionContinuationMessage(response))
+				continue
+			}
+			break
+		}
+
+		if executedActions && isSyntheticFallbackResponse(response) {
+			finalResponse = core.LLMResponse{}
+			break
+		}
+		response = ensureVisibleResponse(response)
+		finalResponse = response
+		record.Findings = append(record.Findings, response.Findings...)
+		record.Actions = append(record.Actions, response.Actions...)
+		record.NeedsUserInput = response.NeedsUserInput
+		record.Confidence = response.Confidence
+		if err := e.Renderer.Response(response); err != nil {
+			return err
+		}
+
+		narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn), response.Narration)
+		results, stop, err := e.executeTurnWithNarrator(ctx, response, narrator)
+		if err != nil {
+			return err
+		}
+		safeResults := sanitizeResults(results)
+		allResults = append(allResults, safeResults...)
+		rawResponse, _ := json.Marshal(response)
+		*history = append(*history, core.ConversationMessage{
+			Role:    "assistant",
+			Content: string(rawResponse),
+		})
+
+		if len(results) > 0 {
+			executedActions = true
+			if hasErrors(results) {
+				consecutiveFailures++
+			} else {
+				consecutiveFailures = 0
+			}
+			if stop {
+				hadClosingAnswer = responseHasVisibleContent(response)
+				e.narrate(narrator.turnFinished(response.Summary))
+				break
+			}
+			if reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures) {
+				break
+			}
+			*history = append(*history, buildContinuationMessage(results))
 			continue
 		}
-		if !usingDirectRetry && isSyntheticFallbackResponse(response) {
-			usingDirectRetry = true
-			snapshot = minimalSnapshot
-			*history = append((*history)[:turnStart], core.ConversationMessage{
-				Role:    "user",
-				Content: prompt,
-			})
-			continue
+
+		if stop || (len(response.Actions) == 0 && len(response.Verification) == 0) {
+			hadClosingAnswer = responseHasVisibleContent(response)
+			e.narrate(narrator.turnFinished(response.Summary))
+			break
 		}
-		narrator = newTurnNarrator(time.Now().UnixNano()+int64(attempts), response.Narration)
-		e.narrate(narrator.intent(response))
-		if attempts == 0 && shouldNudgeForExecutableStep(response, nil) {
-			rawResponse, _ := json.Marshal(response)
-			*history = append(*history, core.ConversationMessage{
-				Role:    "assistant",
-				Content: string(rawResponse),
-			})
-			*history = append(*history, missingActionContinuationMessage(response))
-			continue
-		}
-		break
 	}
+
 	record.Prompt += "\n" + prompt
 	record.ContextJSON = snapshot.JSON()
-	response = ensureVisibleResponse(response)
-	record.Findings = append(record.Findings, response.Findings...)
-	record.Actions = append(record.Actions, response.Actions...)
-	record.Summary = response.Summary
-	record.NeedsUserInput = response.NeedsUserInput
-	record.Confidence = response.Confidence
-	if err := e.Renderer.Response(response); err != nil {
-		return err
+
+	if executedActions && !hadClosingAnswer {
+		finalResponse = synthesizedClosingResponse(allResults)
+		record.Findings = append(record.Findings, finalResponse.Findings...)
+		record.Actions = append(record.Actions, finalResponse.Actions...)
+		record.NeedsUserInput = finalResponse.NeedsUserInput
+		record.Confidence = finalResponse.Confidence
+		if err := e.Renderer.Response(finalResponse); err != nil {
+			return err
+		}
+		rawResponse, _ := json.Marshal(finalResponse)
+		*history = append(*history, core.ConversationMessage{
+			Role:    "assistant",
+			Content: string(rawResponse),
+		})
 	}
-	narrator := newTurnNarrator(time.Now().UnixNano(), response.Narration)
-	results, _, err := e.executeTurnWithNarrator(ctx, response, narrator)
-	if err != nil {
-		return err
-	}
-	e.narrate(narrator.turnFinished(response.Summary))
-	record.Results = append(record.Results, sanitizeResults(results)...)
-	rawResponse, _ := json.Marshal(response)
-	*history = append(*history, core.ConversationMessage{
-		Role:    "assistant",
-		Content: string(rawResponse),
-	})
-	if len(results) > 0 {
-		*history = append(*history, buildContinuationMessage(results))
-	}
+
+	record.Summary = finalResponse.Summary
+	record.Results = append(record.Results, allResults...)
 	record.Messages = sanitizeMessages(*history)
 	record.FinishedAt = time.Now().UTC()
 	if err := e.Sessions.Save(*record); err != nil {
 		return err
 	}
 	if threadState != nil {
-		*threadState = e.Threads.AppendTurn(*threadState, prompt, response, results, threads.AppendOptions{
+		*threadState = e.Threads.AppendTurn(*threadState, prompt, finalResponse, allResults, threads.AppendOptions{
 			ResultCharLimit: e.Runtime.Config.Thread.MaxResultChars,
 			ThreadConfig:    e.Runtime.Config.Thread,
 		})
@@ -597,6 +683,13 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			continue
 		}
 		if action.Type == core.ActionAskUser {
+			if !shouldUseStructuredInput(action) {
+				if responseHasVisibleContent(response) {
+					return results, true, nil
+				}
+				e.Renderer.Message("Reply in chat with the clarification and I'll continue.")
+				return results, true, nil
+			}
 			if narrator != nil {
 				e.narrate(narrator.blocked(action, firstNonEmpty(action.Prompt, action.Reason, "I need your input before I can continue."), core.NarrativeRunning))
 			}
@@ -682,6 +775,46 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 	return results, false, nil
 }
 
+func shouldUseStructuredInput(action core.Action) bool {
+	switch action.InputKind {
+	case core.InputSecret, core.InputConfirm, core.InputManualWait:
+		return true
+	case core.InputText:
+		if action.ExpectsValue && strings.TrimSpace(action.DestinationHint) != "" {
+			return true
+		}
+		joined := strings.ToLower(strings.Join([]string{
+			action.FieldKey,
+			action.Prompt,
+			action.Reason,
+			action.Placeholder,
+			action.DestinationHint,
+		}, " "))
+		joined = strings.NewReplacer("_", " ", "-", " ").Replace(joined)
+		for _, marker := range []string{
+			"token",
+			"api key",
+			"apikey",
+			"secret",
+			"password",
+			"passphrase",
+			"service name",
+			"hostname",
+			"host name",
+			"branch name",
+			"port",
+			"url",
+		} {
+			if strings.Contains(joined, marker) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, match policy.Match, strategy string, readOnly bool, showProgress bool, narrator *turnNarrator) (core.ActionResult, bool, error) {
 	if match.Matched && match.Decision == policy.DecisionDeny {
 		result := core.ActionResult{
@@ -744,7 +877,15 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 	if showProgress && !e.Runtime.JSONOutput {
 		e.Renderer.ActionProgress(action)
 	}
-	result, err := e.Executor.Execute(ctx, action, readOnly)
+	execFn := e.Executor.Execute
+	if showProgress && !e.Runtime.JSONOutput && action.Type == core.ActionRunShell {
+		execFn = func(ctx context.Context, action core.Action, readOnly bool) (core.ActionResult, error) {
+			return e.Executor.ExecuteStream(ctx, action, readOnly, func(chunk core.ActionOutputChunk) {
+				e.Renderer.StreamActionOutput(action, chunk)
+			})
+		}
+	}
+	result, err := execFn(ctx, action, readOnly)
 	e.Renderer.Result(result)
 	if narrator != nil {
 		e.narrate(narrator.actionFinished(result))
@@ -825,6 +966,29 @@ func buildContinuationMessage(results []core.ActionResult) core.ConversationMess
 		Role: "user",
 		Content: "Action results:\n" + string(resultsJSON) +
 			"\nIf the issue is resolved, finish. Otherwise propose the next smallest safe step.",
+	}
+}
+
+func synthesizedClosingResponse(results []core.ActionResult) core.LLMResponse {
+	if len(results) == 0 {
+		return core.LLMResponse{
+			Summary: "I completed the available steps, but I do not have a clearer closing answer yet.",
+		}
+	}
+	last := results[len(results)-1]
+	switch {
+	case last.Error != "":
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I ran the requested steps, but the latest one failed: %s.", firstNonEmpty(last.Summary, last.Error, last.Action.Title)),
+		}
+	case last.Skipped:
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I got partway through the task, but the latest step did not run: %s.", firstNonEmpty(last.Summary, last.Action.Title)),
+		}
+	default:
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I completed the latest step: %s. If you want, I can keep digging into the result.", firstNonEmpty(last.Summary, last.Action.Title)),
+		}
 	}
 }
 

@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -41,6 +43,10 @@ func (e *Executor) Preview(action core.Action, readOnly bool) (core.RiskReport, 
 }
 
 func (e *Executor) Execute(ctx context.Context, action core.Action, readOnly bool) (core.ActionResult, error) {
+	return e.ExecuteStream(ctx, action, readOnly, nil)
+}
+
+func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOnly bool, onChunk func(core.ActionOutputChunk)) (core.ActionResult, error) {
 	startedAt := time.Now().UTC()
 	report, err := e.Classifier.Classify(action, readOnly)
 	if err != nil {
@@ -74,7 +80,7 @@ func (e *Executor) Execute(ctx context.Context, action core.Action, readOnly boo
 	}
 	switch action.Type {
 	case core.ActionRunShell:
-		stdout, stderr, code, err := e.runCommand(ctx, action)
+		stdout, stderr, code, err := e.runCommandStream(ctx, action, onChunk)
 		result.Stdout = stdout
 		result.Stderr = stderr
 		result.ExitCode = code
@@ -242,6 +248,10 @@ func (e *Executor) readFiles(action core.Action) (string, error) {
 }
 
 func (e *Executor) runCommand(ctx context.Context, action core.Action) (string, string, int, error) {
+	return e.runCommandStream(ctx, action, nil)
+}
+
+func (e *Executor) runCommandStream(ctx context.Context, action core.Action, onChunk func(core.ActionOutputChunk)) (string, string, int, error) {
 	timeout := 30 * time.Second
 	if action.TimeoutSec > 0 {
 		timeout = time.Duration(action.TimeoutSec) * time.Second
@@ -254,42 +264,121 @@ func (e *Executor) runCommand(ctx context.Context, action core.Action) (string, 
 		dir = action.CWD
 	}
 
-	stdout, stderr, exitCode, err := e.runShell(runCtx, dir, "sh", action.Command)
+	stdout, stderr, exitCode, err := e.runShellStream(runCtx, dir, "sh", action, onChunk)
 	if err == nil {
 		return stdout, stderr, exitCode, nil
 	}
 	if shouldRetryWithBash(action.Command, stderr) {
 		if _, lookErr := exec.LookPath("bash"); lookErr == nil {
-			return e.runShell(runCtx, dir, "bash", action.Command)
+			return e.runShellStream(runCtx, dir, "bash", action, onChunk)
 		}
 	}
 	return stdout, stderr, exitCode, err
 }
 
 func (e *Executor) runShell(ctx context.Context, dir, shell, command string) (string, string, int, error) {
-	cmd := exec.CommandContext(ctx, shell, "-lc", command)
+	return e.runShellStream(ctx, dir, shell, core.Action{Command: command}, nil)
+}
+
+func (e *Executor) runShellStream(ctx context.Context, dir, shell string, action core.Action, onChunk func(core.ActionOutputChunk)) (string, string, int, error) {
+	cmd := exec.CommandContext(ctx, shell, "-lc", action.Command)
 	cmd.Dir = dir
 
 	stdoutBuf := &cappedBuffer{limit: e.MaxOutputBytes}
 	stderrBuf := &cappedBuffer{limit: e.MaxOutputBytes}
-	cmd.Stdout = stdoutBuf
-	cmd.Stderr = stderrBuf
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", "", -1, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return "", "", -1, err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", "", -1, err
+	}
 
-	err := cmd.Run()
+	type streamResult struct {
+		stream core.ActionOutputStream
+		err    error
+	}
+	streamDone := make(chan streamResult, 2)
+	go func() {
+		streamDone <- streamResult{
+			stream: core.ActionOutputStdout,
+			err:    e.captureStream(stdoutBuf, stdoutPipe, action.ID, core.ActionOutputStdout, onChunk),
+		}
+	}()
+	go func() {
+		streamDone <- streamResult{
+			stream: core.ActionOutputStderr,
+			err:    e.captureStream(stderrBuf, stderrPipe, action.ID, core.ActionOutputStderr, onChunk),
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	var streamErr error
+	for i := 0; i < 2; i++ {
+		result := <-streamDone
+		if streamErr == nil && result.err != nil && !isIgnorableStreamReadError(result.err) {
+			streamErr = result.err
+		}
+	}
 	stdout := e.Redactor.Text(stdoutBuf.String())
 	stderr := e.Redactor.Text(stderrBuf.String())
+	if streamErr != nil {
+		return stdout, stderr, -1, streamErr
+	}
 
 	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
 			exitCode = -1
 		}
-		return stdout, stderr, exitCode, err
+		return stdout, stderr, exitCode, waitErr
 	}
 
 	return stdout, stderr, 0, nil
+}
+
+func isIgnorableStreamReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if err == io.EOF || errors.Is(err, fs.ErrClosed) || errors.Is(err, os.ErrClosed) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "file already closed") ||
+		strings.Contains(message, "closed pipe")
+}
+
+func (e *Executor) captureStream(buf *cappedBuffer, reader io.Reader, actionID string, stream core.ActionOutputStream, onChunk func(core.ActionOutputChunk)) error {
+	streamReader := bufio.NewReader(reader)
+	for {
+		line, err := streamReader.ReadString('\n')
+		if len(line) > 0 {
+			_, _ = buf.Write([]byte(line))
+			if onChunk != nil {
+				text := strings.TrimRight(e.Redactor.Text(line), "\n")
+				if strings.TrimSpace(text) != "" {
+					onChunk(core.ActionOutputChunk{
+						ActionID: actionID,
+						Stream:   stream,
+						Text:     text,
+					})
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func shouldRetryWithBash(command, stderr string) bool {

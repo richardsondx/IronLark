@@ -28,12 +28,76 @@ type TranscriptEntry struct {
 	Status    string
 	Timestamp time.Time
 	ActionID  string
+	Streamed  bool
 }
 
 func (r *AgentRenderer) appendEntryLocked(entry TranscriptEntry) {
 	entry.Timestamp = r.nowFn().UTC()
 	r.entries = append(r.entries, entry)
 	r.transcript = r.renderTranscriptLocked()
+}
+
+func (r *AgentRenderer) actionEntryIndexLocked(actionID string) int {
+	for idx := len(r.entries) - 1; idx >= 0; idx-- {
+		if r.entries[idx].ActionID == actionID {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (r *AgentRenderer) appendActionStreamLocked(action core.Action, chunk core.ActionOutputChunk) bool {
+	idx := r.actionEntryIndexLocked(action.ID)
+	if idx < 0 {
+		return false
+	}
+	line := r.streamLine(chunk)
+	if strings.TrimSpace(line) == "" {
+		return false
+	}
+	entry := &r.entries[idx]
+	entry.Streamed = true
+	entry.Expanded = true
+	entry.Details = append(entry.Details, line)
+	if len(entry.Details) > 80 {
+		entry.Details = entry.Details[len(entry.Details)-80:]
+	}
+	r.transcript = r.renderTranscriptLocked()
+	return true
+}
+
+func (r *AgentRenderer) mergeResultIntoEntryLocked(result core.ActionResult) bool {
+	idx := r.actionEntryIndexLocked(result.Action.ID)
+	if idx < 0 {
+		return false
+	}
+	entry := &r.entries[idx]
+	status := "ok"
+	if result.Error != "" {
+		status = "error"
+	}
+	if result.Skipped {
+		status = "skipped"
+	}
+	includeStreams := !entry.Streamed
+	switch entry.Kind {
+	case transcriptEntryAction:
+		entry.Status = status
+		entry.Summary = firstNonEmpty(result.Summary, entry.Summary, result.Action.Title)
+		entry.Details = append(entry.Details, resultExtraDetailLines(r, result, includeStreams)...)
+		if len(entry.Details) <= 6 {
+			entry.Expanded = true
+		}
+	case transcriptEntryBlock:
+		if result.Summary != "" {
+			entry.Details = append(entry.Details, r.agentLabel("Summary")+": "+result.Summary)
+		}
+		entry.Details = append(entry.Details, resultExtraDetailLines(r, result, includeStreams)...)
+	default:
+		return false
+	}
+	r.transcript = r.renderTranscriptLocked()
+	return true
 }
 
 func (r *AgentRenderer) renderTranscriptLocked() []string {
@@ -226,14 +290,19 @@ func actionTimelineTitle(action core.Action) string {
 }
 
 func resultDetailLines(r *AgentRenderer, result core.ActionResult) ([]string, bool) {
+	lines := resultExtraDetailLines(r, result, true)
+	return lines, len(lines) <= 6
+}
+
+func resultExtraDetailLines(r *AgentRenderer, result core.ActionResult, includeStreams bool) []string {
 	lines := []string{}
-	if result.Stdout != "" {
+	if includeStreams && result.Stdout != "" {
 		lines = append(lines, r.agentLabel("Output")+":")
 		for _, line := range strings.Split(strings.TrimRight(result.Stdout, "\n"), "\n") {
 			lines = append(lines, "  "+r.agentOutputPrefix(ansiGray)+" "+r.agentOutputLine(line, ansiGray))
 		}
 	}
-	if result.Stderr != "" {
+	if includeStreams && result.Stderr != "" {
 		lines = append(lines, r.agentLabel("Stderr")+":")
 		for _, line := range strings.Split(strings.TrimRight(result.Stderr, "\n"), "\n") {
 			lines = append(lines, "  "+r.agentOutputPrefix(ansiRed)+" "+r.agentOutputLine(line, ansiRed))
@@ -248,7 +317,7 @@ func resultDetailLines(r *AgentRenderer, result core.ActionResult) ([]string, bo
 	if result.CheckpointID != "" {
 		lines = append(lines, r.agentLabel("Checkpoint ID")+": "+result.CheckpointID)
 	}
-	return lines, len(lines) <= 6
+	return lines
 }
 
 func firstPath(paths []string) string {

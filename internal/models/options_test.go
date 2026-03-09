@@ -8,10 +8,10 @@ import (
 )
 
 func TestFormatCurrentIncludesActiveAndSuggestedOptions(t *testing.T) {
-	text := FormatCurrent(cfgpkg.DefaultConfig(), "openai", "gpt-5-mini")
+	text := FormatCurrent(cfgpkg.DefaultConfig(), "openai", "gpt-4.1-mini")
 
 	for _, fragment := range []string{
-		"Current model: gpt-5-mini",
+		"Current model: gpt-4.1-mini",
 		"Available model options:",
 		"openai: gpt-4.1-mini, gpt-5-mini (active provider)",
 		"openrouter: openai/gpt-4.1-mini",

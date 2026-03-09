@@ -23,6 +23,10 @@ type Renderer struct {
 	JSON  bool
 	Color bool
 	rawIn *os.File
+
+	streamingActive bool
+	streamStdout    bool
+	streamStderr    bool
 }
 
 type UI interface {
@@ -30,6 +34,7 @@ type UI interface {
 	Response(response core.LLMResponse) error
 	PlannedActions(actions []core.Action, previews []core.RiskReport)
 	ActionProgress(action core.Action)
+	StreamActionOutput(action core.Action, chunk core.ActionOutputChunk)
 	ApprovalPrompt(action core.Action, report core.RiskReport)
 	Result(result core.ActionResult)
 	Narrate(event core.NarrativeEvent)
@@ -143,6 +148,9 @@ func (r *Renderer) ActionProgress(action core.Action) {
 	if r.JSON {
 		return
 	}
+	r.streamingActive = true
+	r.streamStdout = false
+	r.streamStderr = false
 	target := action.Title
 	if target == "" {
 		target = action.Command
@@ -157,6 +165,34 @@ func (r *Renderer) ActionProgress(action core.Action) {
 		target = string(action.Type)
 	}
 	fmt.Fprintf(r.Out, "%s %s\n", r.actionTag(string(action.Type)), target)
+}
+
+func (r *Renderer) StreamActionOutput(action core.Action, chunk core.ActionOutputChunk) {
+	if r.JSON {
+		return
+	}
+	text := strings.TrimRight(chunk.Text, "\n")
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	label := "Output"
+	lineColor := ansiGray
+	opened := &r.streamStdout
+	if chunk.Stream == core.ActionOutputStderr {
+		label = "Stderr"
+		lineColor = ansiRed
+		opened = &r.streamStderr
+	}
+	if !*opened {
+		fmt.Fprintf(r.Out, "%s:\n", r.label(label))
+		*opened = true
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		fmt.Fprintf(r.Out, "  %s %s\n", r.outputPrefix(lineColor), r.outputLine(line, lineColor))
+	}
 }
 
 func (r *Renderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
@@ -196,6 +232,10 @@ func (r *Renderer) Result(result core.ActionResult) {
 		_ = r.encode(result)
 		return
 	}
+	streamed := r.streamingActive && (r.streamStdout || r.streamStderr)
+	r.streamingActive = false
+	r.streamStdout = false
+	r.streamStderr = false
 	status := "ok"
 	if result.Error != "" {
 		status = "error"
@@ -207,10 +247,10 @@ func (r *Renderer) Result(result core.ActionResult) {
 	if result.Summary != "" {
 		fmt.Fprintf(r.Out, "%s: %s\n", r.label("Summary"), result.Summary)
 	}
-	if result.Stdout != "" {
+	if result.Stdout != "" && !streamed {
 		r.outputBlock("Output", result.Stdout, ansiGray)
 	}
-	if result.Stderr != "" {
+	if result.Stderr != "" && !streamed {
 		r.outputBlock("Stderr", result.Stderr, ansiRed)
 	}
 	if result.Error != "" {
