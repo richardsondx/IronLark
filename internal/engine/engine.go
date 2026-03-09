@@ -645,20 +645,20 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 	}
 
 	previews := make([]core.RiskReport, 0, len(response.Actions))
-	matches := make([]policy.Match, 0, len(response.Actions))
+	resolutions := make([]policy.Resolution, 0, len(response.Actions))
 	needApproval := false
 	for _, action := range response.Actions {
 		report, err := e.Executor.Preview(action, e.Runtime.ReadOnly)
 		if err != nil {
 			return nil, false, err
 		}
-		match, err := e.PolicyStore.Evaluate(action)
+		resolution, err := e.PolicyStore.Resolve(action)
 		if err != nil {
 			return nil, false, err
 		}
 		previews = append(previews, report)
-		matches = append(matches, match)
-		if e.actionNeedsApproval(action, report, match) {
+		resolutions = append(resolutions, resolution)
+		if e.actionNeedsApproval(action, report, resolution) {
 			needApproval = true
 		}
 	}
@@ -697,7 +697,7 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 	results := []core.ActionResult{}
 	for idx, action := range response.Actions {
 		report := previews[idx]
-		match := matches[idx]
+		resolution := resolutions[idx]
 		if action.Type == core.ActionFinish {
 			return results, true, nil
 		}
@@ -729,7 +729,7 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			results = append(results, result)
 			continue
 		}
-		if match.Matched && match.Decision == policy.DecisionDeny {
+		if resolution.Match.Matched && resolution.Match.Decision == policy.DecisionDeny {
 			if narrator != nil {
 				e.narrate(narrator.blocked(action, "Machine policy blocked that step.", core.NarrativeSkipped))
 			}
@@ -746,7 +746,7 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			continue
 		}
 
-		result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst, narrator)
+		result, stop, err := e.executeAction(ctx, action, report, resolution, strategy, e.Runtime.ReadOnly, e.Runtime.Interaction == core.InteractionExecuteFirst, narrator)
 		if !stop {
 			results = append(results, result)
 		}
@@ -774,14 +774,14 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			if err != nil {
 				return results, false, err
 			}
-			match, err := e.PolicyStore.Evaluate(action)
+			resolution, err := e.PolicyStore.Resolve(action)
 			if err != nil {
 				return results, false, err
 			}
 			if narrator != nil {
 				e.narrate(narrator.verificationStarted(action))
 			}
-			result, stop, err := e.executeAction(ctx, action, report, match, strategy, e.Runtime.ReadOnly, false, narrator)
+			result, stop, err := e.executeAction(ctx, action, report, resolution, strategy, e.Runtime.ReadOnly, false, narrator)
 			if !stop {
 				results = append(results, result)
 			}
@@ -837,8 +837,8 @@ func shouldUseStructuredInput(action core.Action) bool {
 	}
 }
 
-func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, match policy.Match, strategy string, readOnly bool, showProgress bool, narrator *turnNarrator) (core.ActionResult, bool, error) {
-	if match.Matched && match.Decision == policy.DecisionDeny {
+func (e *Engine) executeAction(ctx context.Context, action core.Action, report core.RiskReport, resolution policy.Resolution, strategy string, readOnly bool, showProgress bool, narrator *turnNarrator) (core.ActionResult, bool, error) {
+	if resolution.Match.Matched && resolution.Match.Decision == policy.DecisionDeny {
 		result := core.ActionResult{
 			Action:   action,
 			Risk:     report,
@@ -856,22 +856,27 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 	}
 
 	approved := true
-	if e.actionNeedsApproval(action, report, match) {
+	if e.actionNeedsApproval(action, report, resolution) {
 		decision, err := e.promptForActionDecision(action, report, strategy)
 		if err != nil {
 			return core.ActionResult{}, false, err
 		}
-		switch decision {
-		case "allow-once":
+		switch decision.Kind {
+		case core.ApprovalDecisionAllowOnce:
 			approved = true
-		case "allow-always":
+		case core.ApprovalDecisionAllowAlways:
 			approved = true
 			if _, err := e.PolicyStore.Add(policy.RuleForAction(action, policy.DecisionAllow)); err != nil {
 				return core.ActionResult{}, false, err
 			}
-		case "deny-once":
+		case core.ApprovalDecisionAutoAccept:
+			approved = true
+			if err := e.PolicyStore.SetAutoAcceptThrough(decision.AutoAcceptThrough); err != nil {
+				return core.ActionResult{}, false, err
+			}
+		case core.ApprovalDecisionDenyOnce:
 			approved = false
-		case "cancel":
+		case core.ApprovalDecisionCancel:
 			return core.ActionResult{}, true, nil
 		default:
 			approved = false
@@ -915,8 +920,11 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 	return result, false, err
 }
 
-func (e *Engine) actionNeedsApproval(action core.Action, report core.RiskReport, match policy.Match) bool {
-	if match.Matched && match.Decision == policy.DecisionAllow && report.Level != core.RiskHigh {
+func (e *Engine) actionNeedsApproval(action core.Action, report core.RiskReport, resolution policy.Resolution) bool {
+	if resolution.Match.Matched && resolution.Match.Decision == policy.DecisionAllow && report.Level != core.RiskHigh {
+		return false
+	}
+	if resolution.AutoAcceptThrough.Covers(report.Level) {
 		return false
 	}
 	if e.Executor.Classifier.IsSensitiveAction(action) {
@@ -925,35 +933,26 @@ func (e *Engine) actionNeedsApproval(action core.Action, report core.RiskReport,
 	return e.Executor.Classifier.NeedsApproval(action, report, e.Runtime.ApprovalMode, e.Runtime.Config.Security.AutoApproveReadTools, e.Runtime.ReadOnly)
 }
 
-func (e *Engine) promptForActionDecision(action core.Action, report core.RiskReport, strategy string) (string, error) {
+func (e *Engine) promptForActionDecision(action core.Action, report core.RiskReport, strategy string) (core.ApprovalDecision, error) {
 	if e.Runtime.Interaction == core.InteractionPlanFirst && strategy == "all" && !e.Executor.Classifier.RequiresDoubleConfirm(report) {
-		return "allow-once", nil
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}, nil
 	}
 	if e.Runtime.Interaction == core.InteractionPlanFirst && strategy != "step" && e.Executor.Classifier.RequiresDoubleConfirm(report) {
 		ok, err := e.Renderer.Confirm(action.Title, true)
 		if err != nil {
-			return "", err
+			return core.ApprovalDecision{}, err
 		}
 		if ok {
-			return "allow-once", nil
+			return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}, nil
 		}
-		return "deny-once", nil
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionDenyOnce}, nil
 	}
 	e.Renderer.ApprovalPrompt(action, report)
-	choice, err := e.Renderer.PromptApprovalChoice()
+	choice, err := e.Renderer.PromptApprovalChoice(report.Level)
 	if err != nil {
-		return "", err
+		return core.ApprovalDecision{}, err
 	}
-	switch choice {
-	case "1":
-		return "allow-once", nil
-	case "2":
-		return "allow-always", nil
-	case "3":
-		return "deny-once", nil
-	default:
-		return "cancel", nil
-	}
+	return choice, nil
 }
 
 func hasErrors(results []core.ActionResult) bool {

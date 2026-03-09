@@ -20,6 +20,21 @@ func (m ApprovalMode) Valid() bool {
 	}
 }
 
+type ApprovalDecisionKind string
+
+const (
+	ApprovalDecisionAllowOnce   ApprovalDecisionKind = "allow_once"
+	ApprovalDecisionAllowAlways ApprovalDecisionKind = "allow_always"
+	ApprovalDecisionAutoAccept  ApprovalDecisionKind = "auto_accept"
+	ApprovalDecisionDenyOnce    ApprovalDecisionKind = "deny_once"
+	ApprovalDecisionCancel      ApprovalDecisionKind = "cancel"
+)
+
+type ApprovalDecision struct {
+	Kind               ApprovalDecisionKind `json:"kind"`
+	AutoAcceptThrough  RiskLevel            `json:"auto_accept_through,omitempty"`
+}
+
 type InteractionMode string
 
 const (
@@ -193,6 +208,32 @@ const (
 	RiskMedium RiskLevel = "MEDIUM"
 	RiskHigh   RiskLevel = "HIGH"
 )
+
+func (l RiskLevel) Valid() bool {
+	switch l {
+	case RiskLow, RiskMedium, RiskHigh:
+		return true
+	default:
+		return false
+	}
+}
+
+func (l RiskLevel) Rank() int {
+	switch l {
+	case RiskLow:
+		return 1
+	case RiskMedium:
+		return 2
+	case RiskHigh:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func (l RiskLevel) Covers(other RiskLevel) bool {
+	return l.Valid() && other.Valid() && l.Rank() >= other.Rank()
+}
 
 type RiskReport struct {
 	Level              RiskLevel `json:"level"`

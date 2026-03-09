@@ -152,9 +152,10 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk context drop`: delete the active thread
 - `lk context use <thread-id>`: pin the current working directory to a manual thread
 - `lk context list`: list recent context threads
-- `lk policy list`: show machine-level allow/deny rules
+- `lk policy list`: show machine-level auto-accept settings and allow/deny rules
 - `lk policy allow <action|command|path> <value>`: persist an allow rule on this machine
 - `lk policy deny <action|command|path> <value>`: persist a deny rule on this machine
+- `lk policy auto-accept <off|low|medium|high>`: set a machine-level risk threshold for automatic approval
 - `lk policy remove <id>`: remove a machine policy rule
 - `lk inspect [system|repo]`: inspect the current machine or repo
 - `lk edit <path> [instruction]`: patch a file with diff approval
@@ -234,17 +235,28 @@ Set `ui.narrated_progress: true` to enable the narrated progress timeline in the
 
 ### Machine Policy
 
-IronLark stores allow/deny rules per machine so repeat approvals can disappear for trusted commands.
+IronLark stores allow/deny rules per machine so repeat approvals can disappear for trusted commands. You can also set a machine-level auto-accept threshold that approves future actions at or below a risk level. Deny rules still win.
 
 ```bash
 lk policy list
+lk policy auto-accept medium
 lk policy allow command "systemctl status"
 lk policy allow command "journalctl -u"
 lk policy deny command "rm"
 lk policy remove <rule-id>
 ```
 
-Read-only actions are generally auto-approved, but sensitive paths such as `.env`, key files, and SSH material still require approval.
+Interactive approval prompts also expose:
+
+- `Allow once`
+- `Always allow on this machine`
+- `Auto-accept (<=LOW|MEDIUM|HIGH)`
+- `Deny once`
+- `Cancel`
+
+When the auto-accept row is selected in an interactive terminal, `Tab` cycles the threshold. `HIGH` auto-accepts everything, `MEDIUM` auto-accepts low and medium risk actions, and `LOW` auto-accepts only low risk actions.
+
+Read-only actions are generally auto-approved, but sensitive paths such as `.env`, key files, and SSH material still require approval unless your machine auto-accept threshold explicitly covers their risk level.
 
 ## Review Before File Changes
 

@@ -53,3 +53,29 @@ printf "IPv4: %s\n" "${v4:-unavailable}"
 		t.Fatalf("expected allow match, got %#v", match)
 	}
 }
+
+func TestAutoAcceptThroughRoundTrip(t *testing.T) {
+	store := Store{Path: filepath.Join(t.TempDir(), "policy.json")}
+	if err := store.SetAutoAcceptThrough(core.RiskMedium); err != nil {
+		t.Fatalf("SetAutoAcceptThrough() error = %v", err)
+	}
+
+	level, ok, err := store.AutoAcceptThrough()
+	if err != nil {
+		t.Fatalf("AutoAcceptThrough() error = %v", err)
+	}
+	if !ok || level != core.RiskMedium {
+		t.Fatalf("expected medium auto accept threshold, got %q %t", level, ok)
+	}
+
+	if err := store.ClearAutoAcceptThrough(); err != nil {
+		t.Fatalf("ClearAutoAcceptThrough() error = %v", err)
+	}
+	level, ok, err = store.AutoAcceptThrough()
+	if err != nil {
+		t.Fatalf("AutoAcceptThrough() after clear error = %v", err)
+	}
+	if ok || level != "" {
+		t.Fatalf("expected cleared auto accept threshold, got %q %t", level, ok)
+	}
+}

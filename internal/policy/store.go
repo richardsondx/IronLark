@@ -40,7 +40,8 @@ type Rule struct {
 }
 
 type File struct {
-	Rules []Rule `json:"rules"`
+	AutoAcceptThrough core.RiskLevel `json:"auto_accept_through,omitempty"`
+	Rules             []Rule         `json:"rules"`
 }
 
 type Store struct {
@@ -51,6 +52,11 @@ type Match struct {
 	Rule     Rule
 	Matched  bool
 	Decision Decision
+}
+
+type Resolution struct {
+	Match             Match
+	AutoAcceptThrough core.RiskLevel
 }
 
 func (s Store) Load() (File, error) {
@@ -64,6 +70,9 @@ func (s Store) Load() (File, error) {
 	var file File
 	if err := json.Unmarshal(data, &file); err != nil {
 		return File{}, fmt.Errorf("unmarshal policy store: %w", err)
+	}
+	if file.AutoAcceptThrough != "" && !file.AutoAcceptThrough.Valid() {
+		return File{}, fmt.Errorf("invalid auto_accept_through %q", file.AutoAcceptThrough)
 	}
 	return file, nil
 }
@@ -88,6 +97,17 @@ func (s Store) List() ([]Rule, error) {
 		return nil, err
 	}
 	return file.Rules, nil
+}
+
+func (s Store) AutoAcceptThrough() (core.RiskLevel, bool, error) {
+	file, err := s.Load()
+	if err != nil {
+		return "", false, err
+	}
+	if !file.AutoAcceptThrough.Valid() {
+		return "", false, nil
+	}
+	return file.AutoAcceptThrough, true, nil
 }
 
 func (s Store) Add(rule Rule) (Rule, error) {
@@ -121,24 +141,55 @@ func (s Store) Remove(id string) error {
 }
 
 func (s Store) Evaluate(action core.Action) (Match, error) {
-	file, err := s.Load()
+	resolution, err := s.Resolve(action)
 	if err != nil {
 		return Match{}, err
 	}
+	return resolution.Match, nil
+}
+
+func (s Store) Resolve(action core.Action) (Resolution, error) {
+	file, err := s.Load()
+	if err != nil {
+		return Resolution{}, err
+	}
+	resolution := Resolution{AutoAcceptThrough: file.AutoAcceptThrough}
 	var allow *Rule
 	for _, rule := range file.Rules {
 		if matchesRule(rule, action) {
 			if rule.Decision == DecisionDeny {
-				return Match{Rule: rule, Matched: true, Decision: DecisionDeny}, nil
+				resolution.Match = Match{Rule: rule, Matched: true, Decision: DecisionDeny}
+				return resolution, nil
 			}
 			r := rule
 			allow = &r
 		}
 	}
 	if allow != nil {
-		return Match{Rule: *allow, Matched: true, Decision: DecisionAllow}, nil
+		resolution.Match = Match{Rule: *allow, Matched: true, Decision: DecisionAllow}
 	}
-	return Match{}, nil
+	return resolution, nil
+}
+
+func (s Store) SetAutoAcceptThrough(level core.RiskLevel) error {
+	if !level.Valid() {
+		return fmt.Errorf("invalid auto accept risk level %q", level)
+	}
+	file, err := s.Load()
+	if err != nil {
+		return err
+	}
+	file.AutoAcceptThrough = level
+	return s.Save(file)
+}
+
+func (s Store) ClearAutoAcceptThrough() error {
+	file, err := s.Load()
+	if err != nil {
+		return err
+	}
+	file.AutoAcceptThrough = ""
+	return s.Save(file)
 }
 
 func RuleForAction(action core.Action, decision Decision) Rule {

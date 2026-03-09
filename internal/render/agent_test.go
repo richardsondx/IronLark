@@ -377,6 +377,34 @@ func TestInsertTextLockedStripsCaretControlLeakNotation(t *testing.T) {
 	}
 }
 
+func TestInsertRuneLockedStripsIncrementalCaretControlLeakNotation(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.mu.Lock()
+	for _, ch := range "abc^P^N^R^[[A^[[Bdef" {
+		renderer.insertRuneLocked(ch)
+	}
+	renderer.mu.Unlock()
+
+	if string(renderer.composer) != "abcdef" {
+		t.Fatalf("expected incremental leaked caret notation removed from composer, got %q", string(renderer.composer))
+	}
+}
+
+func TestHandleBlockerKeyLockedStripsIncrementalCaretControlLeakNotation(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.mu.Lock()
+	renderer.blocker = &blockerState{focus: blockerFocusInput}
+	for _, ch := range "abc^P^N^R^[[A^[[Bdef" {
+		renderer.handleBlockerKeyLocked(keyPress{Kind: keyPrintable, Rune: ch})
+	}
+	got := string(renderer.blocker.answer)
+	renderer.mu.Unlock()
+
+	if got != "abcdef" {
+		t.Fatalf("expected incremental leaked caret notation removed from blocker answer, got %q", got)
+	}
+}
+
 func TestSlashMenuShowsModeToggleAndSelectsHelp(t *testing.T) {
 	renderer := newTestAgentRenderer()
 	renderer.BeginRawTestPrompt()
@@ -435,6 +463,46 @@ func TestSlashMenuApprovalOpensApprovalOverlay(t *testing.T) {
 	}
 	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); !done || submitted != "/approval auto-safe" {
 		t.Fatalf("expected approval command, got %q %t", submitted, done)
+	}
+}
+
+func TestApprovalDecisionTabCyclesAutoAcceptLevel(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.overlay = overlayApprovalDecision
+	renderer.overlayIndex = 2
+	renderer.approvalDecision = &approvalDecisionState{selected: 2, level: core.RiskMedium}
+	renderer.mu.Unlock()
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyTab}); submitted != "" || done {
+		t.Fatalf("expected selection update only, got %q %t", submitted, done)
+	}
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	if renderer.approvalDecision.level != core.RiskHigh {
+		t.Fatalf("expected auto accept level to advance to high, got %q", renderer.approvalDecision.level)
+	}
+}
+
+func TestApprovalDecisionEnterReturnsStructuredDecision(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.overlay = overlayApprovalDecision
+	renderer.overlayIndex = 2
+	renderer.approvalDecision = &approvalDecisionState{selected: 2, level: core.RiskMedium}
+	renderer.mu.Unlock()
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); submitted != "" || !done {
+		t.Fatalf("expected completion only, got %q %t", submitted, done)
+	}
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	if renderer.approvalDecision.result.Kind != core.ApprovalDecisionAutoAccept || renderer.approvalDecision.result.AutoAcceptThrough != core.RiskMedium {
+		t.Fatalf("unexpected approval decision %#v", renderer.approvalDecision.result)
 	}
 }
 
@@ -512,6 +580,10 @@ func TestPolicyOverlayTogglesRuleDecision(t *testing.T) {
 	renderer.openPolicyOverlayLocked()
 	renderer.mu.Unlock()
 
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyDown}); submitted != "" || done {
+		t.Fatalf("expected selection move, got %q %t", submitted, done)
+	}
+
 	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); submitted != "" || done {
 		t.Fatalf("expected in-place toggle, got %q %t", submitted, done)
 	}
@@ -521,6 +593,79 @@ func TestPolicyOverlayTogglesRuleDecision(t *testing.T) {
 	}
 	if len(rules) != 1 || rules[0].ID == rule.ID || rules[0].Decision != policy.DecisionDeny {
 		t.Fatalf("expected toggled deny rule, got %#v", rules)
+	}
+}
+
+func TestPolicyOverlayShowsAutoAcceptThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	store := policy.Store{Path: filepath.Join(tmp, "policy.json")}
+	if err := store.SetAutoAcceptThrough(core.RiskMedium); err != nil {
+		t.Fatalf("SetAutoAcceptThrough() error = %v", err)
+	}
+
+	renderer := newTestAgentRenderer()
+	renderer.meta.PolicyStore = store
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.openPolicyOverlayLocked()
+	lines := renderer.overlayLinesLocked(80)
+	renderer.mu.Unlock()
+
+	joined := strings.Join(lines, "\n")
+	if !containsString(joined, "auto-accept <= MEDIUM") {
+		t.Fatalf("expected auto-accept threshold in policy overlay, got %q", joined)
+	}
+	if !containsString(joined, "no machine rules yet") {
+		t.Fatalf("expected empty rules message in policy overlay, got %q", joined)
+	}
+}
+
+func TestPolicyOverlayEnterCyclesAutoAcceptThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	store := policy.Store{Path: filepath.Join(tmp, "policy.json")}
+
+	renderer := newTestAgentRenderer()
+	renderer.meta.PolicyStore = store
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.openPolicyOverlayLocked()
+	renderer.mu.Unlock()
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); submitted != "" || done {
+		t.Fatalf("expected in-place cycle, got %q %t", submitted, done)
+	}
+	level, ok, err := store.AutoAcceptThrough()
+	if err != nil {
+		t.Fatalf("AutoAcceptThrough() error = %v", err)
+	}
+	if !ok || level != core.RiskLow {
+		t.Fatalf("expected auto-accept to cycle to low, got %q %t", level, ok)
+	}
+}
+
+func TestPolicyOverlayTabCyclesAutoAcceptThreshold(t *testing.T) {
+	tmp := t.TempDir()
+	store := policy.Store{Path: filepath.Join(tmp, "policy.json")}
+	if err := store.SetAutoAcceptThrough(core.RiskMedium); err != nil {
+		t.Fatalf("SetAutoAcceptThrough() error = %v", err)
+	}
+
+	renderer := newTestAgentRenderer()
+	renderer.meta.PolicyStore = store
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.openPolicyOverlayLocked()
+	renderer.mu.Unlock()
+
+	if submitted, done := renderer.handleKey(keyPress{Kind: keyTab}); submitted != "" || done {
+		t.Fatalf("expected in-place tab cycle, got %q %t", submitted, done)
+	}
+	level, ok, err := store.AutoAcceptThrough()
+	if err != nil {
+		t.Fatalf("AutoAcceptThrough() error = %v", err)
+	}
+	if !ok || level != core.RiskHigh {
+		t.Fatalf("expected auto-accept to cycle to high, got %q %t", level, ok)
 	}
 }
 

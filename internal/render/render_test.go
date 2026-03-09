@@ -214,6 +214,22 @@ func TestCollectUserInputTreatsEmptyEnterAsSkip(t *testing.T) {
 	}
 }
 
+func TestPromptApprovalChoiceParsesAutoAcceptLevel(t *testing.T) {
+	var out bytes.Buffer
+	r := &Renderer{
+		In:  bufio.NewReader(strings.NewReader("3 high\n")),
+		Out: &out,
+	}
+
+	decision, err := r.PromptApprovalChoice(core.RiskMedium)
+	if err != nil {
+		t.Fatalf("PromptApprovalChoice() error = %v", err)
+	}
+	if decision.Kind != core.ApprovalDecisionAutoAccept || decision.AutoAcceptThrough != core.RiskHigh {
+		t.Fatalf("expected high auto accept decision, got %#v", decision)
+	}
+}
+
 func TestCollectUserInputSupportsFollowUpShortcut(t *testing.T) {
 	var out bytes.Buffer
 	r := &Renderer{

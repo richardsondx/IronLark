@@ -49,6 +49,7 @@ const (
 	overlayHistory  overlayKind = "history"
 	overlayMode     overlayKind = "mode"
 	overlayApproval overlayKind = "approval"
+	overlayApprovalDecision overlayKind = "approval_decision"
 	overlayModel    overlayKind = "model"
 	overlayPolicy   overlayKind = "policy"
 	overlaySlash    overlayKind = "slash"
@@ -100,6 +101,13 @@ type blockerState struct {
 	editingFollow bool
 }
 
+type approvalDecisionState struct {
+	selected int
+	level    core.RiskLevel
+	result   core.ApprovalDecision
+	done     bool
+}
+
 type AgentRenderer struct {
 	In    *bufio.Reader
 	Out   io.Writer
@@ -141,6 +149,7 @@ type AgentRenderer struct {
 	lastFrame      []string
 	lastWidth      int
 	cursorHidden   bool
+	approvalDecision *approvalDecisionState
 }
 
 func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta) *AgentRenderer {
@@ -488,9 +497,14 @@ func (r *AgentRenderer) PromptChoice() (string, error) {
 	return r.ReadPrompt("> ")
 }
 
-func (r *AgentRenderer) PromptApprovalChoice() (string, error) {
-	r.writeBlock("Choose", []string{"1. Allow once", "2. Always allow on this machine", "3. Deny once", "4. Cancel"})
-	return r.ReadPrompt("> ")
+func (r *AgentRenderer) PromptApprovalChoice(current core.RiskLevel) (core.ApprovalDecision, error) {
+	if !current.Valid() {
+		current = core.RiskMedium
+	}
+	if inFile, ok := r.inFile(); ok && term.IsTerminal(int(inFile.Fd())) {
+		return r.readApprovalDecisionRaw(inFile, current)
+	}
+	return r.readApprovalDecisionBuffered(current)
 }
 
 func (r *AgentRenderer) CollectUserInput(action core.Action) (core.ActionResult, error) {
@@ -575,6 +589,20 @@ func (r *AgentRenderer) readPromptBuffered(prefix string) (string, error) {
 	return line, nil
 }
 
+func (r *AgentRenderer) readApprovalDecisionBuffered(current core.RiskLevel) (core.ApprovalDecision, error) {
+	options := approvalDecisionOptions(current)
+	lines := make([]string, 0, len(options))
+	for idx, option := range options {
+		lines = append(lines, fmt.Sprintf("%d. %s", idx+1, option))
+	}
+	r.writeBlock("Choose", lines)
+	line, err := r.readPromptBuffered("> ")
+	if err != nil {
+		return core.ApprovalDecision{}, err
+	}
+	return parseApprovalChoice(line, current), nil
+}
+
 func (r *AgentRenderer) readSecretBuffered(prefix string) (string, error) {
 	fmt.Fprint(r.Out, prefix)
 	if inFile, ok := r.inFile(); ok && term.IsTerminal(int(inFile.Fd())) {
@@ -626,6 +654,44 @@ func (r *AgentRenderer) readPromptRaw(inFile *os.File) (string, error) {
 		if done {
 			return submitted, nil
 		}
+	}
+}
+
+func (r *AgentRenderer) readApprovalDecisionRaw(inFile *os.File, current core.RiskLevel) (core.ApprovalDecision, error) {
+	oldState, err := term.MakeRaw(int(inFile.Fd()))
+	if err != nil {
+		return core.ApprovalDecision{}, err
+	}
+	defer term.Restore(int(inFile.Fd()), oldState)
+	stopResize := r.watchResize()
+	defer stopResize()
+
+	r.mu.Lock()
+	r.lastPrompt = "> "
+	r.overlay = overlayApprovalDecision
+	r.overlayIndex = 0
+	r.blocker = nil
+	r.approvalDecision = &approvalDecisionState{selected: 0, level: current}
+	r.ensureAltScreenLocked()
+	_ = r.drawLocked()
+	r.mu.Unlock()
+
+	for {
+		key, err := r.readKeyFn()
+		if err != nil {
+			return core.ApprovalDecision{}, err
+		}
+		_, done := r.handleKey(key)
+		if !done {
+			continue
+		}
+		r.mu.Lock()
+		result := r.approvalDecision.result
+		r.approvalDecision = nil
+		r.overlay = overlayNone
+		_ = r.drawLocked()
+		r.mu.Unlock()
+		return result, nil
 	}
 }
 
@@ -753,6 +819,9 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 	if r.overlay == overlayBlocker && r.blocker != nil {
 		return r.handleBlockerKeyLocked(key)
 	}
+	if r.overlay == overlayApprovalDecision && r.approvalDecision != nil {
+		return r.handleApprovalDecisionKeyLocked(key)
+	}
 
 	switch key.Kind {
 	case keyPrintable:
@@ -805,6 +874,10 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		switch r.overlay {
 		case overlayHistory:
 			r.moveOverlayLocked(1)
+		case overlayPolicy:
+			if r.overlayIndex == 0 {
+				r.cyclePolicyAutoAcceptLocked(1)
+			}
 		case overlayNone:
 			r.openHistoryOverlayLocked()
 		default:
@@ -817,6 +890,10 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		switch r.overlay {
 		case overlayHistory:
 			r.moveOverlayLocked(-1)
+		case overlayPolicy:
+			if r.overlayIndex == 0 {
+				r.cyclePolicyAutoAcceptLocked(-1)
+			}
 		default:
 			if r.meta.NarratedProgress && len(r.composer) == 0 && r.overlay == overlayNone && r.toggleLatestExpandableLocked() {
 				_ = r.drawLocked()
@@ -861,7 +938,7 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 			_ = r.drawLocked()
 			return "", false
 		case overlayPolicy:
-			r.toggleSelectedPolicyRuleLocked()
+			r.toggleSelectedPolicyEntryLocked()
 			_ = r.drawLocked()
 			return "", false
 		case overlaySlash:
@@ -907,6 +984,46 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 	return "", false
 }
 
+func (r *AgentRenderer) handleApprovalDecisionKeyLocked(key keyPress) (string, bool) {
+	if r.approvalDecision == nil {
+		return "", false
+	}
+	switch key.Kind {
+	case keyUp:
+		r.approvalDecision.selected = (r.approvalDecision.selected + 4) % 5
+	case keyDown:
+		r.approvalDecision.selected = (r.approvalDecision.selected + 1) % 5
+	case keyTab:
+		if r.approvalDecision.selected == 2 {
+			r.approvalDecision.level = cycleRiskLevel(r.approvalDecision.level, 1)
+		}
+	case keyShiftTab:
+		if r.approvalDecision.selected == 2 {
+			r.approvalDecision.level = cycleRiskLevel(r.approvalDecision.level, -1)
+		}
+	case keyEscape:
+		r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}
+		r.approvalDecision.done = true
+	case keyEnter:
+		switch r.approvalDecision.selected {
+		case 0:
+			r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}
+		case 1:
+			r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionAllowAlways}
+		case 2:
+			r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionAutoAccept, AutoAcceptThrough: r.approvalDecision.level}
+		case 3:
+			r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionDenyOnce}
+		default:
+			r.approvalDecision.result = core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}
+		}
+		r.approvalDecision.done = true
+	}
+	r.overlayIndex = r.approvalDecision.selected
+	_ = r.drawLocked()
+	return "", r.approvalDecision.done
+}
+
 func (r *AgentRenderer) handleBlockerKeyLocked(key keyPress) (string, bool) {
 	if r.blocker == nil {
 		return "", false
@@ -914,18 +1031,18 @@ func (r *AgentRenderer) handleBlockerKeyLocked(key keyPress) (string, bool) {
 	switch key.Kind {
 	case keyPrintable:
 		if r.blocker.editingFollow || r.blocker.focus == blockerFocusFollowUpInput {
-			r.blocker.followUp = append(r.blocker.followUp, key.Rune)
+			r.blocker.followUp = sanitizeComposerRunes(append(r.blocker.followUp, key.Rune))
 			r.blocker.focus = blockerFocusFollowUpInput
 		} else {
-			r.blocker.answer = append(r.blocker.answer, key.Rune)
+			r.blocker.answer = sanitizeComposerRunes(append(r.blocker.answer, key.Rune))
 			r.blocker.focus = blockerFocusInput
 		}
 	case keyPaste:
 		if r.blocker.editingFollow || r.blocker.focus == blockerFocusFollowUpInput {
-			r.blocker.followUp = append(r.blocker.followUp, []rune(key.Text)...)
+			r.blocker.followUp = sanitizeComposerRunes(append(r.blocker.followUp, []rune(key.Text)...))
 			r.blocker.focus = blockerFocusFollowUpInput
 		} else {
-			r.blocker.answer = append(r.blocker.answer, []rune(key.Text)...)
+			r.blocker.answer = sanitizeComposerRunes(append(r.blocker.answer, []rune(key.Text)...))
 			r.blocker.focus = blockerFocusInput
 		}
 	case keyBackspace:
@@ -1001,7 +1118,7 @@ func (r *AgentRenderer) insertRuneLocked(ch rune) {
 	if ch < 32 || ch == 127 {
 		return
 	}
-	r.composer = append(r.composer, ch)
+	r.composer = sanitizeComposerRunes(append(r.composer, ch))
 	r.cursor = len(r.composer)
 }
 
@@ -1012,6 +1129,13 @@ func (r *AgentRenderer) insertTextLocked(text string) {
 	}
 	r.composer = append(r.composer, []rune(text)...)
 	r.cursor = len(r.composer)
+}
+
+func sanitizeComposerRunes(value []rune) []rune {
+	if len(value) == 0 {
+		return nil
+	}
+	return []rune(sanitizeComposerText(string(value)))
 }
 
 func (r *AgentRenderer) backspaceLocked() {
@@ -1054,7 +1178,7 @@ func (r *AgentRenderer) openPolicyOverlayLocked() {
 
 func (r *AgentRenderer) updateOverlayLocked() {
 	composer := string(r.composer)
-	if r.overlay == overlayHistory || r.overlay == overlayMode || r.overlay == overlayApproval || r.overlay == overlayModel || r.overlay == overlayPolicy || r.overlay == overlayBlocker {
+	if r.overlay == overlayHistory || r.overlay == overlayMode || r.overlay == overlayApproval || r.overlay == overlayApprovalDecision || r.overlay == overlayModel || r.overlay == overlayPolicy || r.overlay == overlayBlocker {
 		return
 	}
 	if strings.HasPrefix(composer, "/") {
@@ -1087,10 +1211,12 @@ func (r *AgentRenderer) moveOverlayLocked(delta int) {
 		size = 2
 	case overlayApproval:
 		size = len(approvalModes)
+	case overlayApprovalDecision:
+		size = 5
 	case overlayModel:
 		size = len(r.meta.ModelOptions)
 	case overlayPolicy:
-		size = len(r.policyRulesLocked())
+		size = len(r.policyRulesLocked()) + 1
 	case overlaySlash:
 		size = len(r.filteredSlashCommandsLocked())
 	default:
@@ -1632,6 +1758,17 @@ func (r *AgentRenderer) overlayLinesLocked(width int) []string {
 			lines = append(lines, r.overlayOptionLocked(idx, "approval: "+string(mode), ""))
 		}
 		return r.wrapOverlayLines(width, lines)
+	case overlayApprovalDecision:
+		level := core.RiskMedium
+		if r.approvalDecision != nil {
+			level = r.approvalDecision.level
+		}
+		lines := []string{"Choose"}
+		options := approvalDecisionOptions(level)
+		for idx, option := range options {
+			lines = append(lines, r.overlayOptionLocked(idx, option, ""))
+		}
+		return r.wrapOverlayLines(width, lines)
 	case overlayModel:
 		if len(r.meta.ModelOptions) == 0 {
 			return r.wrapOverlayLines(width, []string{"Models", "  no models configured for the active provider"})
@@ -1646,14 +1783,15 @@ func (r *AgentRenderer) overlayLinesLocked(width int) []string {
 		return r.wrapOverlayLines(width, lines)
 	case overlayPolicy:
 		rules := r.policyRulesLocked()
+		lines := []string{"Policy", r.overlayOptionLocked(0, r.policyAutoAcceptLabelLocked(), "enter/tab cycles")}
 		if len(rules) == 0 {
-			return r.wrapOverlayLines(width, []string{"Policy", "  no machine rules yet"})
+			lines = append(lines, "  no machine rules yet")
+			return r.wrapOverlayLines(width, lines)
 		}
-		lines := []string{"Policy"}
 		for idx, rule := range rules {
-			lines = append(lines, r.overlayOptionLocked(idx, formatPolicyRule(rule), ""))
+			lines = append(lines, r.overlayOptionLocked(idx+1, formatPolicyRule(rule), ""))
 		}
-		lines = append(lines, "  enter toggles allow/deny")
+		lines = append(lines, "  enter toggles allow/deny or cycles auto-accept")
 		return r.wrapOverlayLines(width, lines)
 	case overlaySlash:
 		commands := r.filteredSlashCommandsLocked()
@@ -1762,27 +1900,35 @@ func (r *AgentRenderer) policyRulesLocked() []policy.Rule {
 	return rules
 }
 
-func (r *AgentRenderer) clampPolicyIndexLocked() {
-	rules := r.policyRulesLocked()
-	if len(rules) == 0 {
-		r.overlayIndex = 0
-		return
+func (r *AgentRenderer) policyAutoAcceptLabelLocked() string {
+	level, ok, err := r.meta.PolicyStore.AutoAcceptThrough()
+	if err != nil || !ok {
+		return "auto-accept <= OFF"
 	}
+	return fmt.Sprintf("auto-accept <= %s", level)
+}
+
+func (r *AgentRenderer) clampPolicyIndexLocked() {
+	size := len(r.policyRulesLocked()) + 1
 	if r.overlayIndex < 0 {
 		r.overlayIndex = 0
 	}
-	if r.overlayIndex >= len(rules) {
-		r.overlayIndex = len(rules) - 1
+	if r.overlayIndex >= size {
+		r.overlayIndex = size - 1
 	}
 }
 
-func (r *AgentRenderer) toggleSelectedPolicyRuleLocked() {
+func (r *AgentRenderer) toggleSelectedPolicyEntryLocked() {
+	if r.overlayIndex == 0 {
+		r.cyclePolicyAutoAcceptLocked(1)
+		return
+	}
 	rules := r.policyRulesLocked()
 	if len(rules) == 0 {
 		return
 	}
 	r.clampPolicyIndexLocked()
-	selected := rules[r.overlayIndex]
+	selected := rules[r.overlayIndex-1]
 	_ = r.meta.PolicyStore.Remove(selected.ID)
 	if selected.Decision == policy.DecisionAllow {
 		selected.Decision = policy.DecisionDeny
@@ -1792,6 +1938,19 @@ func (r *AgentRenderer) toggleSelectedPolicyRuleLocked() {
 	selected.ID = ""
 	selected.CreatedAt = time.Time{}
 	_, _ = r.meta.PolicyStore.Add(selected)
+}
+
+func (r *AgentRenderer) cyclePolicyAutoAcceptLocked(delta int) {
+	level, ok, err := r.meta.PolicyStore.AutoAcceptThrough()
+	if err != nil {
+		return
+	}
+	next := cycleOptionalRiskLevel(level, ok, delta)
+	if next == "" {
+		_ = r.meta.PolicyStore.ClearAutoAcceptThrough()
+		return
+	}
+	_ = r.meta.PolicyStore.SetAutoAcceptThrough(next)
 }
 
 func (r *AgentRenderer) wrapWithWidth(line string, width int) []string {

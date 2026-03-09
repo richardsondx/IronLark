@@ -81,7 +81,7 @@ func TestSensitiveReadNeedsApproval(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Preview() error = %v", err)
 	}
-	if !engine.actionNeedsApproval(action, report, policypkg.Match{}) {
+	if !engine.actionNeedsApproval(action, report, policypkg.Resolution{}) {
 		t.Fatalf("expected sensitive read to require approval")
 	}
 }
@@ -96,8 +96,41 @@ func TestAllowRuleSuppressesApproval(t *testing.T) {
 	if report.Level != core.RiskMedium {
 		t.Fatalf("expected medium risk report, got %s", report.Level)
 	}
-	if engine.actionNeedsApproval(action, report, policypkg.Match{Matched: true, Decision: policypkg.DecisionAllow}) {
+	if engine.actionNeedsApproval(action, report, policypkg.Resolution{Match: policypkg.Match{Matched: true, Decision: policypkg.DecisionAllow}}) {
 		t.Fatalf("expected allow rule to suppress approval")
+	}
+}
+
+func TestAutoAcceptThresholdSuppressesApproval(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	action := core.Action{Type: core.ActionRunShell, Command: "systemctl restart nginx"}
+	report, err := engine.Executor.Preview(action, false)
+	if err != nil {
+		t.Fatalf("Preview() error = %v", err)
+	}
+	if !engine.actionNeedsApproval(action, report, policypkg.Resolution{}) {
+		t.Fatalf("expected baseline medium-risk action to require approval")
+	}
+	if engine.actionNeedsApproval(action, report, policypkg.Resolution{AutoAcceptThrough: core.RiskMedium}) {
+		t.Fatalf("expected medium auto-accept threshold to suppress approval")
+	}
+	if !engine.actionNeedsApproval(action, report, policypkg.Resolution{AutoAcceptThrough: core.RiskLow}) {
+		t.Fatalf("expected low auto-accept threshold to still require approval")
+	}
+}
+
+func TestAutoAcceptHighSuppressesHighRiskApproval(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	action := core.Action{Type: core.ActionRunShell, Command: "rm -rf /tmp/bad"}
+	report, err := engine.Executor.Preview(action, false)
+	if err != nil {
+		t.Fatalf("Preview() error = %v", err)
+	}
+	if report.Level != core.RiskHigh {
+		t.Fatalf("expected high risk report, got %s", report.Level)
+	}
+	if engine.actionNeedsApproval(action, report, policypkg.Resolution{AutoAcceptThrough: core.RiskHigh}) {
+		t.Fatalf("expected high auto-accept threshold to suppress approval")
 	}
 }
 
@@ -1203,7 +1236,7 @@ func TestRunTaskInjectsGraphDigestIntoPrompt(t *testing.T) {
 
 func TestVerificationRespectsApprovalFlow(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
-	renderer := &trackingRenderer{approvalChoices: []string{"1"}}
+	renderer := &trackingRenderer{approvalChoices: []core.ApprovalDecision{{Kind: core.ApprovalDecisionAllowOnce}}}
 	engine.Renderer = renderer
 	response := core.LLMResponse{
 		Summary: "Verify service.",
@@ -1231,7 +1264,7 @@ func TestVerificationRespectsApprovalFlow(t *testing.T) {
 
 func TestVerificationCanBeDeniedByUser(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
-	renderer := &trackingRenderer{approvalChoices: []string{"3"}}
+	renderer := &trackingRenderer{approvalChoices: []core.ApprovalDecision{{Kind: core.ApprovalDecisionDenyOnce}}}
 	engine.Renderer = renderer
 	response := core.LLMResponse{
 		Summary: "Verify service.",
@@ -1251,6 +1284,37 @@ func TestVerificationCanBeDeniedByUser(t *testing.T) {
 	}
 	if !results[0].Skipped || results[0].Summary != "user declined action" {
 		t.Fatalf("expected declined verification result, got %#v", results[0])
+	}
+}
+
+func TestPromptAutoAcceptPersistsThreshold(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{approvalChoices: []core.ApprovalDecision{{Kind: core.ApprovalDecisionAutoAccept, AutoAcceptThrough: core.RiskMedium}}}
+	engine.Renderer = renderer
+
+	response := core.LLMResponse{
+		Summary: "Restart service.",
+		Actions: []core.Action{{
+			ID:      "1",
+			Type:    core.ActionRunShell,
+			Title:   "restart",
+			Command: "systemctl restart nginx",
+		}},
+	}
+
+	results, _, err := engine.executeTurn(context.Background(), response)
+	if err != nil {
+		t.Fatalf("executeTurn() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Skipped {
+		t.Fatalf("expected action to run after auto accept, got %#v", results)
+	}
+	level, ok, err := engine.PolicyStore.AutoAcceptThrough()
+	if err != nil {
+		t.Fatalf("AutoAcceptThrough() error = %v", err)
+	}
+	if !ok || level != core.RiskMedium {
+		t.Fatalf("expected persisted medium threshold, got %q %t", level, ok)
 	}
 }
 
@@ -1340,7 +1404,7 @@ type trackingRenderer struct {
 	lastApproval        core.ApprovalMode
 	lastInteraction     core.InteractionMode
 	prompts             []string
-	approvalChoices     []string
+	approvalChoices     []core.ApprovalDecision
 	inputResults        []core.ActionResult
 	blockerActions      []core.Action
 	messages            []string
@@ -1377,9 +1441,9 @@ func (r *trackingRenderer) Sessions(records []sessions.Record) error            
 func (r *trackingRenderer) Patches(records []patches.Record) error                   { return nil }
 func (r *trackingRenderer) Checkpoints(records []checkpoints.Record) error           { return nil }
 func (r *trackingRenderer) PromptChoice() (string, error)                            { return "1", nil }
-func (r *trackingRenderer) PromptApprovalChoice() (string, error) {
+func (r *trackingRenderer) PromptApprovalChoice(current core.RiskLevel) (core.ApprovalDecision, error) {
 	if len(r.approvalChoices) == 0 {
-		return "1", nil
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}, nil
 	}
 	choice := r.approvalChoices[0]
 	if len(r.approvalChoices) > 1 {

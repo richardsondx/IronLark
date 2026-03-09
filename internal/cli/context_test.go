@@ -173,13 +173,23 @@ func TestPolicyCommands(t *testing.T) {
 	if err := runCommand([]string{"policy", "allow", "command", "systemctl status"}); err != nil {
 		t.Fatalf("policy allow error = %v", err)
 	}
+	if err := runCommand([]string{"policy", "auto-accept", "medium"}); err != nil {
+		t.Fatalf("policy auto-accept error = %v", err)
+	}
 	listOutput := captureStdout(t, func() error {
 		cmd := NewRootCommand()
 		cmd.SetArgs([]string{"policy", "list"})
 		return cmd.Execute()
 	})
+	if !strings.Contains(listOutput, "auto-accept <= MEDIUM") {
+		t.Fatalf("expected auto accept threshold in list output, got %q", listOutput)
+	}
 	if !strings.Contains(listOutput, "systemctl status") {
 		t.Fatalf("expected policy rule in list output, got %q", listOutput)
+	}
+
+	if err := runCommand([]string{"policy", "auto-accept", "off"}); err != nil {
+		t.Fatalf("policy auto-accept off error = %v", err)
 	}
 }
 

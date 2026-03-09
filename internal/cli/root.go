@@ -296,8 +296,20 @@ func newPolicyCommand(flags *rootFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			autoAcceptThrough, hasAutoAccept, err := application.PolicyStore.AutoAcceptThrough()
+			if err != nil {
+				return err
+			}
 			if application.Runtime.JSONOutput {
-				return application.Renderer.MessageJSON(rules)
+				return application.Renderer.MessageJSON(map[string]any{
+					"auto_accept_through": autoAcceptThrough,
+					"rules":               rules,
+				})
+			}
+			if hasAutoAccept {
+				application.Renderer.Message(fmt.Sprintf("auto-accept <= %s", autoAcceptThrough))
+			} else {
+				application.Renderer.Message("auto-accept disabled")
 			}
 			for _, rule := range rules {
 				application.Renderer.Message(fmt.Sprintf("%s  %s  %s  %s", rule.ID, rule.Decision, rule.Kind, rule.Value))
@@ -307,6 +319,42 @@ func newPolicyCommand(flags *rootFlags) *cobra.Command {
 	})
 	cmd.AddCommand(newPolicyDecisionCommand(flags, policypkg.DecisionAllow))
 	cmd.AddCommand(newPolicyDecisionCommand(flags, policypkg.DecisionDeny))
+	cmd.AddCommand(&cobra.Command{
+		Use:   "auto-accept <off|low|medium|high>",
+		Short: "Set the machine auto-accept risk threshold",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			switch strings.ToLower(strings.TrimSpace(args[0])) {
+			case "off":
+				if err := application.PolicyStore.ClearAutoAcceptThrough(); err != nil {
+					return err
+				}
+				application.Renderer.Message("Disabled machine auto-accept")
+			case "low":
+				if err := application.PolicyStore.SetAutoAcceptThrough(core.RiskLow); err != nil {
+					return err
+				}
+				application.Renderer.Message("Set machine auto-accept <= LOW")
+			case "medium":
+				if err := application.PolicyStore.SetAutoAcceptThrough(core.RiskMedium); err != nil {
+					return err
+				}
+				application.Renderer.Message("Set machine auto-accept <= MEDIUM")
+			case "high":
+				if err := application.PolicyStore.SetAutoAcceptThrough(core.RiskHigh); err != nil {
+					return err
+				}
+				application.Renderer.Message("Set machine auto-accept <= HIGH")
+			default:
+				return fmt.Errorf("unknown auto-accept level %q", args[0])
+			}
+			return nil
+		},
+	})
 	cmd.AddCommand(&cobra.Command{
 		Use:   "remove <id>",
 		Short: "Remove a policy rule",
@@ -750,7 +798,27 @@ func newRunCommand(flags *rootFlags) *cobra.Command {
 			if application.Runtime.ApprovalMode == core.ApprovalSuggest {
 				return nil
 			}
-			if application.Executor.Classifier.NeedsApproval(action, report, application.Runtime.ApprovalMode, application.Runtime.Config.Security.AutoApproveReadTools, application.Runtime.ReadOnly) {
+			resolution, err := application.PolicyStore.Resolve(action)
+			if err != nil {
+				return err
+			}
+			if resolution.Match.Matched && resolution.Match.Decision == policypkg.DecisionDeny {
+				application.Renderer.Result(core.ActionResult{
+					Action:   action,
+					Risk:     report,
+					Skipped:  true,
+					Summary:  "blocked by machine policy",
+					Approved: false,
+				})
+				return nil
+			}
+			needsApproval := true
+			if resolution.AutoAcceptThrough.Covers(report.Level) || (resolution.Match.Matched && resolution.Match.Decision == policypkg.DecisionAllow && report.Level != core.RiskHigh) {
+				needsApproval = false
+			} else if !application.Executor.Classifier.IsSensitiveAction(action) {
+				needsApproval = application.Executor.Classifier.NeedsApproval(action, report, application.Runtime.ApprovalMode, application.Runtime.Config.Security.AutoApproveReadTools, application.Runtime.ReadOnly)
+			}
+			if needsApproval {
 				ok, err := application.Renderer.Confirm(action.Title, application.Executor.Classifier.RequiresDoubleConfirm(report))
 				if err != nil {
 					return err

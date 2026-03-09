@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/richardsondx/IronLark/internal/checkpoints"
 	ctxpkg "github.com/richardsondx/IronLark/internal/context"
@@ -15,6 +16,22 @@ import (
 	"github.com/richardsondx/IronLark/internal/sessions"
 	"golang.org/x/term"
 )
+
+type approvalKeyKind int
+
+const (
+	approvalKeyUnknown approvalKeyKind = iota
+	approvalKeyEnter
+	approvalKeyUp
+	approvalKeyDown
+	approvalKeyEscape
+	approvalKeyTab
+	approvalKeyShiftTab
+)
+
+type approvalKey struct {
+	Kind approvalKeyKind
+}
 
 type Renderer struct {
 	In    *bufio.Reader
@@ -50,7 +67,7 @@ type UI interface {
 	Patches(records []patches.Record) error
 	Checkpoints(records []checkpoints.Record) error
 	PromptChoice() (string, error)
-	PromptApprovalChoice() (string, error)
+	PromptApprovalChoice(current core.RiskLevel) (core.ApprovalDecision, error)
 	CollectUserInput(action core.Action) (core.ActionResult, error)
 	Confirm(label string, double bool) (bool, error)
 	ReadPrompt(prefix string) (string, error)
@@ -321,13 +338,24 @@ func (r *Renderer) PromptChoice() (string, error) {
 	return r.readLine(r.prompt("> "))
 }
 
-func (r *Renderer) PromptApprovalChoice() (string, error) {
+func (r *Renderer) PromptApprovalChoice(current core.RiskLevel) (core.ApprovalDecision, error) {
+	if !current.Valid() {
+		current = core.RiskMedium
+	}
+	if file := r.rawIn; file != nil && term.IsTerminal(int(file.Fd())) {
+		return r.readApprovalChoiceRaw(file, current)
+	}
 	fmt.Fprintf(r.Out, "\n%s:\n", r.heading("Choose"))
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("1."), "Allow once")
 	fmt.Fprintf(r.Out, "%s %s\n", r.accent("2."), "Always allow on this machine")
-	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), "Deny once")
-	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Cancel")
-	return r.readLine(r.prompt("> "))
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("3."), fmt.Sprintf("Auto-accept (<=%s)", current))
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("4."), "Deny once")
+	fmt.Fprintf(r.Out, "%s %s\n", r.accent("5."), "Cancel")
+	line, err := r.readLine(r.prompt("> "))
+	if err != nil {
+		return core.ApprovalDecision{}, err
+	}
+	return parseApprovalChoice(line, current), nil
 }
 
 func (r *Renderer) CollectUserInput(action core.Action) (core.ActionResult, error) {
@@ -481,6 +509,198 @@ func (r *Renderer) readUserInputAction(action core.Action) (string, core.InputRe
 
 func (r *Renderer) readSecretLine(prefix string) (string, error) {
 	return r.readLine(prefix)
+}
+
+func parseApprovalChoice(line string, current core.RiskLevel) core.ApprovalDecision {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) == 0 {
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}
+	}
+	switch fields[0] {
+	case "1":
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}
+	case "2":
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowAlways}
+	case "3":
+		level := current
+		if len(fields) > 1 {
+			switch strings.ToUpper(fields[1]) {
+			case string(core.RiskLow):
+				level = core.RiskLow
+			case string(core.RiskMedium):
+				level = core.RiskMedium
+			case string(core.RiskHigh):
+				level = core.RiskHigh
+			}
+		}
+		if !level.Valid() {
+			level = core.RiskMedium
+		}
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionAutoAccept, AutoAcceptThrough: level}
+	case "4":
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionDenyOnce}
+	default:
+		return core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}
+	}
+}
+
+func (r *Renderer) readApprovalChoiceRaw(inFile *os.File, current core.RiskLevel) (core.ApprovalDecision, error) {
+	oldState, err := term.MakeRaw(int(inFile.Fd()))
+	if err != nil {
+		return core.ApprovalDecision{}, err
+	}
+	defer term.Restore(int(inFile.Fd()), oldState)
+
+	selected := 0
+	level := current
+	for {
+		r.drawApprovalChoice(selected, level)
+		key, err := r.readApprovalKey()
+		if err != nil {
+			return core.ApprovalDecision{}, err
+		}
+		switch key.Kind {
+		case approvalKeyUp:
+			selected = (selected + 4) % 5
+		case approvalKeyDown:
+			selected = (selected + 1) % 5
+		case approvalKeyTab:
+			if selected == 2 {
+				level = cycleRiskLevel(level, 1)
+			}
+		case approvalKeyShiftTab:
+			if selected == 2 {
+				level = cycleRiskLevel(level, -1)
+			}
+		case approvalKeyEnter:
+			switch selected {
+			case 0:
+				return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowOnce}, nil
+			case 1:
+				return core.ApprovalDecision{Kind: core.ApprovalDecisionAllowAlways}, nil
+			case 2:
+				return core.ApprovalDecision{Kind: core.ApprovalDecisionAutoAccept, AutoAcceptThrough: level}, nil
+			case 3:
+				return core.ApprovalDecision{Kind: core.ApprovalDecisionDenyOnce}, nil
+			default:
+				return core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}, nil
+			}
+		case approvalKeyEscape:
+			return core.ApprovalDecision{Kind: core.ApprovalDecisionCancel}, nil
+		}
+	}
+}
+
+func (r *Renderer) drawApprovalChoice(selected int, level core.RiskLevel) {
+	options := approvalDecisionOptions(level)
+	fmt.Fprintf(r.Out, "\r\033[J\n%s:\n", r.heading("Choose"))
+	for idx, option := range options {
+		prefix := "  "
+		if idx == selected {
+			prefix = "> "
+		}
+		fmt.Fprintf(r.Out, "%s%s %s\n", prefix, r.accent(fmt.Sprintf("%d.", idx+1)), option)
+	}
+}
+
+func approvalDecisionOptions(level core.RiskLevel) []string {
+	return []string{
+		"Allow once",
+		"Always allow on this machine",
+		fmt.Sprintf("Auto-accept (<=%s)  Tab to change", level),
+		"Deny once",
+		"Cancel",
+	}
+}
+
+func approvalDecisionLines(level core.RiskLevel, selected int) []string {
+	options := approvalDecisionOptions(level)
+	lines := make([]string, 0, len(options))
+	for idx, option := range options {
+		prefix := "  "
+		if idx == selected {
+			prefix = "> "
+		}
+		lines = append(lines, fmt.Sprintf("%s%d. %s", prefix, idx+1, option))
+	}
+	return lines
+}
+
+func cycleRiskLevel(level core.RiskLevel, delta int) core.RiskLevel {
+	levels := []core.RiskLevel{core.RiskLow, core.RiskMedium, core.RiskHigh}
+	index := 1
+	for i, candidate := range levels {
+		if candidate == level {
+			index = i
+			break
+		}
+	}
+	index = (index + delta + len(levels)) % len(levels)
+	return levels[index]
+}
+
+func cycleOptionalRiskLevel(level core.RiskLevel, enabled bool, delta int) core.RiskLevel {
+	levels := []core.RiskLevel{"", core.RiskLow, core.RiskMedium, core.RiskHigh}
+	index := 0
+	if enabled && level.Valid() {
+		for i, candidate := range levels {
+			if candidate == level {
+				index = i
+				break
+			}
+		}
+	}
+	index = (index + delta + len(levels)) % len(levels)
+	return levels[index]
+}
+
+func (r *Renderer) readApprovalKey() (approvalKey, error) {
+	b, err := r.In.ReadByte()
+	if err != nil {
+		return approvalKey{}, err
+	}
+	switch b {
+	case '\r', '\n':
+		return approvalKey{Kind: approvalKeyEnter}, nil
+	case '\t':
+		return approvalKey{Kind: approvalKeyTab}, nil
+	case 27:
+		next, ok := r.readApprovalEscByte()
+		if !ok {
+			return approvalKey{Kind: approvalKeyEscape}, nil
+		}
+		if next == '[' {
+			code, ok := r.readApprovalEscByte()
+			if !ok {
+				return approvalKey{Kind: approvalKeyEscape}, nil
+			}
+			switch code {
+			case 'A':
+				return approvalKey{Kind: approvalKeyUp}, nil
+			case 'B':
+				return approvalKey{Kind: approvalKeyDown}, nil
+			case 'Z':
+				return approvalKey{Kind: approvalKeyShiftTab}, nil
+			}
+		}
+		return approvalKey{Kind: approvalKeyEscape}, nil
+	default:
+		return approvalKey{Kind: approvalKeyUnknown}, nil
+	}
+}
+
+func (r *Renderer) readApprovalEscByte() (byte, bool) {
+	for i := 0; i < 25; i++ {
+		if r.In.Buffered() > 0 {
+			b, err := r.In.ReadByte()
+			if err == nil {
+				return b, true
+			}
+			return 0, false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return 0, false
 }
 
 func (r *Renderer) formatDiffLine(line string) string {
