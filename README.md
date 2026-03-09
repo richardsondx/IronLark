@@ -2,6 +2,8 @@
 
 IronLark is an SSH-first AI terminal assistant built for the moment when you SSH into a machine, hit a problem, and want AI help without leaving the terminal.
 
+[![Image from Gyazo](https://i.gyazo.com/d9fb22c9211e51c94286f039922bbc03.gif)](https://gyazo.com/d9fb22c9211e51c94286f039922bbc03)
+
 ## Why IronLark
 
 Use IronLark when you want AI that feels natural inside an SSH session:
