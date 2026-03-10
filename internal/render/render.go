@@ -60,6 +60,7 @@ type UI interface {
 	SetInteraction(mode core.InteractionMode)
 	SetApproval(mode core.ApprovalMode)
 	SetModelContext(provider, model string, options []string)
+	SetOpsSummary(summary string)
 	SetSecretVisibility(visible bool)
 	SecretVisibility() string
 	ClearScreen()
@@ -292,6 +293,8 @@ func (r *Renderer) SetInteraction(mode core.InteractionMode) {}
 func (r *Renderer) SetApproval(mode core.ApprovalMode) {}
 
 func (r *Renderer) SetModelContext(provider, model string, options []string) {}
+
+func (r *Renderer) SetOpsSummary(summary string) {}
 
 func (r *Renderer) SetSecretVisibility(visible bool) {}
 

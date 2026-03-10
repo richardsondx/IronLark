@@ -1,24 +1,34 @@
 # IronLark
 
-IronLark is an SSH-first AI terminal assistant built for the moment when you SSH into a machine, hit a problem, and want AI help without leaving the terminal.
+IronLark is an SSH-first AI terminal operator built for the moment when you SSH into a machine, hit a problem, and want an agent that can inspect, fix, watch, and report back without leaving the terminal.
 
 [![Image from Gyazo](https://i.gyazo.com/d9fb22c9211e51c94286f039922bbc03.gif)](https://gyazo.com/d9fb22c9211e51c94286f039922bbc03)
 
 ## Why IronLark
 
-Use IronLark when you want AI that feels natural inside an SSH session:
-- inspect a server
-- read logs and config files
-- search a repo
-- suggest or apply small patches
-- keep short-term memory across one-shot commands in the same shell
-- execute obvious safe inspection work immediately
-- keep explicit approval around risky actions
-- work well on a remote box such as a DigitalOcean droplet
+Use IronLark when you want an agent that feels native inside an SSH session and can take responsibility for machine outcomes:
+- inspect a server, logs, configs, processes, ports, and repos
+- keep persistent shell-scoped context across one-shot commands and `lk agent`
+- recover a service in the background and come back only when it is healthy or clearly blocked
+- watch a service continuously, capture evidence, and handle obvious restart-only incidents automatically
+- keep a separate operational memory of watchers, recoveries, incidents, and audit trails
+- give you an emergency control plane with `lk ps` to inspect, stop, or kill live background agents
+- execute obvious safe inspection work immediately while preserving explicit approval boundaries for risky actions
 
 IronLark is intentionally opinionated toward terminal and server workflows, not IDE-first workflows.
 
 IronLark is intentionally lightweight: a single Go binary that runs entirely inside the terminal, with no browser, IDE, or desktop dependencies. The policy system is focused on safe shell and file operations, and installing is just downloading the binary into `~/.local/bin` (no daemon or service required).
+
+## What Makes IronLark Different
+
+IronLark is built around terminal-native operational workflows, not just prompt-response assistance:
+
+- **SSH-first operator experience**: work directly on the remote box where the problem lives
+- **Persistent machine memory**: graph snapshots, recent changes, incidents, and background task state stay local to the machine
+- **Background ops runtime**: watchers and recoveries run outside your current chat turn
+- **Outcome-oriented workflows**: ask IronLark to restore a service or keep it healthy, not just suggest the next command
+- **Emergency controls**: `lk ps` shows live IronLark processes so you can stop token bleed or kill a stuck run fast
+- **Readable audit trail**: evidence bundles, progress logs, incident summaries, and command history remain inspectable after the fact
 ## Quick Start
 
 ### Local machine
@@ -88,6 +98,7 @@ lk version
 lk model
 lk config test
 lk "what can you help me do on this server?"
+lk agent
 ```
 
 Try a file edit:
@@ -120,6 +131,58 @@ You can also review a config change directly on the droplet:
 lk edit /etc/ssh/sshd_config "disable password authentication and preserve the rest of the file"
 ```
 
+## Operator Workflows
+
+IronLark is strongest when you use it for delegated terminal work, not just one-shot questions.
+
+### Recover a service
+
+Start an interactive session:
+
+```bash
+lk agent
+```
+
+Then ask in plain English or use the explicit command:
+
+```text
+/recover openclaw
+```
+
+or
+
+```bash
+lk recover "restore openclaw and keep going until it is stable"
+```
+
+Recovery runs are durable background jobs. They keep progress, timeline events, evidence, and a progress log under the local Lark data directory.
+
+### Watch a service
+
+```text
+/watch openclaw
+```
+
+or
+
+```bash
+lk watch openclaw
+```
+
+Watchers use the graph plus active probes to monitor a service, capture evidence first, and apply a narrow restart-only remediation only when the cause looks obvious enough.
+
+### Inspect background ops work
+
+```bash
+lk ps
+lk watch list
+lk watch report openclaw
+lk recover list
+lk recover report <run-id>
+```
+
+`lk ps` is the emergency control plane for live IronLark work. It shows active watchers, recoveries, and agent sessions with pid, state, age, last activity, and token usage.
+
 ## First Commands To Try
 
 ```bash
@@ -129,11 +192,16 @@ lk "what's my ip?"
 lk "remember that my project is in /opt/"
 lk "what did we just find?"
 lk --plan "debug why nginx won't start"
+lk agent
+lk watch openclaw
+lk recover "restore openclaw and keep going until it is healthy"
+lk ps
+lk watch list
+lk recover list
 lk context
 lk context window
 lk policy list
 lk inspect
-lk chat
 lk history
 lk version
 lk update
@@ -148,6 +216,7 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk --plan "task"`: show a visible plan before execution
 - `lk plan "task"`: explicit plan-first mode
 - `lk chat`: interactive shared-context session that also writes to the current thread store
+- `lk agent`: interactive SSH-first operator session with slash-command shortcuts for background ops
 - `lk context`: show the active persistent context thread
 - `lk context window`: show the current context-window usage and replay preview
 - `lk context clear`: clear the active thread history but keep the thread record
@@ -162,6 +231,13 @@ lk edit ./README.md "rewrite the first sentence to be clearer"
 - `lk inspect [system|repo]`: inspect the current machine or repo
 - `lk edit <path> [instruction]`: patch a file with diff approval
 - `lk run "<command>"`: run a shell command with policy guardrails
+- `lk watch <query>`: start a background watcher for a service, container, or app
+- `lk watch list|status|report|stop`: inspect and manage watchers
+- `lk recover <goal>`: start a background recovery run for a target outcome
+- `lk recover list|status|report|stop`: inspect and manage recovery runs
+- `lk ps`: list active IronLark processes across agent sessions, watchers, and recovery runs
+- `lk ps stop <id|pid>`: gracefully stop a background IronLark process
+- `lk ps kill <id|pid>`: force kill a background IronLark process
 - `lk history [sessions|patches|checkpoints]`: show local history
 - `lk undo <patch-id>`: restore a saved file backup
 - `lk restore <checkpoint-id>`: restore a saved checkpoint snapshot
@@ -223,6 +299,9 @@ Relevant config keys in `~/.config/lark/config.yaml`:
 interaction_mode: execute-first
 ui:
   narrated_progress: false
+tools:
+  soft_turns: 5
+  max_turns: 12
 thread:
   enabled: true
   scope: auto-shell
@@ -234,6 +313,33 @@ thread:
 ```
 
 Set `ui.narrated_progress: true` to enable the narrated progress timeline in the interactive `lk agent` TUI. Plain one-shot output and JSON mode keep the existing behavior.
+`tools.soft_turns` is the normal execution budget. `tools.max_turns` is the hard cap, and IronLark now stops explicitly as incomplete if it reaches that cap before a `finish` action.
+
+### Background Ops Runtime
+
+Watchers and recovery runs are stored separately from the main chat transcript so they can continue working while you do something else.
+
+- watchers live under the local ops data directory
+- recovery runs keep `spec.json`, `state.json`, `timeline.jsonl`, `progress.md`, and evidence bundles
+- incidents are persisted so you can ask later what happened
+- `lk agent` shows a compact ops summary in the header when background work exists
+- `/ops`, `/watch <query>`, and `/recover <goal>` are available directly inside `lk agent`
+
+Typical flow:
+
+```text
+lk agent
+/watch openclaw
+/ops
+```
+
+Then later:
+
+```text
+what happened overnight?
+```
+
+IronLark can use operational memory to answer from recent watchers, recoveries, and incidents.
 
 ### Machine Policy
 
@@ -283,6 +389,12 @@ IronLark can currently use terminal-native tools for:
 - inline checkpoints before edits
 - command execution with policy checks
 - persistent short-term thread context across one-shot commands
+- persistent graph-backed machine memory
+- background watcher and recovery runtimes
+- incident evidence capture and reporting
+- process-level emergency control through `lk ps`
+
+With the default `openai` provider, planning and web search run through the OpenAI Responses API. Other `openai-compatible` providers continue using the local web-search fallback.
 
 ## Local Development
 

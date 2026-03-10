@@ -150,7 +150,7 @@ func TestModelCommandShowsCurrentAndOptions(t *testing.T) {
 	for _, fragment := range []string{
 		"Current model: gpt-4.1-mini",
 		"Available model options:",
-		"openai: gpt-4.1-mini, gpt-5-mini",
+		"openai: gpt-4.1-mini, gpt-5, gpt-5-mini",
 		"openrouter: openai/gpt-4.1-mini",
 	} {
 		if !strings.Contains(output, fragment) {

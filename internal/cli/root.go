@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -85,9 +86,12 @@ func NewRootCommand() *cobra.Command {
 
 	cmd.AddCommand(newChatCommand(flags))
 	cmd.AddCommand(newAgentCommand(flags))
+	cmd.AddCommand(newPSCommand(flags))
 	cmd.AddCommand(newPlanCommand(flags))
 	cmd.AddCommand(newContextCommand(flags))
 	cmd.AddCommand(newGraphCommand(flags))
+	cmd.AddCommand(newWatchCommand(flags))
+	cmd.AddCommand(newRecoverCommand(flags))
 	cmd.AddCommand(newPolicyCommand(flags))
 	cmd.AddCommand(newInspectCommand(flags))
 	cmd.AddCommand(newEditCommand(flags))
@@ -773,11 +777,14 @@ func newEditCommand(flags *rootFlags) *cobra.Command {
 }
 
 func newRunCommand(flags *rootFlags) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "run <command>",
 		Short: "Run a shell command with policy guardrails",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return runShellRunList(flags)
+			}
 			application, err := buildApp(flags)
 			if err != nil {
 				return err
@@ -832,6 +839,140 @@ func newRunCommand(flags *rootFlags) *cobra.Command {
 			return err
 		},
 	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "list",
+		Short: "List durable shell runs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runShellRunList(flags)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "show <id>",
+		Short: "Show durable shell run status",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return showShellRun(flags, args[0])
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "logs <id>",
+		Short: "Show durable shell run logs",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return showShellRunLogs(flags, args[0])
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "stop <id>",
+		Short: "Stop a durable shell run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return stopOrKillProcess(cmd.Context(), flags, args[0], syscall.SIGTERM)
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "kill <id>",
+		Short: "Kill a durable shell run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return stopOrKillProcess(cmd.Context(), flags, args[0], syscall.SIGKILL)
+		},
+	})
+	var shellRunID string
+	cmd.AddCommand(&cobra.Command{
+		Use:          "__exec",
+		Short:        "Internal durable shell run executor",
+		Hidden:       true,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			application, err := buildApp(flags)
+			if err != nil {
+				return err
+			}
+			return application.Ops.RunShellRun(cmd.Context(), buildOpsDeps(application), shellRunID)
+		},
+	})
+	hidden := cmd.Commands()[len(cmd.Commands())-1]
+	hidden.Flags().StringVar(&shellRunID, "id", "", "shell run id")
+	_ = hidden.MarkFlagRequired("id")
+	return cmd
+}
+
+func runShellRunList(flags *rootFlags) error {
+	application, err := buildApp(flags)
+	if err != nil {
+		return err
+	}
+	runs, err := application.Ops.ListShellRuns()
+	if err != nil {
+		return err
+	}
+	if application.Runtime.JSONOutput {
+		return application.Renderer.MessageJSON(runs)
+	}
+	for _, run := range runs {
+		application.Renderer.Message(fmt.Sprintf("%s  %-10s  %s", run.Spec.ID, run.State.State, summarizeCommand(run.Spec.Command)))
+	}
+	return nil
+}
+
+func showShellRun(flags *rootFlags, id string) error {
+	application, err := buildApp(flags)
+	if err != nil {
+		return err
+	}
+	run, err := application.Ops.LoadShellRunStatus(id)
+	if err != nil {
+		return err
+	}
+	if run.Spec.ID == "" {
+		return fmt.Errorf("shell run %q was not found", id)
+	}
+	if application.Runtime.JSONOutput {
+		return application.Renderer.MessageJSON(run)
+	}
+	application.Renderer.Message(fmt.Sprintf("Shell run: %s", run.Spec.ID))
+	application.Renderer.Message(fmt.Sprintf("State: %s", run.State.State))
+	application.Renderer.Message(fmt.Sprintf("Command: %s", run.Spec.Command))
+	application.Renderer.Message(fmt.Sprintf("Summary: %s", run.State.LastSummary))
+	if run.State.LastError != "" {
+		application.Renderer.Message(fmt.Sprintf("Error: %s", run.State.LastError))
+	}
+	if run.State.StdoutPreview != "" {
+		application.Renderer.Message("Stdout preview:\n" + run.State.StdoutPreview)
+	}
+	if run.State.StderrPreview != "" {
+		application.Renderer.Message("Stderr preview:\n" + run.State.StderrPreview)
+	}
+	return nil
+}
+
+func showShellRunLogs(flags *rootFlags, id string) error {
+	application, err := buildApp(flags)
+	if err != nil {
+		return err
+	}
+	run, err := application.Ops.LoadShellRunStatus(id)
+	if err != nil {
+		return err
+	}
+	if run.Spec.ID == "" {
+		return fmt.Errorf("shell run %q was not found", id)
+	}
+	report := map[string]string{
+		"stdout": run.State.StdoutPreview,
+		"stderr": run.State.StderrPreview,
+	}
+	if application.Runtime.JSONOutput {
+		return application.Renderer.MessageJSON(report)
+	}
+	if run.State.StdoutPreview != "" {
+		application.Renderer.Message("stdout:\n" + run.State.StdoutPreview)
+	}
+	if run.State.StderrPreview != "" {
+		application.Renderer.Message("stderr:\n" + run.State.StderrPreview)
+	}
+	return nil
 }
 
 func newHistoryCommand(flags *rootFlags) *cobra.Command {
@@ -1064,11 +1205,8 @@ func validateModelForProvider(providerName, model string) error {
 	}
 	switch providerName {
 	case "openai":
-		if strings.Contains(model, "codex") {
-			return fmt.Errorf("model %q is not supported by IronLark's current OpenAI chat-completions client; use gpt-5-mini instead", model)
-		}
 		if strings.Contains(model, "/") {
-			return fmt.Errorf("model %q is not a valid raw OpenAI model ID; use values like gpt-5-mini or gpt-4.1-mini", model)
+			return fmt.Errorf("model %q is not a valid raw OpenAI model ID; use values like gpt-5-mini, gpt-4.1-mini, or gpt-5", model)
 		}
 	}
 	return nil
@@ -1156,6 +1294,16 @@ func firstArg(args []string) string {
 		return ""
 	}
 	return args[0]
+}
+
+func summarizeCommand(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func providerSmokeTest(ctx context.Context, application *app.App) error {

@@ -15,6 +15,7 @@ var (
 		"cat":        nil,
 		"ls":         nil,
 		"pwd":        nil,
+		"printf":     nil,
 		"id":         nil,
 		"whoami":     nil,
 		"uname":      nil,
@@ -85,7 +86,7 @@ func (c *Classifier) Classify(action core.Action, readOnly bool) (core.RiskRepor
 			report.Reason = "blocked by read-only mode"
 		}
 		return report, nil
-	case core.ActionReadFiles, core.ActionListDir, core.ActionSearchFiles, core.ActionSemanticSearch, core.ActionWebSearch, core.ActionFetchRules:
+	case core.ActionReadFiles, core.ActionListDir, core.ActionSearchFiles, core.ActionSemanticSearch, core.ActionWebSearch, core.ActionFetchRules, core.ActionFetchOps:
 		return core.RiskReport{
 			Level:              c.actionPathRisk(action),
 			TouchesSystemFiles: c.actionTouchesSystemPath(action),

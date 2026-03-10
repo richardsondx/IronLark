@@ -40,20 +40,21 @@ type AgentMeta struct {
 	Interaction      core.InteractionMode
 	NarratedProgress bool
 	PolicyStore      policy.Store
+	OpsSummary       string
 }
 
 type overlayKind string
 
 const (
-	overlayNone     overlayKind = ""
-	overlayHistory  overlayKind = "history"
-	overlayMode     overlayKind = "mode"
-	overlayApproval overlayKind = "approval"
+	overlayNone             overlayKind = ""
+	overlayHistory          overlayKind = "history"
+	overlayMode             overlayKind = "mode"
+	overlayApproval         overlayKind = "approval"
 	overlayApprovalDecision overlayKind = "approval_decision"
-	overlayModel    overlayKind = "model"
-	overlayPolicy   overlayKind = "policy"
-	overlaySlash    overlayKind = "slash"
-	overlayBlocker  overlayKind = "blocker"
+	overlayModel            overlayKind = "model"
+	overlayPolicy           overlayKind = "policy"
+	overlaySlash            overlayKind = "slash"
+	overlayBlocker          overlayKind = "blocker"
 )
 
 type keyKind int
@@ -118,37 +119,37 @@ type AgentRenderer struct {
 	meta  AgentMeta
 	rawIn *os.File
 
-	mu             sync.Mutex
-	transcript     []string
-	entries        []TranscriptEntry
-	scrollOffset   int
-	composer       []rune
-	cursor         int
-	promptHistory  []string
-	historyIndex   int
-	historyDraft   []rune
-	overlay        overlayKind
-	overlayIndex   int
-	thinking       bool
-	thinkingLabel  string
-	thinkingFrame  int
-	thinkingStop   chan struct{}
-	actionStatus   string
-	actionFrame    int
-	actionStop     chan struct{}
-	activePhase    string
-	lastPrompt     string
-	slashCommands  []slashCommand
-	secretVisible  bool
-	readKeyFn      func() (keyPress, error)
-	sizeFn         func() (int, int)
-	redrawInterval time.Duration
-	altScreen      bool
-	blocker        *blockerState
-	nowFn          func() time.Time
-	lastFrame      []string
-	lastWidth      int
-	cursorHidden   bool
+	mu               sync.Mutex
+	transcript       []string
+	entries          []TranscriptEntry
+	scrollOffset     int
+	composer         []rune
+	cursor           int
+	promptHistory    []string
+	historyIndex     int
+	historyDraft     []rune
+	overlay          overlayKind
+	overlayIndex     int
+	thinking         bool
+	thinkingLabel    string
+	thinkingFrame    int
+	thinkingStop     chan struct{}
+	actionStatus     string
+	actionFrame      int
+	actionStop       chan struct{}
+	activePhase      string
+	lastPrompt       string
+	slashCommands    []slashCommand
+	secretVisible    bool
+	readKeyFn        func() (keyPress, error)
+	sizeFn           func() (int, int)
+	redrawInterval   time.Duration
+	altScreen        bool
+	blocker          *blockerState
+	nowFn            func() time.Time
+	lastFrame        []string
+	lastWidth        int
+	cursorHidden     bool
 	approvalDecision *approvalDecisionState
 }
 
@@ -165,6 +166,9 @@ func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta
 			{Label: "model", Execute: "/model"},
 			{Label: "provider", Execute: "/provider"},
 			{Label: "policy", Execute: "/policy"},
+			{Label: "ops", Execute: "/ops"},
+			{Label: "watch", Execute: "/watch "},
+			{Label: "recover", Execute: "/recover "},
 			{Label: "clear", Execute: "/clear"},
 			{Label: "help", Execute: "/help"},
 			{Label: "exit", Execute: "/exit"},
@@ -256,16 +260,59 @@ func (r *AgentRenderer) ActionProgress(action core.Action) {
 		return
 	}
 	r.setActionStatus(firstNonEmpty(r.activePhase, "Running "+label+"..."))
+	details := actionProgressDetails(action, r.meta.Provider)
 	r.mu.Lock()
 	r.appendEntryLocked(TranscriptEntry{
 		Kind:     transcriptEntryAction,
 		Title:    actionTimelineTitle(action),
 		Summary:  action.Reason,
+		Details:  details,
+		Expanded: len(details) > 0 && len(details) <= 4,
 		Status:   string(core.NarrativeRunning),
 		ActionID: action.ID,
 	})
 	_ = r.drawLocked()
 	r.mu.Unlock()
+}
+
+func actionProgressDetails(action core.Action, provider string) []string {
+	if action.Type != core.ActionWebSearch {
+		return nil
+	}
+	query := strings.TrimSpace(firstNonEmpty(action.Query, action.Pattern, action.Title))
+	if query == "" {
+		return nil
+	}
+	details := []string{
+		"provider: " + firstNonEmpty(strings.TrimSpace(provider), "local"),
+		"query: " + query,
+	}
+	if sites := extractSearchSites(query); len(sites) > 0 {
+		details = append(details, "site filters: "+strings.Join(sites, ", "))
+	}
+	return details
+}
+
+func extractSearchSites(query string) []string {
+	fields := strings.Fields(query)
+	sites := make([]string, 0, len(fields))
+	seen := map[string]struct{}{}
+	for _, field := range fields {
+		if !strings.HasPrefix(strings.ToLower(field), "site:") {
+			continue
+		}
+		site := strings.TrimSpace(strings.TrimPrefix(field, "site:"))
+		site = strings.Trim(site, "\"'(),")
+		if site == "" {
+			continue
+		}
+		if _, ok := seen[site]; ok {
+			continue
+		}
+		seen[site] = struct{}{}
+		sites = append(sites, site)
+	}
+	return sites
 }
 
 func (r *AgentRenderer) StreamActionOutput(action core.Action, chunk core.ActionOutputChunk) {
@@ -428,6 +475,13 @@ func (r *AgentRenderer) SetModelContext(provider, model string, options []string
 	r.meta.Provider = provider
 	r.meta.Model = model
 	r.meta.ModelOptions = append([]string(nil), options...)
+	_ = r.drawLocked()
+}
+
+func (r *AgentRenderer) SetOpsSummary(summary string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.meta.OpsSummary = strings.TrimSpace(summary)
 	_ = r.drawLocked()
 }
 
@@ -1518,7 +1572,8 @@ func (r *AgentRenderer) writeBlock(title string, lines []string) {
 func (r *AgentRenderer) drawLocked() error {
 	width, height := r.sizeFn()
 	header := r.headerLines(width, height)
-	bodyHeight := height - len(header) - 4
+	promptLines := r.promptLinesLocked(width)
+	bodyHeight := height - len(header) - len(promptLines) - 3
 	if bodyHeight < 4 {
 		bodyHeight = 4
 	}
@@ -1570,7 +1625,11 @@ func (r *AgentRenderer) drawLocked() error {
 	}
 	frame = append(frame,
 		truncateDisplay(r.statusLineLocked(width), width),
-		truncateDisplay(r.promptLineLocked(width), width),
+	)
+	for _, line := range promptLines {
+		frame = append(frame, truncateDisplay(line, width))
+	}
+	frame = append(frame,
 		truncateDisplay(r.inputBorderLineLocked(width), width),
 		truncateDisplay(r.footerLineLocked(width), width),
 	)
@@ -1583,13 +1642,16 @@ func (r *AgentRenderer) drawLocked() error {
 	if len(frame) > height {
 		frame = frame[:height]
 	}
-	return r.renderFrameLocked(frame, width)
+	cursorRow, cursorCol := r.promptCursorPositionLocked(width, len(header), bodyHeight, len(overlayLines))
+	return r.renderFrameLocked(frame, width, cursorRow, cursorCol)
 }
 
 func (r *AgentRenderer) headerLines(width, height int) []string {
-	return []string{
-		truncateDisplay(" SSH-first ai agent. Tab opens prompt history. Type / for command menu. ", width),
+	line := " SSH-first ai agent. Tab opens prompt history. Type / for command menu. "
+	if strings.TrimSpace(r.meta.OpsSummary) != "" {
+		line += " | " + r.meta.OpsSummary + " "
 	}
+	return []string{truncateDisplay(line, width)}
 }
 
 func (r *AgentRenderer) shouldShowWelcomeLocked() bool {
@@ -1714,18 +1776,114 @@ func (r *AgentRenderer) statusLineLocked(width int) string {
 	}
 }
 
-func (r *AgentRenderer) promptLineLocked(width int) string {
+func (r *AgentRenderer) promptLinesLocked(width int) []string {
 	if r.overlay == overlayBlocker && r.blocker != nil {
 		if r.blocker.editingFollow || r.blocker.focus == blockerFocusFollowUpInput {
-			return "clarify> " + renderPromptValue(string(r.blocker.followUp))
+			return r.wrapPromptTailLocked("clarify> ", string(r.blocker.followUp), width, 3)
 		}
 		value := string(r.blocker.answer)
 		if r.blocker.action.InputKind == core.InputSecret && !r.secretVisible {
 			value = strings.Repeat("*", len(r.blocker.answer))
 		}
-		return "> " + renderPromptValue(value)
+		return r.wrapPromptTailLocked("> ", value, width, 3)
 	}
-	return "> " + renderPromptValue(string(r.composer))
+	return r.wrapPromptTailLocked("> ", string(r.composer), width, 3)
+}
+
+func (r *AgentRenderer) wrapPromptTailLocked(prefix, value string, width, maxLines int) []string {
+	if maxLines <= 0 {
+		return nil
+	}
+	value = renderPromptValue(value)
+	if width <= 0 {
+		return []string{prefix + value}
+	}
+	continuationPrefix := strings.Repeat(" ", visibleWidth(prefix))
+	firstWidth := max(1, width-visibleWidth(prefix))
+	nextWidth := max(1, width-visibleWidth(continuationPrefix))
+	segments := wrapVisibleTail(value, firstWidth, nextWidth)
+	if len(segments) > maxLines {
+		segments = segments[len(segments)-maxLines:]
+	}
+	lines := make([]string, 0, len(segments))
+	for idx, segment := range segments {
+		linePrefix := continuationPrefix
+		if idx == 0 {
+			linePrefix = prefix
+		}
+		lines = append(lines, linePrefix+segment)
+	}
+	return lines
+}
+
+func (r *AgentRenderer) promptCursorPositionLocked(width, headerHeight, bodyHeight, overlayHeight int) (int, int) {
+	const maxPromptLines = 3
+	prefix, value, cursor := r.activePromptStateLocked()
+	value = renderPromptValue(value)
+	beforeCursor := renderPromptValue(sliceRunes(value, 0, cursor))
+	if cursor <= 0 {
+		beforeCursor = ""
+	}
+	firstWidth := max(1, width-visibleWidth(prefix))
+	continuationPrefix := strings.Repeat(" ", visibleWidth(prefix))
+	nextWidth := max(1, width-visibleWidth(continuationPrefix))
+	segments := wrapVisibleTail(beforeCursor, firstWidth, nextWidth)
+	if len(segments) > maxPromptLines {
+		segments = segments[len(segments)-maxPromptLines:]
+	}
+	row := headerHeight + bodyHeight + overlayHeight + 2 + len(segments) - 1
+	colPrefix := visibleWidth(prefix)
+	if len(segments) > 1 {
+		colPrefix = visibleWidth(continuationPrefix)
+	}
+	col := colPrefix + visibleWidth(segments[len(segments)-1]) + 1
+	if row < 1 {
+		row = 1
+	}
+	if col < 1 {
+		col = 1
+	}
+	return row, col
+}
+
+func (r *AgentRenderer) activePromptStateLocked() (string, string, int) {
+	if r.overlay == overlayBlocker && r.blocker != nil {
+		if r.blocker.editingFollow || r.blocker.focus == blockerFocusFollowUpInput {
+			value := string(r.blocker.followUp)
+			return "clarify> ", value, utf8.RuneCountInString(value)
+		}
+		value := string(r.blocker.answer)
+		if r.blocker.action.InputKind == core.InputSecret && !r.secretVisible {
+			return "> ", strings.Repeat("*", len(r.blocker.answer)), len(r.blocker.answer)
+		}
+		return "> ", value, utf8.RuneCountInString(value)
+	}
+	value := string(r.composer)
+	cursor := r.cursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(r.composer) {
+		cursor = len(r.composer)
+	}
+	return "> ", value, cursor
+}
+
+func sliceRunes(value string, start, end int) string {
+	runes := []rune(value)
+	if start < 0 {
+		start = 0
+	}
+	if end < start {
+		end = start
+	}
+	if start > len(runes) {
+		start = len(runes)
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	return string(runes[start:end])
 }
 
 func (r *AgentRenderer) inputBorderLineLocked(width int) string {
@@ -1972,6 +2130,85 @@ func (r *AgentRenderer) wrapWithWidth(line string, width int) []string {
 	return out
 }
 
+func wrapVisibleTail(value string, firstWidth, continuationWidth int) []string {
+	if firstWidth <= 0 {
+		firstWidth = 1
+	}
+	if continuationWidth <= 0 {
+		continuationWidth = firstWidth
+	}
+	if value == "" {
+		return []string{""}
+	}
+	segments := []string{}
+	width := firstWidth
+	for {
+		if visibleWidth(value) <= width {
+			segments = append([]string{value}, segments...)
+			break
+		}
+		keep := visibleTail(value, width)
+		segments = append([]string{keep}, segments...)
+		value = visibleTrimSuffix(value, width)
+		width = continuationWidth
+		if value == "" {
+			break
+		}
+	}
+	if len(segments) == 0 {
+		return []string{""}
+	}
+	return segments
+}
+
+func visibleTail(value string, width int) string {
+	if width <= 0 || value == "" {
+		return ""
+	}
+	total := visibleWidth(value)
+	if total <= width {
+		return value
+	}
+	return visibleDropPrefix(value, total-width)
+}
+
+func visibleTrimSuffix(value string, width int) string {
+	total := visibleWidth(value)
+	if width <= 0 || total <= width {
+		return ""
+	}
+	return truncateVisible(value, total-width)
+}
+
+func visibleDropPrefix(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	trimmed := value
+	remaining := width
+	for i := 0; i < len(trimmed) && remaining > 0; {
+		if trimmed[i] == 27 {
+			end := ansiSequenceEnd(trimmed, i)
+			if end <= i {
+				trimmed = trimmed[i+1:]
+				i = 0
+				continue
+			}
+			trimmed = trimmed[end:]
+			i = 0
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(trimmed[i:])
+		if size <= 0 {
+			size = 1
+		}
+		trimmed = trimmed[i+size:]
+		remaining--
+		i = 0
+	}
+	return trimmed
+}
+
 func splitMessageLines(text string) []string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	parts := strings.Split(text, "\n")
@@ -1995,12 +2232,11 @@ func (r *AgentRenderer) ensureAltScreenLocked() {
 	if r.altScreen {
 		return
 	}
-	_, _ = fmt.Fprint(r.Out, "\033[?1049h\033[?2004h\033[?25l")
+	_, _ = fmt.Fprint(r.Out, "\033[?1049h\033[?2004h")
 	r.altScreen = true
-	r.cursorHidden = true
 }
 
-func (r *AgentRenderer) renderFrameLocked(frame []string, width int) error {
+func (r *AgentRenderer) renderFrameLocked(frame []string, width, cursorRow, cursorCol int) error {
 	fullRedraw := len(r.lastFrame) != len(frame) || r.lastWidth != width || r.lastFrame == nil
 	if fullRedraw {
 		if _, err := fmt.Fprint(r.Out, "\033[H\033[2J"); err != nil {
@@ -2023,9 +2259,10 @@ func (r *AgentRenderer) renderFrameLocked(frame []string, width int) error {
 	}
 	r.lastFrame = append(r.lastFrame[:0], frame...)
 	r.lastWidth = width
-	if _, err := fmt.Fprintf(r.Out, "\033[%d;1H", len(frame)); err != nil {
+	if _, err := fmt.Fprintf(r.Out, "\033[%d;%dH\033[?25h", cursorRow, cursorCol); err != nil {
 		return err
 	}
+	r.cursorHidden = false
 	return nil
 }
 

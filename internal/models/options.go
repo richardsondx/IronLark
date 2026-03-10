@@ -46,6 +46,7 @@ func Suggested(cfg cfgpkg.Config) []ProviderOptions {
 
 	// Keep suggested IDs conservative and aligned with models already referenced
 	// in the repo config so `/model` shows practical alternatives by default.
+	add("openai", "gpt-5")
 	add("openai", "gpt-5-mini")
 	add("openai", "gpt-4.1-mini")
 	add("openrouter", "openai/gpt-4.1-mini")

@@ -40,6 +40,11 @@ type chatCompletionResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -52,7 +57,7 @@ func NewOpenAICompatibleClient(baseURL, apiKey string, headers map[string]string
 		apiKey:  apiKey,
 		headers: headers,
 		client: &http.Client{
-			Timeout: 90 * time.Second,
+			Timeout: 180 * time.Second,
 		},
 	}
 }
@@ -125,5 +130,18 @@ func (c *OpenAICompatibleClient) Generate(ctx context.Context, req Request) (res
 		return core.LLMResponse{}, fmt.Errorf("provider returned no choices")
 	}
 
-	return ParseResponse(decoded.Choices[0].Message.Content)
+	response, err = ParseResponse(decoded.Choices[0].Message.Content)
+	if err != nil {
+		return core.LLMResponse{}, err
+	}
+	response.Usage = core.TokenUsage{
+		PromptTokens:     decoded.Usage.PromptTokens,
+		CompletionTokens: decoded.Usage.CompletionTokens,
+		TotalTokens:      decoded.Usage.TotalTokens,
+	}
+	return response, nil
+}
+
+func (c *OpenAICompatibleClient) WebSearch(ctx context.Context, req SearchRequest) ([]string, error) {
+	return nil, ErrWebSearchUnsupported
 }

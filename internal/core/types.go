@@ -31,8 +31,8 @@ const (
 )
 
 type ApprovalDecision struct {
-	Kind               ApprovalDecisionKind `json:"kind"`
-	AutoAcceptThrough  RiskLevel            `json:"auto_accept_through,omitempty"`
+	Kind              ApprovalDecisionKind `json:"kind"`
+	AutoAcceptThrough RiskLevel            `json:"auto_accept_through,omitempty"`
 }
 
 type InteractionMode string
@@ -62,6 +62,7 @@ const (
 	ActionEditFile       ActionType = "edit_file"
 	ActionWebSearch      ActionType = "web_search"
 	ActionFetchRules     ActionType = "fetch_rules"
+	ActionFetchOps       ActionType = "fetch_ops"
 	ActionAskUser        ActionType = "ask_user"
 	ActionInspect        ActionType = "inspect"
 	ActionCheckpoint     ActionType = "checkpoint"
@@ -182,6 +183,19 @@ type ActionOutputChunk struct {
 	Text     string             `json:"text"`
 }
 
+type ShellFailureKind string
+
+const (
+	ShellFailureNone         ShellFailureKind = ""
+	ShellFailureTimeout      ShellFailureKind = "timeout"
+	ShellFailureSignalKilled ShellFailureKind = "signal_killed"
+	ShellFailureNonZeroExit  ShellFailureKind = "nonzero_exit"
+	ShellFailureStartup      ShellFailureKind = "startup_error"
+	ShellFailureStream       ShellFailureKind = "stream_error"
+	ShellFailureStalled      ShellFailureKind = "stalled_output"
+	ShellFailureUnknown      ShellFailureKind = "unknown"
+)
+
 type Verification struct {
 	Type        ActionType `json:"type"`
 	Command     string     `json:"command,omitempty"`
@@ -189,6 +203,30 @@ type Verification struct {
 	Paths       []string   `json:"paths,omitempty"`
 	SuccessHint string     `json:"success_hint,omitempty"`
 	TimeoutSec  int        `json:"timeout_sec,omitempty"`
+}
+
+type TokenUsage struct {
+	PromptTokens     int  `json:"prompt_tokens,omitempty"`
+	CompletionTokens int  `json:"completion_tokens,omitempty"`
+	TotalTokens      int  `json:"total_tokens,omitempty"`
+	Estimated        bool `json:"estimated,omitempty"`
+}
+
+func (u TokenUsage) Empty() bool {
+	return u.PromptTokens == 0 && u.CompletionTokens == 0 && u.TotalTokens == 0
+}
+
+func (u TokenUsage) Add(other TokenUsage) TokenUsage {
+	out := TokenUsage{
+		PromptTokens:     u.PromptTokens + other.PromptTokens,
+		CompletionTokens: u.CompletionTokens + other.CompletionTokens,
+		TotalTokens:      u.TotalTokens + other.TotalTokens,
+		Estimated:        u.Estimated || other.Estimated,
+	}
+	if out.TotalTokens == 0 {
+		out.TotalTokens = out.PromptTokens + out.CompletionTokens
+	}
+	return out
 }
 
 type LLMResponse struct {
@@ -199,7 +237,19 @@ type LLMResponse struct {
 	Narration      *Narration     `json:"narration,omitempty"`
 	NeedsUserInput bool           `json:"needs_user_input"`
 	Confidence     float64        `json:"confidence,omitempty"`
+	Usage          TokenUsage     `json:"usage,omitempty"`
 }
+
+type CompletionStatus string
+
+const (
+	CompletionFinished             CompletionStatus = "finished"
+	CompletionIncompleteMaxTurns   CompletionStatus = "incomplete_max_turns"
+	CompletionIncompleteNoProgress CompletionStatus = "incomplete_no_progress"
+	CompletionBlockedUserInput     CompletionStatus = "blocked_user_input"
+	CompletionFailed               CompletionStatus = "failed"
+	CompletionBackgroundContinuing CompletionStatus = "background_continuing"
+)
 
 type RiskLevel string
 
@@ -244,26 +294,32 @@ type RiskReport struct {
 }
 
 type ActionResult struct {
-	Action       Action            `json:"action"`
-	Risk         RiskReport        `json:"risk"`
-	Approved     bool              `json:"approved"`
-	Skipped      bool              `json:"skipped"`
-	Stdout       string            `json:"stdout,omitempty"`
-	Stderr       string            `json:"stderr,omitempty"`
-	Summary      string            `json:"summary,omitempty"`
-	ExitCode     int               `json:"exit_code,omitempty"`
-	DurationMS   int64             `json:"duration_ms,omitempty"`
-	Error        string            `json:"error,omitempty"`
-	PatchID      string            `json:"patch_id,omitempty"`
-	BackupPath   string            `json:"backup_path,omitempty"`
-	CheckpointID string            `json:"checkpoint_id,omitempty"`
-	InputKind    InputKind         `json:"input_kind,omitempty"`
-	FieldKey     string            `json:"field_key,omitempty"`
-	ResponseMode InputResponseMode `json:"response_mode,omitempty"`
-	InputValue   string            `json:"input_value,omitempty"`
-	IsSensitive  bool              `json:"is_sensitive,omitempty"`
-	StartedAt    time.Time         `json:"started_at"`
-	FinishedAt   time.Time         `json:"finished_at"`
+	Action                Action            `json:"action"`
+	Risk                  RiskReport        `json:"risk"`
+	Approved              bool              `json:"approved"`
+	Skipped               bool              `json:"skipped"`
+	Stdout                string            `json:"stdout,omitempty"`
+	Stderr                string            `json:"stderr,omitempty"`
+	Summary               string            `json:"summary,omitempty"`
+	ExitCode              int               `json:"exit_code,omitempty"`
+	DurationMS            int64             `json:"duration_ms,omitempty"`
+	Error                 string            `json:"error,omitempty"`
+	FailureKind           ShellFailureKind  `json:"failure_kind,omitempty"`
+	TimedOut              bool              `json:"timed_out,omitempty"`
+	KilledBySignal        int               `json:"killed_by_signal,omitempty"`
+	Retryable             bool              `json:"retryable,omitempty"`
+	BackgroundRecommended bool              `json:"background_recommended,omitempty"`
+	BackgroundRunID       string            `json:"background_run_id,omitempty"`
+	PatchID               string            `json:"patch_id,omitempty"`
+	BackupPath            string            `json:"backup_path,omitempty"`
+	CheckpointID          string            `json:"checkpoint_id,omitempty"`
+	InputKind             InputKind         `json:"input_kind,omitempty"`
+	FieldKey              string            `json:"field_key,omitempty"`
+	ResponseMode          InputResponseMode `json:"response_mode,omitempty"`
+	InputValue            string            `json:"input_value,omitempty"`
+	IsSensitive           bool              `json:"is_sensitive,omitempty"`
+	StartedAt             time.Time         `json:"started_at"`
+	FinishedAt            time.Time         `json:"finished_at"`
 }
 
 type ConversationMessage struct {

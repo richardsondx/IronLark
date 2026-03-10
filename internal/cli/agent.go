@@ -75,7 +75,6 @@ func newAgentListCommand(flags *rootFlags) *cobra.Command {
 			refreshed := make([]agent.Workspace, 0, len(workspaces))
 			for _, workspace := range workspaces {
 				workspace, _ = manager.Inspect(cmd.Context(), workspace)
-				_ = application.Agents.Save(workspace)
 				refreshed = append(refreshed, workspace)
 			}
 			if application.Runtime.JSONOutput {
@@ -162,6 +161,7 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 				Interaction:      application.Runtime.Interaction,
 				NarratedProgress: application.Runtime.Config.UI.NarratedProgress,
 				PolicyStore:      application.PolicyStore,
+				OpsSummary:       application.Ops.SummaryLine(),
 			})
 			defer fmt.Fprint(os.Stdout, "\033[?25h\033[?2004l\033[?1049l")
 			if err := application.Agents.Save(workspace); err != nil {

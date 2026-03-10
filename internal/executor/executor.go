@@ -12,30 +12,57 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/richardsondx/IronLark/internal/checkpoints"
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/patches"
 	"github.com/richardsondx/IronLark/internal/policy"
+	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/redact"
 	"github.com/richardsondx/IronLark/internal/search"
 )
 
 type Executor struct {
-	WorkingDir         string
-	MaxOutputBytes     int
-	MaxListEntries     int
-	MaxFileBytes       int
-	Redactor           *redact.Redactor
-	Classifier         *policy.Classifier
-	PatchStore         patches.Store
-	CheckpointStore    checkpoints.Store
-	Searcher           search.Searcher
-	RuleURLs           []string
-	SemanticMaxFiles   int
-	SemanticChunkLines int
-	WebSearchResults   int
+	WorkingDir                  string
+	MaxOutputBytes              int
+	MaxListEntries              int
+	MaxFileBytes                int
+	Redactor                    *redact.Redactor
+	Classifier                  *policy.Classifier
+	PatchStore                  patches.Store
+	CheckpointStore             checkpoints.Store
+	Searcher                    search.Searcher
+	RuleURLs                    []string
+	SemanticMaxFiles            int
+	SemanticChunkLines          int
+	WebSearchResults            int
+	DefaultShellTimeoutSec      int
+	ShellStallWindowSec         int
+	AutoBackgroundLongRuns      bool
+	LongRunHeuristicsEnabled    bool
+	DurableShellMaxRuntimeSec   int
+	DurableShellLogPreviewBytes int
+	ProviderModel               string
+	Provider                    interface {
+		WebSearch(ctx context.Context, req provider.SearchRequest) ([]string, error)
+	}
+	OpsFetcher interface {
+		Fetch(query string, since time.Time, limit int) (string, error)
+	}
+}
+
+type shellRunResult struct {
+	stdout         string
+	stderr         string
+	exitCode       int
+	err            error
+	failureKind    core.ShellFailureKind
+	timedOut       bool
+	killedBySignal int
+	retryable      bool
 }
 
 func (e *Executor) Preview(action core.Action, readOnly bool) (core.RiskReport, error) {
@@ -80,17 +107,24 @@ func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOn
 	}
 	switch action.Type {
 	case core.ActionRunShell:
-		stdout, stderr, code, err := e.runCommandStream(ctx, action, onChunk)
-		result.Stdout = stdout
-		result.Stderr = stderr
-		result.ExitCode = code
-		if err != nil {
-			result.Error = err.Error()
-			result.Summary = summarize(stderr, stdout)
-			finalize(&result, startedAt)
-			return result, err
+		runResult := e.runCommandStream(ctx, action, onChunk)
+		result.Stdout = runResult.stdout
+		result.Stderr = runResult.stderr
+		result.ExitCode = runResult.exitCode
+		result.FailureKind = runResult.failureKind
+		result.TimedOut = runResult.timedOut
+		result.KilledBySignal = runResult.killedBySignal
+		result.Retryable = runResult.retryable
+		if runResult.failureKind == core.ShellFailureTimeout || runResult.failureKind == core.ShellFailureSignalKilled || runResult.failureKind == core.ShellFailureStalled {
+			result.BackgroundRecommended = true
 		}
-		result.Summary = summarize(stdout, stderr)
+		if runResult.err != nil {
+			result.Error = runResult.err.Error()
+			result.Summary = summarize(runResult.stderr, runResult.stdout)
+			finalize(&result, startedAt)
+			return result, runResult.err
+		}
+		result.Summary = summarize(runResult.stdout, runResult.stderr)
 		finalize(&result, startedAt)
 		return result, nil
 	case core.ActionReadFiles:
@@ -179,16 +213,32 @@ func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOn
 		finalize(&result, startedAt)
 		return result, nil
 	case core.ActionWebSearch:
-		results, err := e.Searcher.WebSearch(ctx, firstNonEmpty(action.Query, action.Pattern, action.Reason), search.Options{
-			MaxResults: e.WebSearchResults,
-		})
+		query := firstNonEmpty(action.Query, action.Pattern, action.Reason)
+		results, err := e.providerWebSearch(ctx, query)
 		if err != nil {
 			result.Error = err.Error()
 			finalize(&result, startedAt)
 			return result, err
 		}
 		result.Stdout = strings.Join(results, "\n")
-		result.Summary = fmt.Sprintf("web search for %q", firstNonEmpty(action.Query, action.Pattern, action.Reason))
+		result.Summary = fmt.Sprintf("web search for %q", query)
+		finalize(&result, startedAt)
+		return result, nil
+	case core.ActionFetchOps:
+		if e.OpsFetcher == nil {
+			err := fmt.Errorf("ops memory is unavailable")
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		output, err := e.OpsFetcher.Fetch(firstNonEmpty(action.Query, action.Pattern, action.Reason), time.Time{}, e.MaxListEntries)
+		if err != nil {
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		result.Stdout = output
+		result.Summary = "fetched operational history"
 		finalize(&result, startedAt)
 		return result, nil
 	case core.ActionFetchRules:
@@ -248,15 +298,19 @@ func (e *Executor) readFiles(action core.Action) (string, error) {
 }
 
 func (e *Executor) runCommand(ctx context.Context, action core.Action) (string, string, int, error) {
-	return e.runCommandStream(ctx, action, nil)
+	result := e.runCommandStream(ctx, action, nil)
+	return result.stdout, result.stderr, result.exitCode, result.err
 }
 
-func (e *Executor) runCommandStream(ctx context.Context, action core.Action, onChunk func(core.ActionOutputChunk)) (string, string, int, error) {
+func (e *Executor) runCommandStream(ctx context.Context, action core.Action, onChunk func(core.ActionOutputChunk)) shellRunResult {
 	timeout := 30 * time.Second
+	if e.DefaultShellTimeoutSec > 0 {
+		timeout = time.Duration(e.DefaultShellTimeoutSec) * time.Second
+	}
 	if action.TimeoutSec > 0 {
 		timeout = time.Duration(action.TimeoutSec) * time.Second
 	}
-	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	runCtx, cancel := context.WithTimeoutCause(ctx, timeout, context.DeadlineExceeded)
 	defer cancel()
 
 	dir := e.WorkingDir
@@ -264,38 +318,79 @@ func (e *Executor) runCommandStream(ctx context.Context, action core.Action, onC
 		dir = action.CWD
 	}
 
-	stdout, stderr, exitCode, err := e.runShellStream(runCtx, dir, "sh", action, onChunk)
-	if err == nil {
-		return stdout, stderr, exitCode, nil
+	result := e.runShellStream(runCtx, dir, "sh", action, onChunk)
+	if result.err == nil {
+		return result
 	}
-	if shouldRetryWithBash(action.Command, stderr) {
+	if shouldRetryWithBash(action.Command, result.stderr) {
 		if _, lookErr := exec.LookPath("bash"); lookErr == nil {
 			return e.runShellStream(runCtx, dir, "bash", action, onChunk)
 		}
 	}
-	return stdout, stderr, exitCode, err
+	return result
 }
 
 func (e *Executor) runShell(ctx context.Context, dir, shell, command string) (string, string, int, error) {
-	return e.runShellStream(ctx, dir, shell, core.Action{Command: command}, nil)
+	result := e.runShellStream(ctx, dir, shell, core.Action{Command: command}, nil)
+	return result.stdout, result.stderr, result.exitCode, result.err
 }
 
-func (e *Executor) runShellStream(ctx context.Context, dir, shell string, action core.Action, onChunk func(core.ActionOutputChunk)) (string, string, int, error) {
+func (e *Executor) runShellStream(ctx context.Context, dir, shell string, action core.Action, onChunk func(core.ActionOutputChunk)) shellRunResult {
 	cmd := exec.CommandContext(ctx, shell, "-lc", action.Command)
 	cmd.Dir = dir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdoutBuf := &cappedBuffer{limit: e.MaxOutputBytes}
 	stderrBuf := &cappedBuffer{limit: e.MaxOutputBytes}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", "", -1, err
+		return shellRunResult{exitCode: -1, err: err, failureKind: core.ShellFailureStartup}
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		return "", "", -1, err
+		return shellRunResult{exitCode: -1, err: err, failureKind: core.ShellFailureStartup}
 	}
 	if err := cmd.Start(); err != nil {
-		return "", "", -1, err
+		return shellRunResult{exitCode: -1, err: err, failureKind: core.ShellFailureStartup}
+	}
+
+	stallWindow := time.Duration(e.ShellStallWindowSec) * time.Second
+	var (
+		activityMu   sync.Mutex
+		lastActivity = time.Now()
+		stallErr     error
+	)
+	markActivity := func() {
+		activityMu.Lock()
+		lastActivity = time.Now()
+		activityMu.Unlock()
+	}
+	var stallCancel context.CancelFunc
+	if stallWindow > 0 {
+		stallCtx, cancel := context.WithCancel(context.Background())
+		stallCancel = cancel
+		go func() {
+			ticker := time.NewTicker(minDuration(5*time.Second, stallWindow))
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stallCtx.Done():
+					return
+				case <-ticker.C:
+					activityMu.Lock()
+					idle := time.Since(lastActivity)
+					activityMu.Unlock()
+					if idle < stallWindow {
+						continue
+					}
+					stallErr = fmt.Errorf("command stalled without output for %s", stallWindow)
+					_ = killProcessGroup(cmd.Process)
+					cancel()
+					return
+				}
+			}
+		}()
+		defer stallCancel()
 	}
 
 	type streamResult struct {
@@ -306,13 +401,13 @@ func (e *Executor) runShellStream(ctx context.Context, dir, shell string, action
 	go func() {
 		streamDone <- streamResult{
 			stream: core.ActionOutputStdout,
-			err:    e.captureStream(stdoutBuf, stdoutPipe, action.ID, core.ActionOutputStdout, onChunk),
+			err:    e.captureStream(stdoutBuf, stdoutPipe, action.ID, core.ActionOutputStdout, onChunk, markActivity),
 		}
 	}()
 	go func() {
 		streamDone <- streamResult{
 			stream: core.ActionOutputStderr,
-			err:    e.captureStream(stderrBuf, stderrPipe, action.ID, core.ActionOutputStderr, onChunk),
+			err:    e.captureStream(stderrBuf, stderrPipe, action.ID, core.ActionOutputStderr, onChunk, markActivity),
 		}
 	}()
 
@@ -327,20 +422,33 @@ func (e *Executor) runShellStream(ctx context.Context, dir, shell string, action
 	stdout := e.Redactor.Text(stdoutBuf.String())
 	stderr := e.Redactor.Text(stderrBuf.String())
 	if streamErr != nil {
-		return stdout, stderr, -1, streamErr
+		return shellRunResult{stdout: stdout, stderr: stderr, exitCode: -1, err: streamErr, failureKind: core.ShellFailureStream, retryable: true}
 	}
 
-	exitCode := 0
 	if waitErr != nil {
+		result := shellRunResult{stdout: stdout, stderr: stderr, exitCode: -1, err: waitErr, failureKind: core.ShellFailureUnknown}
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = -1
+			result.exitCode = exitErr.ExitCode()
+			result.failureKind = core.ShellFailureNonZeroExit
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				result.killedBySignal = int(status.Signal())
+				result.failureKind = core.ShellFailureSignalKilled
+				result.retryable = true
+			}
 		}
-		return stdout, stderr, exitCode, waitErr
+		if stallErr != nil {
+			result.err = stallErr
+			result.failureKind = core.ShellFailureStalled
+			result.retryable = true
+		} else if errors.Is(context.Cause(ctx), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			result.timedOut = true
+			result.failureKind = core.ShellFailureTimeout
+			result.retryable = true
+		}
+		return result
 	}
 
-	return stdout, stderr, 0, nil
+	return shellRunResult{stdout: stdout, stderr: stderr, exitCode: 0, err: nil}
 }
 
 func isIgnorableStreamReadError(err error) bool {
@@ -355,11 +463,14 @@ func isIgnorableStreamReadError(err error) bool {
 		strings.Contains(message, "closed pipe")
 }
 
-func (e *Executor) captureStream(buf *cappedBuffer, reader io.Reader, actionID string, stream core.ActionOutputStream, onChunk func(core.ActionOutputChunk)) error {
+func (e *Executor) captureStream(buf *cappedBuffer, reader io.Reader, actionID string, stream core.ActionOutputStream, onChunk func(core.ActionOutputChunk), onActivity func()) error {
 	streamReader := bufio.NewReader(reader)
 	for {
 		line, err := streamReader.ReadString('\n')
 		if len(line) > 0 {
+			if onActivity != nil {
+				onActivity()
+			}
 			_, _ = buf.Write([]byte(line))
 			if onChunk != nil {
 				text := strings.TrimRight(e.Redactor.Text(line), "\n")
@@ -379,6 +490,20 @@ func (e *Executor) captureStream(buf *cappedBuffer, reader io.Reader, actionID s
 			return err
 		}
 	}
+}
+
+func killProcessGroup(proc *os.Process) error {
+	if proc == nil {
+		return nil
+	}
+	return syscall.Kill(-proc.Pid, syscall.SIGKILL)
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func shouldRetryWithBash(command, stderr string) bool {
@@ -441,6 +566,27 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 
 func (c *cappedBuffer) String() string {
 	return c.buf.String()
+}
+
+func (e *Executor) providerWebSearch(ctx context.Context, query string) ([]string, error) {
+	if e.Provider != nil {
+		results, err := e.Provider.WebSearch(ctx, provider.SearchRequest{
+			Model:      e.ProviderModel,
+			Query:      query,
+			MaxResults: e.WebSearchResults,
+		})
+		if err == nil {
+			return results, nil
+		}
+		if !errors.Is(err, provider.ErrWebSearchUnsupported) {
+			if !provider.IsRetryableWebSearchError(err) {
+				return nil, err
+			}
+		}
+	}
+	return e.Searcher.WebSearch(ctx, query, search.Options{
+		MaxResults: e.WebSearchResults,
+	})
 }
 
 func summarize(values ...string) string {

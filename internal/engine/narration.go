@@ -179,6 +179,14 @@ func (n *turnNarrator) blocked(action core.Action, reason string, status core.Na
 	return n.event(core.NarrativeBlocked, "Blocked", text, action.ID, target, status)
 }
 
+func (n *turnNarrator) budgetExtended() core.NarrativeEvent {
+	return n.event(core.NarrativeIntent, "Continuing", "Continuing past normal turn budget because progress is still real.", "", "", core.NarrativeRunning)
+}
+
+func (n *turnNarrator) hardCapReached() core.NarrativeEvent {
+	return n.event(core.NarrativeBlocked, "Turn limit", "Stopped at hard turn cap before completion.", "", "", core.NarrativeError)
+}
+
 func (n *turnNarrator) interrupted() core.NarrativeEvent {
 	return n.event(core.NarrativeTurnFinished, "Interrupted", "The current turn was interrupted. I’m waiting for the next instruction.", "", "", core.NarrativeError)
 }
@@ -254,6 +262,8 @@ func phaseForAction(action core.Action) string {
 		return "Searching the web"
 	case core.ActionFetchRules:
 		return "Checking project rules"
+	case core.ActionFetchOps:
+		return "Checking operational memory"
 	case core.ActionCheckpoint:
 		return "Saving a checkpoint"
 	case core.ActionAskUser:

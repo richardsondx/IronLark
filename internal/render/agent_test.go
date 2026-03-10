@@ -123,11 +123,33 @@ func TestDrawLockedKeepsCursorOnPromptLine(t *testing.T) {
 	if !strings.Contains(output, "--------------------------------------------------------------------------------\033[K") {
 		t.Fatalf("expected output to contain input border line, got %q", output)
 	}
-	if !strings.HasSuffix(output, "\033[24;1H") {
-		t.Fatalf("expected output to end by positioning the cursor on the last row, got %q", output)
+	if !strings.HasSuffix(output, "\033[22;3H\033[?25h") {
+		t.Fatalf("expected output to end by positioning the cursor on the prompt, got %q", output)
 	}
 	if !strings.Contains(output, "IronLark Agent") {
 		t.Fatalf("expected output to end on footer line, got %q", output)
+	}
+}
+
+func TestDrawLockedPlacesCursorAtWrappedPromptTail(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+
+	renderer.mu.Lock()
+	renderer.Out = &bytes.Buffer{}
+	renderer.sizeFn = func() (int, int) { return 12, 24 }
+	renderer.composer = []rune("abcdefghijk")
+	renderer.cursor = len(renderer.composer)
+
+	if err := renderer.drawLocked(); err != nil {
+		renderer.mu.Unlock()
+		t.Fatalf("drawLocked() error = %v", err)
+	}
+	output := renderer.Out.(*bytes.Buffer).String()
+	renderer.mu.Unlock()
+
+	if !strings.HasSuffix(output, "\033[22;13H\033[?25h") {
+		t.Fatalf("expected wrapped prompt cursor at tail, got %q", output)
 	}
 }
 
@@ -823,6 +845,55 @@ func TestNarratedProgressUsesNarrativePhaseInStatusLine(t *testing.T) {
 	}
 }
 
+func TestWebSearchActionProgressShowsQueryAndSiteFilter(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	renderer.meta.Provider = "openai"
+	renderer.ActionProgress(core.Action{
+		ID:    "search-docs",
+		Type:  core.ActionWebSearch,
+		Query: "site:harborframework.com/docs BaseInstalledAgent MyInstalledAgent job.yaml agents",
+	})
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	joined := strings.Join(renderer.transcript, "\n")
+	if !containsString(joined, "WebSearch(site:harborframework.com/docs") {
+		t.Fatalf("expected web search action entry, got %q", joined)
+	}
+	if !containsString(joined, "provider: openai") {
+		t.Fatalf("expected provider detail, got %q", joined)
+	}
+	if !containsString(joined, "site filters: harborframework.com/docs") {
+		t.Fatalf("expected site filter detail, got %q", joined)
+	}
+	if !containsString(joined, "query: site:harborframework.com/docs BaseInstalledAgent MyInstalledAgent") || !containsString(joined, "job") {
+		t.Fatalf("expected query detail, got %q", joined)
+	}
+}
+
+func TestNarrationLinesWrapInsteadOfTruncating(t *testing.T) {
+	renderer := newNarratedTestAgentRenderer()
+	renderer.mu.Lock()
+	renderer.lastWidth = 80
+	renderer.mu.Unlock()
+	renderer.Narrate(core.NarrativeEvent{
+		Kind:   core.NarrativeIntent,
+		Phase:  "Searching the web",
+		Text:   "To register IronLark as an installed agent, subclass BaseInstalledAgent and make the class importable, then select it for the benchmark either by passing --agent-import-path module.path:IronLarkInstalledAgent when running Terminal-Bench or by adding an agents entry in a job.yaml that references the import path.",
+		Status: core.NarrativeDone,
+	})
+
+	renderer.mu.Lock()
+	defer renderer.mu.Unlock()
+	joined := strings.Join(renderer.transcript, "\n")
+	if containsString(joined, "benchmark e...") {
+		t.Fatalf("expected wrapped narration instead of truncation, got %q", joined)
+	}
+	if !containsString(joined, "benchmark either by passin") || !containsString(joined, "g --agent-import-path") {
+		t.Fatalf("expected wrapped narration content, got %q", joined)
+	}
+}
+
 func TestNarratedProgressShiftTabTogglesLatestDetails(t *testing.T) {
 	renderer := newNarratedTestAgentRenderer()
 	renderer.BeginRawTestPrompt()
@@ -1005,8 +1076,9 @@ func TestBlockerPanelShowsSecretInputByDefault(t *testing.T) {
 		focus: blockerFocusInput,
 	}
 	renderer.blocker.answer = []rune("secret")
-	line := renderer.promptLineLocked(80)
+	lines := renderer.promptLinesLocked(80)
 	renderer.mu.Unlock()
+	line := strings.Join(lines, "\n")
 	if !containsString(line, "secret") {
 		t.Fatalf("expected visible secret prompt line, got %q", line)
 	}
@@ -1029,8 +1101,9 @@ func TestBlockerPanelMasksSecretInputWhenHidden(t *testing.T) {
 		focus: blockerFocusInput,
 	}
 	renderer.blocker.answer = []rune("secret")
-	line := renderer.promptLineLocked(80)
+	lines := renderer.promptLinesLocked(80)
 	renderer.mu.Unlock()
+	line := strings.Join(lines, "\n")
 	if containsString(line, "secret") {
 		t.Fatalf("expected masked secret prompt line, got %q", line)
 	}
@@ -1065,8 +1138,9 @@ func TestBracketedPasteStaysInComposerUntilExplicitSubmit(t *testing.T) {
 
 	renderer.mu.Lock()
 	composer := string(renderer.composer)
-	promptLine := renderer.promptLineLocked(80)
+	promptLines := renderer.promptLinesLocked(80)
 	renderer.mu.Unlock()
+	promptLine := strings.Join(promptLines, "\n")
 
 	if composer != "first line\nsecond line" {
 		t.Fatalf("expected multiline composer, got %q", composer)
@@ -1103,8 +1177,9 @@ func TestBlockerPanelAcceptsBracketedPasteWithoutSubmitting(t *testing.T) {
 
 	renderer.mu.Lock()
 	value := string(renderer.blocker.answer)
-	promptLine := renderer.promptLineLocked(80)
+	promptLines := renderer.promptLinesLocked(80)
 	renderer.mu.Unlock()
+	promptLine := strings.Join(promptLines, "\n")
 
 	if value != "alpha\nbeta" {
 		t.Fatalf("expected multiline blocker value, got %q", value)
@@ -1115,6 +1190,48 @@ func TestBlockerPanelAcceptsBracketedPasteWithoutSubmitting(t *testing.T) {
 
 	if submitted, done := renderer.handleKey(keyPress{Kind: keyEnter}); !done || submitted != "alpha\nbeta" {
 		t.Fatalf("expected explicit blocker submit after paste, got %q %t", submitted, done)
+	}
+}
+
+func TestPromptLinesWrapComposerUpToThreeLines(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.composer = []rune("abcdefghijklmnopqrstuvwxyz1234567890")
+	lines := renderer.promptLinesLocked(14)
+	renderer.mu.Unlock()
+
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 prompt lines, got %d: %#v", len(lines), lines)
+	}
+	if lines[0] != "> abcdefghijkl" {
+		t.Fatalf("unexpected first prompt line %q", lines[0])
+	}
+	if lines[1] != "  mnopqrstuvwx" {
+		t.Fatalf("unexpected second prompt line %q", lines[1])
+	}
+	if lines[2] != "  yz1234567890" {
+		t.Fatalf("unexpected third prompt line %q", lines[2])
+	}
+}
+
+func TestPromptLinesClipOldestTextAfterThreeLines(t *testing.T) {
+	renderer := newTestAgentRenderer()
+	renderer.BeginRawTestPrompt()
+	renderer.mu.Lock()
+	renderer.composer = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+	lines := renderer.promptLinesLocked(14)
+	renderer.mu.Unlock()
+
+	if len(lines) != 3 {
+		t.Fatalf("expected clipped prompt to stay at 3 lines, got %d: %#v", len(lines), lines)
+	}
+	joined := strings.Join(lines, "\n")
+	if containsString(joined, "abc") {
+		t.Fatalf("expected oldest text to be clipped from the left, got %q", joined)
+	}
+	if !strings.HasSuffix(lines[2], "OPQRSTUVWXYZ") {
+		t.Fatalf("expected newest text to remain visible, got %#v", lines)
 	}
 }
 

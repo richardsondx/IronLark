@@ -11,6 +11,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/engine"
 	"github.com/richardsondx/IronLark/internal/executor"
 	"github.com/richardsondx/IronLark/internal/graph"
+	"github.com/richardsondx/IronLark/internal/ops"
 	"github.com/richardsondx/IronLark/internal/patches"
 	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
@@ -36,6 +37,7 @@ type App struct {
 	Patches     patches.Store
 	Checkpoints checkpoints.Store
 	Graph       *graph.Manager
+	Ops         *ops.Manager
 }
 
 func New(overrides state.Overrides) (*App, error) {
@@ -81,10 +83,17 @@ func New(overrides state.Overrides) (*App, error) {
 			Searcher: search.Searcher{
 				UserAgent: "lark-term/1.0",
 			},
-			RuleURLs:           runtimeState.Config.Rules.RemoteURLs,
-			SemanticMaxFiles:   runtimeState.Config.Tools.SemanticMaxFiles,
-			SemanticChunkLines: runtimeState.Config.Tools.SemanticChunkLines,
-			WebSearchResults:   runtimeState.Config.Tools.WebSearchResults,
+			RuleURLs:                    runtimeState.Config.Rules.RemoteURLs,
+			SemanticMaxFiles:            runtimeState.Config.Tools.SemanticMaxFiles,
+			SemanticChunkLines:          runtimeState.Config.Tools.SemanticChunkLines,
+			WebSearchResults:            runtimeState.Config.Tools.WebSearchResults,
+			DefaultShellTimeoutSec:      runtimeState.Config.Tools.InlineShellTimeoutSec,
+			ShellStallWindowSec:         runtimeState.Config.Tools.ShellStallWindowSec,
+			AutoBackgroundLongRuns:      runtimeState.Config.Tools.AutoBackgroundLongRuns == nil || *runtimeState.Config.Tools.AutoBackgroundLongRuns,
+			LongRunHeuristicsEnabled:    runtimeState.Config.Tools.LongRunHeuristics == nil || *runtimeState.Config.Tools.LongRunHeuristics,
+			DurableShellMaxRuntimeSec:   runtimeState.Config.Tools.DurableShellMaxRuntimeSec,
+			DurableShellLogPreviewBytes: runtimeState.Config.Tools.DurableShellLogPreviewBytes,
+			ProviderModel:               runtimeState.Model,
 		},
 		Renderer:    renderer,
 		Agents:      agent.Store{Dir: loaded.Paths.AgentDir},
@@ -94,12 +103,19 @@ func New(overrides state.Overrides) (*App, error) {
 		Patches:     patches.Store{Dir: loaded.Paths.PatchesDir},
 		Checkpoints: checkpoints.Store{Dir: loaded.Paths.CheckpointsDir},
 		Graph:       graph.NewManager(graph.Store{Dir: loaded.Paths.GraphDir}, runtimeState.Config.Graph, runtimeState.WorkingDir),
+		Ops:         ops.NewManager(loaded.Paths),
 	}
+	app.Executor.OpsFetcher = app.Ops
 
 	if providerCfg, err := runtimeState.ProviderConfig(); err == nil {
 		apiKey, keyErr := runtimeState.APIKey()
 		if keyErr == nil && providerCfg.Type == "openai-compatible" {
-			app.Provider = provider.OpenAICompatibleFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+			if runtimeState.ProviderName == "openai" {
+				app.Provider = provider.OpenAIResponsesFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+			} else {
+				app.Provider = provider.OpenAICompatibleFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+			}
+			app.Executor.Provider = app.Provider
 		}
 	}
 
@@ -118,5 +134,6 @@ func (a *App) Engine() *engine.Engine {
 		Threads:     a.Threads,
 		PolicyStore: a.PolicyStore,
 		Graph:       a.Graph,
+		Ops:         a.Ops,
 	}
 }

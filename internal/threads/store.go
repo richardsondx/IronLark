@@ -41,13 +41,14 @@ type ThreadRef struct {
 }
 
 type ThreadTurn struct {
-	UserPrompt       string    `json:"user_prompt"`
-	AssistantSummary string    `json:"assistant_summary,omitempty"`
-	Findings         []string  `json:"findings,omitempty"`
-	ActionSummary    string    `json:"action_summary,omitempty"`
-	ResultSummary    string    `json:"result_summary,omitempty"`
-	EstimatedTokens  int       `json:"estimated_tokens"`
-	CreatedAt        time.Time `json:"created_at"`
+	UserPrompt       string                `json:"user_prompt"`
+	AssistantSummary string                `json:"assistant_summary,omitempty"`
+	Findings         []string              `json:"findings,omitempty"`
+	ActionSummary    string                `json:"action_summary,omitempty"`
+	ResultSummary    string                `json:"result_summary,omitempty"`
+	CompletionStatus core.CompletionStatus `json:"completion_status,omitempty"`
+	EstimatedTokens  int                   `json:"estimated_tokens"`
+	CreatedAt        time.Time             `json:"created_at"`
 }
 
 type Thread struct {
@@ -339,13 +340,14 @@ func (s Store) ClearOverride(ref ThreadRef) error {
 	return s.writeOverrides(overrides)
 }
 
-func (s Store) AppendTurn(thread Thread, userPrompt string, response core.LLMResponse, results []core.ActionResult, opts AppendOptions) Thread {
+func (s Store) AppendTurn(thread Thread, userPrompt string, response core.LLMResponse, results []core.ActionResult, status core.CompletionStatus, opts AppendOptions) Thread {
 	turn := ThreadTurn{
 		UserPrompt:       strings.TrimSpace(userPrompt),
 		AssistantSummary: strings.TrimSpace(response.Summary),
 		Findings:         append([]string{}, response.Findings...),
 		ActionSummary:    summarizeActions(response.Actions),
 		ResultSummary:    summarizeResults(results, opts.ResultCharLimit),
+		CompletionStatus: status,
 		CreatedAt:        time.Now().UTC(),
 	}
 	turn.EstimatedTokens = estimateTurnTokens(turn)
@@ -521,6 +523,9 @@ func buildAssistantReplay(turn ThreadTurn) string {
 	if turn.ResultSummary != "" {
 		lines = append(lines, "Results: "+turn.ResultSummary)
 	}
+	if turn.CompletionStatus != "" && turn.CompletionStatus != core.CompletionFinished {
+		lines = append(lines, "Completion status: "+string(turn.CompletionStatus))
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -531,6 +536,9 @@ func mergeSummary(existing string, turn ThreadTurn) string {
 	}
 	if turn.ResultSummary != "" {
 		entry = append(entry, "Outcome: "+compressText(turn.ResultSummary))
+	}
+	if turn.CompletionStatus != "" && turn.CompletionStatus != core.CompletionFinished {
+		entry = append(entry, "Status: "+string(turn.CompletionStatus))
 	}
 	addition := strings.Join(entry, " | ")
 	if strings.TrimSpace(existing) == "" {

@@ -113,15 +113,18 @@ func (r *AgentRenderer) renderEntryLinesLocked(entry TranscriptEntry) []string {
 	case transcriptEntryAssistant:
 		return r.renderAssistantEntryLines(entry)
 	case transcriptEntryNarration:
-		return []string{"", r.timelineLine("o", entry.Summary, "")}
+		return append([]string{""}, r.wrapTimelineEntry("o", entry.Summary, "", 0)...)
 	case transcriptEntryAction:
-		lines := []string{"", r.timelineLine(r.actionGlyph(entry.Status), entry.Title, ansiGreen)}
+		lines := []string{""}
+		lines = append(lines, r.wrapTimelineEntry(r.actionGlyph(entry.Status), entry.Title, ansiGreen, 0)...)
 		if entry.Summary != "" {
-			lines = append(lines, "  "+entry.Summary)
+			for _, wrapped := range r.wrapWithWidth(entry.Summary, max(8, r.bodyWidth()-2)) {
+				lines = append(lines, "  "+wrapped)
+			}
 		}
 		return append(lines, r.renderEntryDetails(entry, "  ")...)
 	case transcriptEntryResult:
-		lines := []string{fmt.Sprintf("  %s %s", r.resultGlyph(entry.Status), entry.Summary)}
+		lines := r.wrapTimelineEntry(r.resultGlyph(entry.Status), entry.Summary, "", 2)
 		return append(lines, r.renderEntryDetails(entry, "    ")...)
 	case transcriptEntryUser:
 		out := make([]string, 0, len(entry.Details)+1)
@@ -148,6 +151,30 @@ func (r *AgentRenderer) renderEntryLinesLocked(entry TranscriptEntry) []string {
 		}
 		return lines
 	}
+}
+
+func (r *AgentRenderer) wrapTimelineEntry(glyph, text, color string, indent int) []string {
+	prefix := strings.Repeat(" ", max(0, indent)) + r.timelineLine(glyph, "", color)
+	prefix = strings.TrimRight(prefix, " ")
+	if prefix == "" {
+		prefix = strings.Repeat(" ", max(0, indent))
+	}
+	firstPrefix := prefix + " "
+	bodyWidth := max(8, r.bodyWidth()-visibleWidth(firstPrefix))
+	wrapped := r.wrapWithWidth(text, bodyWidth)
+	if len(wrapped) == 0 {
+		return []string{firstPrefix}
+	}
+	lines := make([]string, 0, len(wrapped))
+	continuationPrefix := strings.Repeat(" ", visibleWidth(firstPrefix))
+	for idx, line := range wrapped {
+		if idx == 0 {
+			lines = append(lines, firstPrefix+line)
+			continue
+		}
+		lines = append(lines, continuationPrefix+line)
+	}
+	return lines
 }
 
 func (r *AgentRenderer) renderAssistantEntryLines(entry TranscriptEntry) []string {

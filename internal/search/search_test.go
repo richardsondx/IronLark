@@ -74,3 +74,16 @@ func TestWebSearchParsesResultMarkup(t *testing.T) {
 		t.Fatalf("unexpected web results: %#v", results)
 	}
 }
+
+func TestWebSearchReturnsExplicitBotChallengeError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><body><div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div></body></html>`))
+	}))
+	defer server.Close()
+
+	searcher := Searcher{HTTPClient: server.Client(), WebSearchURL: server.URL}
+	_, err := searcher.WebSearch(context.Background(), "example", Options{MaxResults: 3})
+	if err == nil || !strings.Contains(err.Error(), "anti-bot challenge") {
+		t.Fatalf("expected anti-bot challenge error, got %v", err)
+	}
+}

@@ -13,22 +13,25 @@ import (
 )
 
 type Record struct {
-	ID             string                     `json:"id"`
-	Mode           string                     `json:"mode"`
-	Prompt         string                     `json:"prompt"`
-	Provider       string                     `json:"provider"`
-	Model          string                     `json:"model"`
-	ApprovalMode   core.ApprovalMode          `json:"approval_mode"`
-	ContextJSON    string                     `json:"context_json,omitempty"`
-	Findings       []string                   `json:"findings,omitempty"`
-	Actions        []core.Action              `json:"actions,omitempty"`
-	Results        []core.ActionResult        `json:"results,omitempty"`
-	Summary        string                     `json:"summary,omitempty"`
-	Messages       []core.ConversationMessage `json:"messages,omitempty"`
-	NeedsUserInput bool                       `json:"needs_user_input,omitempty"`
-	Confidence     float64                    `json:"confidence,omitempty"`
-	StartedAt      time.Time                  `json:"started_at"`
-	FinishedAt     time.Time                  `json:"finished_at"`
+	ID               string                     `json:"id"`
+	Mode             string                     `json:"mode"`
+	Prompt           string                     `json:"prompt"`
+	Provider         string                     `json:"provider"`
+	Model            string                     `json:"model"`
+	ApprovalMode     core.ApprovalMode          `json:"approval_mode"`
+	ContextJSON      string                     `json:"context_json,omitempty"`
+	Findings         []string                   `json:"findings,omitempty"`
+	Actions          []core.Action              `json:"actions,omitempty"`
+	Results          []core.ActionResult        `json:"results,omitempty"`
+	Summary          string                     `json:"summary,omitempty"`
+	Messages         []core.ConversationMessage `json:"messages,omitempty"`
+	NeedsUserInput   bool                       `json:"needs_user_input,omitempty"`
+	Confidence       float64                    `json:"confidence,omitempty"`
+	CompletionStatus core.CompletionStatus      `json:"completion_status,omitempty"`
+	RequestCount     int                        `json:"request_count,omitempty"`
+	TokenUsage       core.TokenUsage            `json:"token_usage,omitempty"`
+	StartedAt        time.Time                  `json:"started_at"`
+	FinishedAt       time.Time                  `json:"finished_at"`
 }
 
 type Store struct {

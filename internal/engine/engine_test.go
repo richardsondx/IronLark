@@ -16,6 +16,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
 	"github.com/richardsondx/IronLark/internal/graph"
+	"github.com/richardsondx/IronLark/internal/ops"
 	"github.com/richardsondx/IronLark/internal/patches"
 	policypkg "github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
@@ -131,6 +132,53 @@ func TestAutoAcceptHighSuppressesHighRiskApproval(t *testing.T) {
 	}
 	if engine.actionNeedsApproval(action, report, policypkg.Resolution{AutoAcceptThrough: core.RiskHigh}) {
 		t.Fatalf("expected high auto-accept threshold to suppress approval")
+	}
+}
+
+func TestShouldPromoteShellBeforeRunForLongHeuristic(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	engine.Ops = &ops.Manager{}
+	if !engine.shouldPromoteShellBeforeRun(core.Action{
+		Type:    core.ActionRunShell,
+		Command: "pipx install harbor",
+	}) {
+		t.Fatal("expected install heuristic to promote to background")
+	}
+}
+
+func TestHasErrorsIgnoresBackgroundRuns(t *testing.T) {
+	if hasErrors([]core.ActionResult{{
+		Error:           "signal: killed",
+		BackgroundRunID: "shell-1",
+	}}) {
+		t.Fatal("expected backgrounded result not to count as a blocking error")
+	}
+}
+
+func TestBuildContinuationMessageBlocksPrematureVerificationForBackgroundRun(t *testing.T) {
+	msg := buildContinuationMessage([]core.ActionResult{{
+		BackgroundRunID: "shell-1",
+		Summary:         "continuing in background run shell-1 (pid 123)",
+	}})
+	if !strings.Contains(msg.Content, "Background run status:") {
+		t.Fatalf("expected background status continuation, got %q", msg.Content)
+	}
+	if strings.Contains(msg.Content, "If the issue is resolved, finish") {
+		t.Fatalf("expected no generic finish/verify continuation, got %q", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "Do not verify completion-dependent outcomes yet") {
+		t.Fatalf("expected explicit wait guidance, got %q", msg.Content)
+	}
+}
+
+func TestBuildContinuationMessageRequiresExplicitFinishOrNextAction(t *testing.T) {
+	msg := buildContinuationMessage([]core.ActionResult{{
+		Action:   core.Action{Type: core.ActionRunShell, Title: "Inspect"},
+		Summary:  "inspect complete",
+		Approved: true,
+	}})
+	if !strings.Contains(msg.Content, "Return a finish action only if the task is complete") {
+		t.Fatalf("expected explicit finish guidance, got %q", msg.Content)
 	}
 }
 
@@ -425,6 +473,12 @@ func TestRunChatPromptContinuesUntilClosingAnswer(t *testing.T) {
 			Findings: []string{
 				"The shell check reported an OpenClaw installation marker.",
 			},
+			Actions: []core.Action{{
+				ID:     "finish-openclaw",
+				Type:   core.ActionFinish,
+				Title:  "Finish",
+				Reason: "task complete",
+			}},
 		},
 	}}
 	engine.Runtime.NoContext = true
@@ -467,6 +521,12 @@ func TestRunChatPromptExecuteFirstRunsActionWithoutFullContextRetry(t *testing.T
 		},
 		{
 			Summary: "Docker is installed.",
+			Actions: []core.Action{{
+				ID:     "finish-docker",
+				Type:   core.ActionFinish,
+				Title:  "Finish",
+				Reason: "task complete",
+			}},
 		},
 	}}
 	engine.Provider = provider
@@ -528,8 +588,11 @@ func TestRunChatPromptSynthesizesClosingAnswerWhenModelStopsAfterResults(t *test
 	if err := engine.runChatPrompt(context.Background(), "inspect root", nil, &history, record, nil, threads.ThreadRef{}); err != nil {
 		t.Fatalf("runChatPrompt() error = %v", err)
 	}
-	if !strings.Contains(record.Summary, "I completed the latest step:") {
-		t.Fatalf("expected synthesized closing summary, got %q", record.Summary)
+	if record.CompletionStatus != core.CompletionIncompleteMaxTurns {
+		t.Fatalf("expected incomplete max-turn status, got %q", record.CompletionStatus)
+	}
+	if !strings.Contains(record.Summary, "I stopped before completion after reaching the hard turn cap.") {
+		t.Fatalf("expected explicit incomplete summary, got %q", record.Summary)
 	}
 	if len(renderer.responses) == 0 || renderer.responses[len(renderer.responses)-1].Summary != record.Summary {
 		t.Fatalf("expected synthesized response to render, got %#v", renderer.responses)
@@ -580,6 +643,195 @@ func TestRunChatPromptResumesAfterStructuredUserInput(t *testing.T) {
 	}
 	if record.Summary != "The token is in place and the task can continue." {
 		t.Fatalf("expected final summary after input, got %q", record.Summary)
+	}
+}
+
+func TestRunTaskFinishesOnExplicitFinishAction(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "Checking Docker.",
+			Actions: []core.Action{{
+				ID:      "check-docker",
+				Type:    core.ActionRunShell,
+				Title:   "Check Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "check Docker",
+			}},
+		},
+		{
+			Summary: "Docker is installed.",
+			Actions: []core.Action{{
+				ID:     "finish-docker",
+				Type:   core.ActionFinish,
+				Title:  "Finish",
+				Reason: "the task is complete",
+			}},
+		},
+	}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "is docker installed?", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	records, err := engine.Sessions.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) == 0 || records[0].CompletionStatus != core.CompletionFinished {
+		t.Fatalf("expected finished completion status, got %#v", records)
+	}
+}
+
+func TestRunTaskAllowsAnswerOnlyCompletionWithoutExecutedActions(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	engine.Provider = &fakeProvider{responses: []core.LLMResponse{{
+		Summary: "Docker is installed.",
+	}}}
+	engine.Runtime.NoContext = true
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "is docker installed?", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	records, err := engine.Sessions.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) == 0 || records[0].CompletionStatus != core.CompletionFinished {
+		t.Fatalf("expected answer-only completion to finish, got %#v", records)
+	}
+}
+
+func TestRunTaskContinuesPastSoftTurnsWhenProgressIsReal(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	renderer := &trackingRenderer{}
+	engine.Renderer = renderer
+	engine.Runtime.Config.UI.NarratedProgress = true
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "Check docker.",
+			Actions: []core.Action{{
+				ID:      "check-docker",
+				Type:    core.ActionRunShell,
+				Title:   "Check Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "check docker",
+			}},
+		},
+		{
+			Summary: "Check compose.",
+			Actions: []core.Action{{
+				ID:      "check-compose",
+				Type:    core.ActionRunShell,
+				Title:   "Check Compose",
+				Command: "printf 'compose ok\\n'",
+				Reason:  "check compose",
+			}},
+		},
+		{
+			Summary: "Everything is installed.",
+			Actions: []core.Action{{
+				ID:     "finish-install",
+				Type:   core.ActionFinish,
+				Title:  "Finish",
+				Reason: "task complete",
+			}},
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Runtime.Config.Tools.SoftTurns = 1
+	engine.Runtime.Config.Tools.MaxTurns = 4
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "inspect docker stack", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	if len(provider.requests) != 3 {
+		t.Fatalf("expected continuation past soft-turn budget, got %d requests", len(provider.requests))
+	}
+	foundExtension := false
+	for _, event := range renderer.narrativeEvents {
+		if strings.Contains(event.Text, "Continuing past normal turn budget") {
+			foundExtension = true
+			break
+		}
+	}
+	if !foundExtension {
+		t.Fatalf("expected extension narration, got %#v", renderer.narrativeEvents)
+	}
+}
+
+func TestRunTaskStopsOnRepeatedNoProgressAfterSoftTurns(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	provider := &fakeProvider{responses: []core.LLMResponse{
+		{
+			Summary: "Inspect docker.",
+			Actions: []core.Action{{
+				ID:      "inspect-docker-1",
+				Type:    core.ActionRunShell,
+				Title:   "Inspect Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "inspect docker",
+			}},
+		},
+		{
+			Summary: "Inspect docker again.",
+			Actions: []core.Action{{
+				ID:      "inspect-docker-2",
+				Type:    core.ActionRunShell,
+				Title:   "Inspect Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "inspect docker",
+			}},
+		},
+		{
+			Summary: "Inspect docker again.",
+			Actions: []core.Action{{
+				ID:      "inspect-docker-3",
+				Type:    core.ActionRunShell,
+				Title:   "Inspect Docker",
+				Command: "printf 'docker ok\\n'",
+				Reason:  "inspect docker",
+			}},
+		},
+	}}
+	engine.Provider = provider
+	engine.Runtime.NoContext = true
+	engine.Runtime.Config.Tools.SoftTurns = 1
+	engine.Runtime.Config.Tools.MaxTurns = 5
+	engine.Collector = ctxpkg.New(redact.New(nil))
+	engine.Sessions = sessions.Store{Dir: filepath.Join(t.TempDir(), "sessions")}
+	if err := os.MkdirAll(engine.Sessions.Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := engine.RunTask(context.Background(), "inspect docker repeatedly", nil, "oneshot"); err != nil {
+		t.Fatalf("RunTask() error = %v", err)
+	}
+	records, err := engine.Sessions.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) == 0 || records[0].CompletionStatus != core.CompletionIncompleteNoProgress {
+		t.Fatalf("expected incomplete no-progress status, got %#v", records)
+	}
+	if len(provider.requests) != 3 {
+		t.Fatalf("expected no-progress stop before hard cap, got %d requests", len(provider.requests))
 	}
 }
 
@@ -795,6 +1047,12 @@ func TestRunTaskExecuteFirstRunsActionWithoutFullContextRetry(t *testing.T) {
 		},
 		{
 			Summary: "Docker is installed.",
+			Actions: []core.Action{{
+				ID:     "finish-docker-task",
+				Type:   core.ActionFinish,
+				Title:  "Finish",
+				Reason: "task complete",
+			}},
 		},
 	}}
 	engine.Provider = provider
@@ -1393,6 +1651,10 @@ func (f *fakeProvider) Generate(ctx context.Context, req provider.Request) (core
 	return resp, nil
 }
 
+func (f *fakeProvider) WebSearch(ctx context.Context, req provider.SearchRequest) ([]string, error) {
+	return nil, provider.ErrWebSearchUnsupported
+}
+
 type trackingRenderer struct {
 	beginCalls          int
 	endCalls            int
@@ -1434,6 +1696,7 @@ func (r *trackingRenderer) EndThinking()                                        
 func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)                 { r.lastInteraction = mode }
 func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)                       { r.lastApproval = mode }
 func (r *trackingRenderer) SetModelContext(provider, model string, options []string) {}
+func (r *trackingRenderer) SetOpsSummary(summary string)                             {}
 func (r *trackingRenderer) SetSecretVisibility(visible bool)                         {}
 func (r *trackingRenderer) SecretVisibility() string                                 { return "visible" }
 func (r *trackingRenderer) ClearScreen()                                             { r.clearCalls++ }

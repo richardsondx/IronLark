@@ -216,6 +216,9 @@ func (s Searcher) WebSearch(ctx context.Context, query string, opts Options) ([]
 	if err != nil {
 		return nil, err
 	}
+	if looksLikeBotChallenge(body) {
+		return nil, fmt.Errorf("web search provider blocked the request with an anti-bot challenge")
+	}
 	re := regexp.MustCompile(`(?s)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>`)
 	snippetRe := regexp.MustCompile(`(?s)<a[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>|<div[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</div>`)
 	matches := re.FindAllStringSubmatch(body, opts.MaxResults)
@@ -231,7 +234,7 @@ func (s Searcher) WebSearch(ctx context.Context, query string, opts Options) ([]
 		results = append(results, fmt.Sprintf("%s | %s | %s", title, link, snippet))
 	}
 	if len(results) == 0 {
-		return nil, fmt.Errorf("no web results parsed")
+		return nil, fmt.Errorf("web search returned a page without parseable results")
 	}
 	return results, nil
 }
@@ -339,6 +342,13 @@ func tokenize(value string) []string {
 		out = append(out, part)
 	}
 	return out
+}
+
+func looksLikeBotChallenge(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "anomaly-modal") ||
+		strings.Contains(lower, "bots use duckduckgo too") ||
+		strings.Contains(lower, "complete the following challenge")
 }
 
 func scoreChunk(queryTokens []string, path, chunk string) float64 {

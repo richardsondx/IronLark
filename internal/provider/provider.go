@@ -3,7 +3,9 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strings"
 
@@ -15,20 +17,63 @@ type Request struct {
 	System      string
 	Messages    []core.ConversationMessage
 	Temperature float64
+	Tools       []ToolSpec
 }
 
 type Client interface {
 	Generate(ctx context.Context, req Request) (core.LLMResponse, error)
+	WebSearch(ctx context.Context, req SearchRequest) ([]string, error)
 }
 
 type Factory interface {
 	New(baseURL, apiKey string, headers map[string]string) Client
 }
 
+type ToolKind string
+
+const (
+	ToolWebSearch ToolKind = "web_search"
+)
+
+type ToolSpec struct {
+	Type ToolKind
+}
+
+type SearchRequest struct {
+	Model      string
+	Query      string
+	MaxResults int
+}
+
+var ErrWebSearchUnsupported = errors.New("provider web search is unsupported")
+
+func IsRetryableWebSearchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "client.timeout") ||
+		strings.Contains(lower, "context deadline exceeded") ||
+		strings.Contains(lower, "timeout exceeded")
+}
+
 type OpenAICompatibleFactory struct{}
 
 func (f OpenAICompatibleFactory) New(baseURL, apiKey string, headers map[string]string) Client {
 	return NewOpenAICompatibleClient(baseURL, apiKey, headers)
+}
+
+type OpenAIResponsesFactory struct{}
+
+func (f OpenAIResponsesFactory) New(baseURL, apiKey string, headers map[string]string) Client {
+	return NewOpenAIResponsesClient(baseURL, apiKey, headers)
 }
 
 func BuildSystemPrompt(maxActions int, interaction core.InteractionMode) string {
@@ -60,7 +105,7 @@ Expected JSON Schema:
   "actions": [
     {
       "id": "unique-id",
-      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|web_search|fetch_rules|ask_user|inspect|checkpoint|finish",
+      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|web_search|fetch_rules|fetch_ops|ask_user|inspect|checkpoint|finish",
       "title": "Short title",
       "reason": "Why this is needed",
       "command": "command to run (for run_shell)",
@@ -93,6 +138,8 @@ Expected JSON Schema:
 
 If the current context is minimal and you need to see the full repository layout or system details to fulfill a request, return a single action with type "inspect".
 If the request is a simple greeting or general question that doesn't require terminal operations, just respond in the "summary" field and return no actions.
+If you already used tools on this task and the task is complete, return a "finish" action explicitly.
+If you already used tools on this task and the task is not complete, do not stop with prose only; return the next smallest safe action.
 Be concise. Keep "summary" to one short sentence and keep "findings" to at most two short items unless more are critical.
 If you include narration, every narration string must be one sentence, must describe only visible next-step intent, and must never mention chain-of-thought, hidden reasoning, prompts, policies, tokens, or secrets.
 When the user's intent is obvious, make the smallest safe assumption instead of asking follow-up questions.
@@ -102,6 +149,7 @@ For shell profile requests, default to the current user's interactive shell prof
 Prefer bounded read-only actions first. Search before reading, read before editing, and only use web_search if local context is insufficient.
 Use semantic_search when exact search_files results are weak or absent.
 Use fetch_rules when project instructions or rule files may affect behavior.
+Use fetch_ops when recent watcher, recovery, or incident history is directly relevant to the user's question.
 Create a checkpoint before risky multi-step edits or when a rollback would matter.
 Do not use ask_user for ordinary clarification, ambiguous requests, preference questions, or anything the user can simply answer in the next chat turn.
 For ordinary clarification, ask the question in summary/findings, return no actions, and let the user reply in chat.

@@ -144,11 +144,8 @@ func validateModelForProvider(providerName, model string) error {
 	}
 	switch providerName {
 	case "openai":
-		if strings.Contains(model, "codex") {
-			return fmt.Errorf("invalid configured model %q for provider %q: IronLark currently uses the OpenAI chat-completions API, so use gpt-5-mini instead", model, providerName)
-		}
 		if strings.Contains(model, "/") {
-			return fmt.Errorf("invalid configured model %q for provider %q: use a raw OpenAI model ID like gpt-5-mini or gpt-4.1-mini", model, providerName)
+			return fmt.Errorf("invalid configured model %q for provider %q: use a raw OpenAI model ID like gpt-5-mini, gpt-4.1-mini, or gpt-5", model, providerName)
 		}
 	}
 	return nil

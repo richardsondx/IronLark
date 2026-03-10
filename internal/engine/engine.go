@@ -19,6 +19,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/executor"
 	"github.com/richardsondx/IronLark/internal/graph"
 	"github.com/richardsondx/IronLark/internal/models"
+	"github.com/richardsondx/IronLark/internal/ops"
 	"github.com/richardsondx/IronLark/internal/policy"
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/render"
@@ -40,6 +41,31 @@ type Engine struct {
 	Threads     threads.Store
 	PolicyStore policy.Store
 	Graph       *graph.Manager
+	Ops         *ops.Manager
+}
+
+type turnBudget struct {
+	Soft int
+	Hard int
+}
+
+type completionTracker struct {
+	budget            turnBudget
+	executedActions   bool
+	noProgressStreak  int
+	lastActionKey     string
+	lastResultKey     string
+	lastReplyKey      string
+	lastStage         string
+	extensionNarrated bool
+}
+
+type continuationDecision struct {
+	Continue         bool
+	Continuation     *core.ConversationMessage
+	Status           core.CompletionStatus
+	AnnounceExtended bool
+	AnnounceHardCap  bool
 }
 
 func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode string) error {
@@ -52,8 +78,9 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		return err
 	}
 	graphDigest := e.ensureGraphDigest(ctx, graph.ModeLight)
+	opsDigest := e.ensureOpsDigest()
 
-	threadRef, threadState, history, err := e.prepareTaskHistory(prompt, snapshot, graphDigest)
+	threadRef, threadState, history, err := e.prepareTaskHistory(prompt, snapshot, graphDigest, opsDigest)
 	if err != nil {
 		return err
 	}
@@ -69,32 +96,35 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		StartedAt:    time.Now().UTC(),
 	}
 
-	var finalSummary string
+	budget := resolveTurnBudget(e.Runtime.Config.Tools.SoftTurns, e.Runtime.Config.Tools.MaxTurns)
+	tracker := completionTracker{budget: budget}
+	var finalResponse core.LLMResponse
+	var finalStatus core.CompletionStatus
+	allResults := make([]core.ActionResult, 0)
 	isMinimalContext := true
 	consecutiveFailures := 0
-	maxTurns := e.Runtime.Config.Tools.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 5
-	}
 	skipTurnStartNarration := false
-	for turn := 0; turn < maxTurns; turn++ {
+	for turn := 0; turn < budget.Hard; turn++ {
 		narrator := newTurnNarrator(time.Now().UnixNano()+int64(turn), nil)
 		if !skipTurnStartNarration {
 			e.narrate(narrator.turnStarted())
 		}
 		skipTurnStartNarration = false
 		e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
-		response, err := e.Provider.Generate(ctx, provider.Request{
+		request := provider.Request{
 			Model:       e.Runtime.Model,
 			System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 			Messages:    history,
 			Temperature: 0.1,
-		})
+		}
+		response, err := e.Provider.Generate(ctx, request)
 		e.Renderer.EndThinking()
 		if err != nil {
 			return err
 		}
 		response = normalizedResponse(response)
+		record.RequestCount++
+		record.TokenUsage = record.TokenUsage.Add(usageOrEstimate(request, response))
 		narrator = newTurnNarrator(time.Now().UnixNano()+int64(turn), response.Narration)
 		e.narrate(narrator.intent(response))
 
@@ -112,7 +142,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			skipTurnStartNarration = true
 
 			// Replace initial user message with full context and re-run the generation
-			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot, graphDigest)
+			history[len(history)-1].Content = buildInitialPrompt(prompt, fullSnapshot, graphDigest, opsDigest)
 			continue
 		}
 
@@ -121,7 +151,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		record.NeedsUserInput = response.NeedsUserInput
 		record.Confidence = response.Confidence
 		response = ensureVisibleResponse(response)
-		finalSummary = response.Summary
+		finalResponse = response
 
 		if err := e.Renderer.Response(response); err != nil {
 			return err
@@ -131,10 +161,11 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 		if err != nil {
 			return err
 		}
-		record.Results = append(record.Results, sanitizeResults(results)...)
+		safeResults := sanitizeResults(results)
+		allResults = append(allResults, safeResults...)
 		if hasErrors(results) {
 			consecutiveFailures++
-		} else {
+		} else if len(results) > 0 {
 			consecutiveFailures = 0
 		}
 
@@ -149,25 +180,61 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 			continue
 		}
 
-		if stop || len(results) == 0 || reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures) {
-			e.narrate(narrator.turnFinished(finalSummary))
-			break
+		decision := tracker.decideContinuation(response, safeResults, stop, reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures), turn+1)
+		if decision.AnnounceExtended {
+			e.narrate(narrator.budgetExtended())
 		}
-		history = append(history, buildContinuationMessage(results))
+		if decision.Continue {
+			if decision.Continuation != nil {
+				history = append(history, *decision.Continuation)
+			}
+			continue
+		}
+		finalStatus = decision.Status
+		if decision.AnnounceHardCap {
+			e.narrate(narrator.hardCapReached())
+		}
+		e.narrate(narrator.turnFinished(finalResponse.Summary))
+		break
 	}
 
-	record.Summary = finalSummary
+	if finalStatus == "" {
+		if tracker.executedActions {
+			finalStatus = core.CompletionIncompleteMaxTurns
+		} else {
+			finalStatus = core.CompletionFinished
+		}
+	}
+	if shouldSynthesizeOutcome(finalStatus, finalResponse, tracker.executedActions) {
+		finalResponse = synthesizedClosingResponse(finalStatus, finalResponse, allResults)
+		record.Findings = append(record.Findings, finalResponse.Findings...)
+		record.Actions = append(record.Actions, finalResponse.Actions...)
+		record.NeedsUserInput = finalResponse.NeedsUserInput
+		record.Confidence = finalResponse.Confidence
+		if err := e.Renderer.Response(finalResponse); err != nil {
+			return err
+		}
+		rawResponse, _ := json.Marshal(finalResponse)
+		history = append(history, core.ConversationMessage{
+			Role:    "assistant",
+			Content: string(rawResponse),
+		})
+	}
+
+	record.Summary = finalResponse.Summary
+	record.Results = allResults
 	record.Messages = sanitizeMessages(history)
+	record.CompletionStatus = finalStatus
 	record.FinishedAt = time.Now().UTC()
 	if err := e.Sessions.Save(record); err != nil {
 		return err
 	}
 	if threadState != nil {
 		*threadState = e.Threads.AppendTurn(*threadState, prompt, core.LLMResponse{
-			Summary:  finalSummary,
+			Summary:  finalResponse.Summary,
 			Findings: record.Findings,
 			Actions:  record.Actions,
-		}, record.Results, threads.AppendOptions{
+		}, record.Results, finalStatus, threads.AppendOptions{
 			ResultCharLimit: e.Runtime.Config.Thread.MaxResultChars,
 			ThreadConfig:    e.Runtime.Config.Thread,
 		})
@@ -208,7 +275,14 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 		}
 	}
 
+	lastOpsSummary := ""
 	for {
+		currentOpsSummary := e.ensureOpsDigest()
+		e.Renderer.SetOpsSummary(currentOpsSummary)
+		if strings.TrimSpace(currentOpsSummary) != "" && lastOpsSummary != "" && currentOpsSummary != lastOpsSummary {
+			e.Renderer.Message("Background ops update: " + currentOpsSummary)
+		}
+		lastOpsSummary = currentOpsSummary
 		promptRaw, err := e.Renderer.ReadPrompt("> ")
 		if err != nil {
 			if isChatInputClosedError(err) {
@@ -274,6 +348,7 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 			case "/model":
 				if len(args) > 0 {
 					e.Runtime.Model = args[0]
+					e.Executor.ProviderModel = e.Runtime.Model
 					e.Renderer.SetModelContext(
 						e.Runtime.ProviderName,
 						e.Runtime.Model,
@@ -296,7 +371,13 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 					if providerCfg, err := e.Runtime.ProviderConfig(); err == nil {
 						if apiKey, keyErr := e.Runtime.APIKey(); keyErr == nil {
 							if providerCfg.Type == "openai-compatible" {
-								e.Provider = provider.OpenAICompatibleFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+								if e.Runtime.ProviderName == "openai" {
+									e.Provider = provider.OpenAIResponsesFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+								} else {
+									e.Provider = provider.OpenAICompatibleFactory{}.New(providerCfg.BaseURL, apiKey, providerCfg.Headers)
+								}
+								e.Executor.Provider = e.Provider
+								e.Executor.ProviderModel = e.Runtime.Model
 								e.Renderer.SetModelContext(
 									e.Runtime.ProviderName,
 									e.Runtime.Model,
@@ -321,11 +402,75 @@ func (e *Engine) RunChat(ctx context.Context, initialPrompt string, stdin []byte
 				e.Renderer.ClearScreen()
 				e.Renderer.Message("Chat history cleared. Starting fresh.")
 				continue
+			case "/ops":
+				if e.Ops == nil {
+					e.Renderer.Message("Operational memory is unavailable.")
+					continue
+				}
+				summary := e.ensureOpsDigest()
+				if strings.TrimSpace(summary) == "" {
+					summary = "ops: idle"
+				}
+				result, err := e.Ops.Query("", time.Now().UTC().Add(-24*time.Hour), 8)
+				if err != nil {
+					e.Renderer.Message(err.Error())
+					continue
+				}
+				data, _ := json.MarshalIndent(map[string]any{
+					"summary": summary,
+					"ops":     result,
+				}, "", "  ")
+				e.Renderer.Message(string(data))
+				continue
+			case "/watch":
+				if e.Ops == nil {
+					e.Renderer.Message("Operational runtime is unavailable.")
+					continue
+				}
+				if len(args) == 0 {
+					e.Renderer.Message("Usage: /watch <query>")
+					continue
+				}
+				executable, err := os.Executable()
+				if err != nil {
+					e.Renderer.Message(err.Error())
+					continue
+				}
+				watcher, pid, err := e.Ops.StartWatcher(ctx, e.opsRuntimeDeps(), strings.Join(args, " "), executable)
+				if err != nil {
+					e.Renderer.Message(err.Error())
+					continue
+				}
+				e.Renderer.Message(fmt.Sprintf("Started watcher %s for %s (pid %d)", watcher.ID, watcher.Entity.DisplayName, pid))
+				e.Renderer.SetOpsSummary(e.ensureOpsDigest())
+				continue
+			case "/recover":
+				if e.Ops == nil {
+					e.Renderer.Message("Operational runtime is unavailable.")
+					continue
+				}
+				if len(args) == 0 {
+					e.Renderer.Message("Usage: /recover <goal>")
+					continue
+				}
+				executable, err := os.Executable()
+				if err != nil {
+					e.Renderer.Message(err.Error())
+					continue
+				}
+				spec, pid, err := e.Ops.StartRecovery(ctx, e.opsRuntimeDeps(), strings.Join(args, " "), executable)
+				if err != nil {
+					e.Renderer.Message(err.Error())
+					continue
+				}
+				e.Renderer.Message(fmt.Sprintf("Started recovery %s for %s (pid %d)", spec.ID, spec.Entity.DisplayName, pid))
+				e.Renderer.SetOpsSummary(e.ensureOpsDigest())
+				continue
 			case "/exit":
 				record.FinishedAt = time.Now().UTC()
 				return e.Sessions.Save(record)
 			case "/help":
-				e.Renderer.Message("Available slash commands:\n  /mode [name]      - Get or set execute-first / plan-first\n  /approval [name]  - Get or set confirm / auto-safe / agent / suggest\n  /secret [state]   - Get or set secret input visibility\n  /model [name]     - Get or set the current model\n  /provider [name]  - Get or set the current provider\n  /clear            - Clear the conversation history\n  /help             - Show this menu\n  /exit             - Exit the agent session")
+				e.Renderer.Message("Available slash commands:\n  /mode [name]      - Get or set execute-first / plan-first\n  /approval [name]  - Get or set confirm / auto-safe / agent / suggest\n  /secret [state]   - Get or set secret input visibility\n  /model [name]     - Get or set the current model\n  /provider [name]  - Get or set the current provider\n  /ops              - Show watcher and recovery activity\n  /watch <query>    - Start a background watcher\n  /recover <goal>   - Start a background recovery run\n  /clear            - Clear the conversation history\n  /help             - Show this menu\n  /exit             - Exit the agent session")
 				continue
 			default:
 				e.Renderer.Message(fmt.Sprintf("Unknown command: %s. Type /help for a list of commands.", cmd))
@@ -411,26 +556,24 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	}
 	minimalSnapshot := snapshot
 	graphDigest := e.ensureGraphDigest(ctx, graph.ModeLight)
+	opsDigest := e.ensureOpsDigest()
 	turnStart := len(*history)
 	*history = append(*history, core.ConversationMessage{
 		Role:    "user",
-		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
+		Content: buildInitialPrompt(prompt, snapshot, graphDigest, opsDigest),
 	})
 
-	maxTurns := e.Runtime.Config.Tools.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 5
-	}
+	budget := resolveTurnBudget(e.Runtime.Config.Tools.SoftTurns, e.Runtime.Config.Tools.MaxTurns)
+	tracker := completionTracker{budget: budget}
 	usingFullContext := false
 	usingDirectRetry := false
 
 	var finalResponse core.LLMResponse
 	allResults := make([]core.ActionResult, 0)
+	var finalStatus core.CompletionStatus
 	consecutiveFailures := 0
-	executedActions := false
-	hadClosingAnswer := false
 
-	for turn := 0; turn < maxTurns; turn++ {
+	for turn := 0; turn < budget.Hard; turn++ {
 		var response core.LLMResponse
 		turnStartNarrated := false
 		for attempts := 0; attempts < 4; attempts++ {
@@ -441,12 +584,13 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 			}
 			e.Renderer.BeginThinking(e.thinkingLabelWithPhase("Understanding the task"))
 			var stopped bool
-			response, stopped, err = e.generateResponse(ctx, provider.Request{
+			request := provider.Request{
 				Model:       e.Runtime.Model,
 				System:      provider.BuildSystemPrompt(e.Runtime.Config.Context.MaxActions, e.Runtime.Interaction),
 				Messages:    *history,
 				Temperature: 0.1,
-			})
+			}
+			response, stopped, err = e.generateResponse(ctx, request)
 			e.Renderer.EndThinking()
 			if err != nil {
 				return err
@@ -455,6 +599,8 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 				e.narrate(narrator.interrupted())
 				return errTurnStopped
 			}
+			record.RequestCount++
+			record.TokenUsage = record.TokenUsage.Add(usageOrEstimate(request, response))
 			response = normalizedResponse(response)
 			if shouldReplaceWithGreetingSummary(prompt, response) {
 				response = greetingOnlyResponse(prompt)
@@ -466,7 +612,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 				}
 				usingFullContext = true
 				snapshot = fullSnapshot
-				(*history)[len(*history)-1].Content = buildInitialPrompt(prompt, snapshot, graphDigest)
+				(*history)[len(*history)-1].Content = buildInitialPrompt(prompt, snapshot, graphDigest, opsDigest)
 				e.narrate(narrator.contextShift())
 				continue
 			}
@@ -493,7 +639,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 			break
 		}
 
-		if executedActions && isSyntheticFallbackResponse(response) {
+		if tracker.executedActions && isSyntheticFallbackResponse(response) {
 			finalResponse = core.LLMResponse{}
 			break
 		}
@@ -521,36 +667,43 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 		})
 
 		if len(results) > 0 {
-			executedActions = true
 			if hasErrors(results) {
 				consecutiveFailures++
 			} else {
 				consecutiveFailures = 0
 			}
-			if stop {
-				hadClosingAnswer = responseHasVisibleContent(response)
-				e.narrate(narrator.turnFinished(response.Summary))
-				break
+		}
+		decision := tracker.decideContinuation(response, safeResults, stop, reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures), turn+1)
+		if decision.AnnounceExtended {
+			e.narrate(narrator.budgetExtended())
+		}
+		if decision.Continue {
+			if decision.Continuation != nil {
+				*history = append(*history, *decision.Continuation)
 			}
-			if reachedFailureLimit(consecutiveFailures, e.Runtime.Config.Tools.MaxConsecutiveFailures) {
-				break
-			}
-			*history = append(*history, buildContinuationMessage(results))
 			continue
 		}
-
-		if stop || (len(response.Actions) == 0 && len(response.Verification) == 0) {
-			hadClosingAnswer = responseHasVisibleContent(response)
-			e.narrate(narrator.turnFinished(response.Summary))
-			break
+		finalStatus = decision.Status
+		if decision.AnnounceHardCap {
+			e.narrate(narrator.hardCapReached())
 		}
+		e.narrate(narrator.turnFinished(response.Summary))
+		break
 	}
 
 	record.Prompt += "\n" + prompt
 	record.ContextJSON = snapshot.JSON()
 
-	if executedActions && !hadClosingAnswer {
-		finalResponse = synthesizedClosingResponse(allResults)
+	if finalStatus == "" {
+		if tracker.executedActions {
+			finalStatus = core.CompletionIncompleteMaxTurns
+		} else {
+			finalStatus = core.CompletionFinished
+		}
+	}
+
+	if shouldSynthesizeOutcome(finalStatus, finalResponse, tracker.executedActions) {
+		finalResponse = synthesizedClosingResponse(finalStatus, finalResponse, allResults)
 		record.Findings = append(record.Findings, finalResponse.Findings...)
 		record.Actions = append(record.Actions, finalResponse.Actions...)
 		record.NeedsUserInput = finalResponse.NeedsUserInput
@@ -568,12 +721,13 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 	record.Summary = finalResponse.Summary
 	record.Results = append(record.Results, allResults...)
 	record.Messages = sanitizeMessages(*history)
+	record.CompletionStatus = finalStatus
 	record.FinishedAt = time.Now().UTC()
 	if err := e.Sessions.Save(*record); err != nil {
 		return err
 	}
 	if threadState != nil {
-		*threadState = e.Threads.AppendTurn(*threadState, prompt, finalResponse, allResults, threads.AppendOptions{
+		*threadState = e.Threads.AppendTurn(*threadState, prompt, finalResponse, allResults, finalStatus, threads.AppendOptions{
 			ResultCharLimit: e.Runtime.Config.Thread.MaxResultChars,
 			ThreadConfig:    e.Runtime.Config.Thread,
 		})
@@ -901,6 +1055,17 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 	if narrator != nil {
 		e.narrate(narrator.actionStarted(action))
 	}
+	if action.Type == core.ActionRunShell {
+		if promoted, ok, err := e.maybePromoteShellAction(ctx, action, report); ok || err != nil {
+			if err == nil {
+				e.Renderer.Result(promoted)
+				if narrator != nil {
+					e.narrate(narrator.actionFinished(promoted))
+				}
+			}
+			return promoted, false, err
+		}
+	}
 	if showProgress && !e.Runtime.JSONOutput {
 		e.Renderer.ActionProgress(action)
 	}
@@ -913,6 +1078,16 @@ func (e *Engine) executeAction(ctx context.Context, action core.Action, report c
 		}
 	}
 	result, err := execFn(ctx, action, readOnly)
+	if err != nil && action.Type == core.ActionRunShell && result.BackgroundRecommended {
+		if promoted, ok, promoteErr := e.promoteShellFailure(ctx, action, result); ok || promoteErr != nil {
+			if promoteErr == nil {
+				result = promoted
+				err = nil
+			} else {
+				err = promoteErr
+			}
+		}
+	}
 	e.Renderer.Result(result)
 	if narrator != nil {
 		e.narrate(narrator.actionFinished(result))
@@ -957,6 +1132,9 @@ func (e *Engine) promptForActionDecision(action core.Action, report core.RiskRep
 
 func hasErrors(results []core.ActionResult) bool {
 	for _, result := range results {
+		if result.BackgroundRunID != "" {
+			continue
+		}
 		if result.Error != "" {
 			return true
 		}
@@ -971,6 +1149,120 @@ func reachedFailureLimit(current, limit int) bool {
 	return current >= limit
 }
 
+func resolveTurnBudget(soft, hard int) turnBudget {
+	if hard <= 0 {
+		hard = 12
+	}
+	if soft <= 0 {
+		soft = 5
+	}
+	if soft > hard {
+		soft = hard
+	}
+	return turnBudget{Soft: soft, Hard: hard}
+}
+
+func (t *completionTracker) decideContinuation(response core.LLMResponse, results []core.ActionResult, stop, failureLimitHit bool, turnUsed int) continuationDecision {
+	finishSeen := responseHasFinishAction(response)
+	if finishSeen {
+		return continuationDecision{Status: core.CompletionFinished}
+	}
+	if blockedByUserInput(response, results, stop) {
+		return continuationDecision{Status: core.CompletionBlockedUserInput}
+	}
+	if hasBackgroundRun(results) {
+		return continuationDecision{Status: core.CompletionBackgroundContinuing}
+	}
+	if failureLimitHit {
+		return continuationDecision{Status: core.CompletionFailed}
+	}
+	if turnUsed >= t.budget.Hard {
+		if t.executedActions {
+			return continuationDecision{Status: core.CompletionIncompleteMaxTurns, AnnounceHardCap: true}
+		}
+		return continuationDecision{Status: core.CompletionFinished}
+	}
+
+	actionKey, resultKey, stage, executedTool := fingerprintExecutedResults(results)
+	if executedTool {
+		progress := !t.executedActions || actionKey != t.lastActionKey || resultKey != t.lastResultKey || stage != t.lastStage
+		t.executedActions = true
+		if turnUsed >= t.budget.Soft {
+			if progress {
+				t.noProgressStreak = 0
+			} else {
+				t.noProgressStreak++
+			}
+		} else {
+			t.noProgressStreak = 0
+		}
+		t.lastActionKey = actionKey
+		t.lastResultKey = resultKey
+		t.lastReplyKey = ""
+		t.lastStage = stage
+		if turnUsed >= t.budget.Soft && t.noProgressStreak >= 2 {
+			return continuationDecision{Status: core.CompletionIncompleteNoProgress}
+		}
+		msg := buildContinuationMessage(results)
+		decision := continuationDecision{
+			Continue:     true,
+			Continuation: &msg,
+		}
+		if turnUsed >= t.budget.Soft && !t.extensionNarrated {
+			decision.AnnounceExtended = true
+			t.extensionNarrated = true
+		}
+		return decision
+	}
+
+	if len(results) > 0 {
+		msg := buildContinuationMessage(results)
+		return continuationDecision{
+			Continue:     true,
+			Continuation: &msg,
+		}
+	}
+
+	if t.executedActions && len(response.Actions) == 0 && len(response.Verification) == 0 && !response.NeedsUserInput {
+		replyKey := strings.TrimSpace(response.Summary) + "|" + strings.Join(response.Findings, "|")
+		if turnUsed >= t.budget.Soft {
+			if replyKey == t.lastReplyKey {
+				t.noProgressStreak++
+			} else {
+				t.noProgressStreak = 0
+			}
+		}
+		t.lastReplyKey = replyKey
+		if turnUsed >= t.budget.Soft && t.noProgressStreak >= 2 {
+			return continuationDecision{Status: core.CompletionIncompleteNoProgress}
+		}
+		msg := explicitFinishContinuationMessage(response)
+		decision := continuationDecision{
+			Continue:     true,
+			Continuation: &msg,
+		}
+		if turnUsed >= t.budget.Soft && !t.extensionNarrated {
+			decision.AnnounceExtended = true
+			t.extensionNarrated = true
+		}
+		return decision
+	}
+
+	if !t.executedActions && (stop || (len(response.Actions) == 0 && len(response.Verification) == 0)) {
+		return continuationDecision{Status: core.CompletionFinished}
+	}
+
+	if len(response.Actions) > 0 || len(response.Verification) > 0 {
+		msg := missingActionContinuationMessage(response)
+		return continuationDecision{
+			Continue:     true,
+			Continuation: &msg,
+		}
+	}
+
+	return continuationDecision{Status: core.CompletionFinished}
+}
+
 func buildContinuationMessage(results []core.ActionResult) core.ConversationMessage {
 	if followUp := findFollowUp(results); followUp != nil {
 		return core.ConversationMessage{
@@ -982,35 +1274,138 @@ func buildContinuationMessage(results []core.ActionResult) core.ConversationMess
 			),
 		}
 	}
+	if runID, summary, ok := findBackgroundRunContinuation(results); ok {
+		return core.ConversationMessage{
+			Role: "user",
+			Content: fmt.Sprintf("Background run status:\nrun_id=%s\nstate=running\nsummary=%s\nThe durable shell run is still active. Do not verify completion-dependent outcomes yet. Wait, inspect logs, or explain that the task is continuing in background until this run succeeds or fails.",
+				runID,
+				summary,
+			),
+		}
+	}
 	resultsJSON, _ := json.Marshal(results)
 	return core.ConversationMessage{
 		Role: "user",
 		Content: "Action results:\n" + string(resultsJSON) +
-			"\nIf the issue is resolved, finish. Otherwise propose the next smallest safe step.",
+			"\nReturn a finish action only if the task is complete. Otherwise return the next smallest safe action.",
 	}
 }
 
-func synthesizedClosingResponse(results []core.ActionResult) core.LLMResponse {
-	if len(results) == 0 {
-		return core.LLMResponse{
-			Summary: "I completed the available steps, but I do not have a clearer closing answer yet.",
-		}
+func synthesizedClosingResponse(status core.CompletionStatus, response core.LLMResponse, results []core.ActionResult) core.LLMResponse {
+	latest := latestUsefulResult(results)
+	latestText := "no additional result details were captured"
+	if latest != nil {
+		latestText = firstNonEmpty(latest.Summary, latest.Error, latest.Action.Reason, latest.Action.Title, latest.Action.Command, latest.Action.Query, latest.Action.Path)
 	}
-	last := results[len(results)-1]
-	switch {
-	case last.Error != "":
+	nextStep := nextRequiredStepHint(response, results)
+	switch status {
+	case core.CompletionFinished:
 		return core.LLMResponse{
-			Summary: fmt.Sprintf("I ran the requested steps, but the latest one failed: %s.", firstNonEmpty(last.Summary, last.Error, last.Action.Title)),
+			Summary: fmt.Sprintf("I completed the task. Latest confirmed step: %s.", latestText),
 		}
-	case last.Skipped:
+	case core.CompletionIncompleteMaxTurns:
 		return core.LLMResponse{
-			Summary: fmt.Sprintf("I got partway through the task, but the latest step did not run: %s.", firstNonEmpty(last.Summary, last.Action.Title)),
+			Summary: fmt.Sprintf("I stopped before completion after reaching the hard turn cap. Latest useful result: %s. Next required step: %s.", latestText, nextStep),
+		}
+	case core.CompletionIncompleteNoProgress:
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I stopped before completion because the last turns were repeating without new progress. Latest useful result: %s. Next required step: %s.", latestText, nextStep),
+		}
+	case core.CompletionBlockedUserInput:
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I’m blocked on required user input before the task can complete. Next required step: %s.", nextStep),
+		}
+	case core.CompletionFailed:
+		return core.LLMResponse{
+			Summary: fmt.Sprintf("I stopped before completion because repeated action failures prevented further progress. Latest failure: %s. Next required step: %s.", latestText, nextStep),
+		}
+	case core.CompletionBackgroundContinuing:
+		if latest != nil && latest.BackgroundRunID != "" {
+			return core.LLMResponse{
+				Summary: fmt.Sprintf("I moved the remaining work into durable background run %s, so the task is continuing outside this turn.", latest.BackgroundRunID),
+			}
+		}
+		return core.LLMResponse{
+			Summary: "The task is continuing outside this turn in background work.",
 		}
 	default:
 		return core.LLMResponse{
-			Summary: fmt.Sprintf("I completed the latest step: %s. If you want, I can keep digging into the result.", firstNonEmpty(last.Summary, last.Action.Title)),
+			Summary: fmt.Sprintf("I stopped before completion. Latest useful result: %s. Next required step: %s.", latestText, nextStep),
 		}
 	}
+}
+
+func (e *Engine) maybePromoteShellAction(ctx context.Context, action core.Action, report core.RiskReport) (core.ActionResult, bool, error) {
+	if !e.shouldPromoteShellBeforeRun(action) {
+		return core.ActionResult{}, false, nil
+	}
+	return e.startBackgroundShellRun(ctx, action, report, ops.ShellPromotionLongExpected)
+}
+
+func (e *Engine) promoteShellFailure(ctx context.Context, action core.Action, failed core.ActionResult) (core.ActionResult, bool, error) {
+	var reason ops.ShellPromotionReason
+	switch failed.FailureKind {
+	case core.ShellFailureTimeout:
+		reason = ops.ShellPromotionTimedOut
+	case core.ShellFailureSignalKilled:
+		reason = ops.ShellPromotionSignalKilled
+	case core.ShellFailureStalled:
+		reason = ops.ShellPromotionStalled
+	default:
+		return core.ActionResult{}, false, nil
+	}
+	return e.startBackgroundShellRun(ctx, action, failed.Risk, reason)
+}
+
+func (e *Engine) startBackgroundShellRun(ctx context.Context, action core.Action, report core.RiskReport, reason ops.ShellPromotionReason) (core.ActionResult, bool, error) {
+	if e.Ops == nil {
+		return core.ActionResult{}, false, nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return core.ActionResult{}, false, err
+	}
+	status, pid, err := e.Ops.StartShellRun(ctx, e.opsRuntimeDeps(), action, reason, executable)
+	if err != nil {
+		return core.ActionResult{}, false, err
+	}
+	result := core.ActionResult{
+		Action:                action,
+		Risk:                  report,
+		Approved:              true,
+		BackgroundRunID:       status.Spec.ID,
+		BackgroundRecommended: true,
+		Retryable:             true,
+		Summary:               fmt.Sprintf("continuing in background run %s (pid %d)", status.Spec.ID, pid),
+	}
+	return result, true, nil
+}
+
+func (e *Engine) shouldPromoteShellBeforeRun(action core.Action) bool {
+	if e.Ops == nil || action.Type != core.ActionRunShell {
+		return false
+	}
+	if !e.Runtime.Config.Tools.AutoBackgroundLongRunsValue() {
+		return false
+	}
+	if action.TimeoutSec > 0 && action.TimeoutSec > e.Runtime.Config.Tools.InlineShellTimeoutSec {
+		return true
+	}
+	if !e.Runtime.Config.Tools.LongRunHeuristicsEnabledValue() {
+		return false
+	}
+	command := strings.ToLower(action.Command)
+	for _, token := range []string{
+		"pip install", "pipx install", "npm install", "pnpm install", "yarn install",
+		"apt-get install", "brew install", "docker build", "docker pull", "go test",
+		"cargo test", "pytest", "make install", "make build", "bundle install",
+		"terraform apply", "kubectl apply", "migrate", "migration", "deploy",
+	} {
+		if strings.Contains(command, token) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldNudgeForExecutableStep(response core.LLMResponse, results []core.ActionResult) bool {
@@ -1056,9 +1451,128 @@ func shouldNudgeForExecutableStep(response core.LLMResponse, results []core.Acti
 func missingActionContinuationMessage(response core.LLMResponse) core.ConversationMessage {
 	return core.ConversationMessage{
 		Role: "user",
-		Content: fmt.Sprintf("Your last response described a next step but returned no executable actions or verification.\nSummary: %s\nReturn the smallest concrete next action now, or return a finish action if the task is already complete.",
+		Content: fmt.Sprintf("Your last response described a next step but returned no executable actions or verification.\nSummary: %s\nDo not answer with vague prose. Return the smallest concrete next action now, or return a finish action if the task is already complete.",
 			response.Summary),
 	}
+}
+
+func explicitFinishContinuationMessage(response core.LLMResponse) core.ConversationMessage {
+	return core.ConversationMessage{
+		Role: "user",
+		Content: fmt.Sprintf("You already executed actions on this task.\nLatest summary: %s\nDo not stop with prose only. Return a finish action if the task is complete, or return the next smallest safe action if it is not.",
+			response.Summary),
+	}
+}
+
+func shouldSynthesizeOutcome(status core.CompletionStatus, response core.LLMResponse, executedActions bool) bool {
+	if status != core.CompletionFinished {
+		if status == core.CompletionBlockedUserInput && responseHasVisibleContent(response) {
+			return false
+		}
+		return true
+	}
+	if !executedActions {
+		return false
+	}
+	if isSyntheticFallbackResponse(response) {
+		return true
+	}
+	return (len(response.Actions) > 0 && !responseHasFinishAction(response)) || len(response.Verification) > 0 || response.NeedsUserInput
+}
+
+func responseHasFinishAction(response core.LLMResponse) bool {
+	for _, action := range response.Actions {
+		if action.Type == core.ActionFinish {
+			return true
+		}
+	}
+	return false
+}
+
+func responseHasAskUserAction(response core.LLMResponse) bool {
+	for _, action := range response.Actions {
+		if action.Type == core.ActionAskUser {
+			return true
+		}
+	}
+	return false
+}
+
+func blockedByUserInput(response core.LLMResponse, results []core.ActionResult, stop bool) bool {
+	if !stop {
+		return false
+	}
+	if response.NeedsUserInput || responseHasAskUserAction(response) {
+		return true
+	}
+	for _, result := range results {
+		if result.InputKind != "" && result.ResponseMode != core.InputResponseSubmitted && result.ResponseMode != core.InputResponseFollowUp {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBackgroundRun(results []core.ActionResult) bool {
+	for _, result := range results {
+		if strings.TrimSpace(result.BackgroundRunID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func fingerprintExecutedResults(results []core.ActionResult) (string, string, string, bool) {
+	actionParts := []string{}
+	resultParts := []string{}
+	stage := ""
+	for _, result := range results {
+		if result.Skipped || result.Action.Type == core.ActionAskUser || result.Action.Type == core.ActionFinish {
+			continue
+		}
+		if stage == "" {
+			stage = string(result.Action.Type)
+		}
+		actionTarget := firstNonEmpty(result.Action.Path, firstPath(result.Action.Paths), result.Action.Query, result.Action.Pattern, result.Action.Command, result.Action.Title)
+		actionParts = append(actionParts, string(result.Action.Type)+"|"+actionTarget)
+		resultParts = append(resultParts, firstNonEmpty(result.Summary, result.Error, result.Stdout, result.Stderr))
+	}
+	if len(actionParts) == 0 {
+		return "", "", "", false
+	}
+	return strings.Join(actionParts, "||"), strings.Join(resultParts, "||"), stage, true
+}
+
+func latestUsefulResult(results []core.ActionResult) *core.ActionResult {
+	for i := len(results) - 1; i >= 0; i-- {
+		result := &results[i]
+		if strings.TrimSpace(result.Summary) != "" || strings.TrimSpace(result.Error) != "" || strings.TrimSpace(result.BackgroundRunID) != "" {
+			return result
+		}
+	}
+	return nil
+}
+
+func nextRequiredStepHint(response core.LLMResponse, results []core.ActionResult) string {
+	for _, action := range response.Actions {
+		if action.Type == core.ActionFinish {
+			continue
+		}
+		return firstNonEmpty(action.Reason, action.Title, action.Query, action.Pattern, action.Command, action.Path, action.FieldKey)
+	}
+	for _, verify := range response.Verification {
+		return firstNonEmpty(verify.SuccessHint, verify.Command, verify.Path, firstPath(verify.Paths))
+	}
+	if latest := latestUsefulResult(results); latest != nil {
+		if latest.Action.Type == core.ActionAskUser {
+			return firstNonEmpty(latest.Action.Prompt, latest.Action.Reason, latest.Action.FieldKey, "provide the required input")
+		}
+		return firstNonEmpty(latest.Action.Reason, latest.Action.Title, latest.Action.Query, latest.Action.Pattern, latest.Action.Command, latest.Action.Path, "take the next smallest safe action")
+	}
+	if strings.TrimSpace(response.Summary) != "" {
+		return strings.TrimSpace(response.Summary)
+	}
+	return "take the next smallest safe action"
 }
 
 func findFollowUp(results []core.ActionResult) *core.ActionResult {
@@ -1068,6 +1582,16 @@ func findFollowUp(results []core.ActionResult) *core.ActionResult {
 		}
 	}
 	return nil
+}
+
+func findBackgroundRunContinuation(results []core.ActionResult) (string, string, bool) {
+	for _, result := range results {
+		if strings.TrimSpace(result.BackgroundRunID) == "" {
+			continue
+		}
+		return result.BackgroundRunID, firstNonEmpty(result.Summary, "background work is continuing"), true
+	}
+	return "", "", false
 }
 
 func sanitizeResults(results []core.ActionResult) []core.ActionResult {
@@ -1084,7 +1608,11 @@ func sanitizeMessages(history []core.ConversationMessage) []core.ConversationMes
 		if msg.Role == "user" && strings.Contains(msg.Content, "Action results:\n") {
 			prefix := "Action results:\n"
 			body := strings.TrimPrefix(msg.Content, prefix)
-			if idx := strings.Index(body, "\nIf the issue is resolved"); idx >= 0 {
+			idx := strings.Index(body, "\nReturn a finish action only if the task is complete")
+			if idx < 0 {
+				idx = strings.Index(body, "\nIf the issue is resolved")
+			}
+			if idx >= 0 {
 				resultsJSON := body[:idx]
 				var results []core.ActionResult
 				if err := json.Unmarshal([]byte(resultsJSON), &results); err == nil {
@@ -1096,9 +1624,22 @@ func sanitizeMessages(history []core.ConversationMessage) []core.ConversationMes
 		if strings.Contains(msg.Content, "User follow-up while blocked:") {
 			msg.Content = strings.ReplaceAll(msg.Content, "[secret]", "[secret]")
 		}
+		if strings.Contains(msg.Content, "Background run status:\n") {
+			msg.Content = redactBackgroundContinuation(msg.Content)
+		}
 		out = append(out, msg)
 	}
 	return out
+}
+
+func redactBackgroundContinuation(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "summary=") {
+			lines[i] = "summary=" + strings.TrimSpace(strings.TrimPrefix(line, "summary="))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func redactActionResult(result core.ActionResult) core.ActionResult {
@@ -1147,14 +1688,20 @@ func (e *Engine) thinkingLabelWithPhase(phase string) string {
 	return e.thinkingLabel()
 }
 
-func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot, graphDigest string) string {
-	if strings.TrimSpace(graphDigest) == "" {
+func buildInitialPrompt(prompt string, snapshot ctxpkg.Snapshot, graphDigest, opsDigest string) string {
+	if strings.TrimSpace(graphDigest) == "" && strings.TrimSpace(opsDigest) == "" {
 		return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s", prompt, snapshot.JSON())
 	}
-	return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s\n\nServer graph memory:\n%s", prompt, snapshot.JSON(), graphDigest)
+	if strings.TrimSpace(opsDigest) == "" {
+		return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s\n\nServer graph memory:\n%s", prompt, snapshot.JSON(), graphDigest)
+	}
+	if strings.TrimSpace(graphDigest) == "" {
+		return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s\n\nOperational memory:\n%s", prompt, snapshot.JSON(), opsDigest)
+	}
+	return fmt.Sprintf("User request:\n%s\n\nCurrent context:\n%s\n\nServer graph memory:\n%s\n\nOperational memory:\n%s", prompt, snapshot.JSON(), graphDigest, opsDigest)
 }
 
-func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot, graphDigest string) (threads.ThreadRef, *threads.Thread, []core.ConversationMessage, error) {
+func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot, graphDigest, opsDigest string) (threads.ThreadRef, *threads.Thread, []core.ConversationMessage, error) {
 	threadRef, threadState, err := e.resolveThreadContext()
 	if err != nil {
 		return threads.ThreadRef{}, nil, nil, err
@@ -1168,7 +1715,7 @@ func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot, gra
 	}
 	history = append(history, core.ConversationMessage{
 		Role:    "user",
-		Content: buildInitialPrompt(prompt, snapshot, graphDigest),
+		Content: buildInitialPrompt(prompt, snapshot, graphDigest, opsDigest),
 	})
 	return threadRef, threadState, history, nil
 }
@@ -1181,6 +1728,52 @@ func (e *Engine) ensureGraphDigest(ctx context.Context, mode string) string {
 		return ""
 	}
 	return e.Graph.Digest(6)
+}
+
+func (e *Engine) ensureOpsDigest() string {
+	if e.Ops == nil {
+		return ""
+	}
+	return e.Ops.SummaryLine()
+}
+
+func (e *Engine) opsRuntimeDeps() ops.RuntimeDeps {
+	host := ""
+	if e.Graph != nil {
+		host = e.Graph.HostKey()
+	}
+	if host == "" {
+		userName, rawHost := agent.CurrentIdentity()
+		host = userName + "@" + rawHost
+	}
+	return ops.RuntimeDeps{
+		Runtime:    e.Runtime,
+		Graph:      e.Graph,
+		Executor:   e.Executor,
+		Policy:     e.PolicyStore,
+		Host:       host,
+		WorkingDir: e.Runtime.WorkingDir,
+	}
+}
+
+func usageOrEstimate(request provider.Request, response core.LLMResponse) core.TokenUsage {
+	if !response.Usage.Empty() {
+		return response.Usage
+	}
+	chars := len(request.System)
+	for _, msg := range request.Messages {
+		chars += len(msg.Role) + len(msg.Content)
+	}
+	raw, _ := json.Marshal(response)
+	chars += len(raw)
+	estimated := chars / 4
+	if estimated <= 0 {
+		estimated = 1
+	}
+	return core.TokenUsage{
+		TotalTokens: estimated,
+		Estimated:   true,
+	}
 }
 
 func (e *Engine) resolveThreadContext() (threads.ThreadRef, *threads.Thread, error) {

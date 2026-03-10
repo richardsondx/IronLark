@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/patches"
 	"github.com/richardsondx/IronLark/internal/policy"
+	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/redact"
 	"github.com/richardsondx/IronLark/internal/search"
 )
@@ -107,6 +110,28 @@ func TestExecuteStreamEmitsShellOutputChunks(t *testing.T) {
 	}
 }
 
+func TestExecuteClassifiesShellTimeout(t *testing.T) {
+	exec := testExecutor(t)
+	result, err := exec.Execute(context.Background(), core.Action{
+		ID:         "timeout-shell",
+		Type:       core.ActionRunShell,
+		Command:    "sleep 2",
+		TimeoutSec: 1,
+	}, false)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if result.FailureKind != core.ShellFailureTimeout {
+		t.Fatalf("expected timeout classification, got %#v", result)
+	}
+	if !result.TimedOut {
+		t.Fatalf("expected timed_out to be true, got %#v", result)
+	}
+	if !result.BackgroundRecommended {
+		t.Fatalf("expected background recommendation, got %#v", result)
+	}
+}
+
 func TestIgnorableStreamReadError(t *testing.T) {
 	cases := []error{
 		io.EOF,
@@ -123,6 +148,60 @@ func TestIgnorableStreamReadError(t *testing.T) {
 	}
 }
 
+func TestExecuteWebSearchUsesProviderWhenAvailable(t *testing.T) {
+	exec := testExecutor(t)
+	exec.ProviderModel = "gpt-5-mini"
+	exec.Provider = fakeWebSearchProvider{
+		results: []string{"Harbor docs | https://harborframework.com/docs/agents | agent config"},
+	}
+	exec.Searcher = search.Searcher{WebSearchURL: "://bad-url"}
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		Type:  core.ActionWebSearch,
+		Query: "site:harborframework.com/docs Agents BaseEnvironment Installed agents",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(result.Stdout, "Harbor docs") {
+		t.Fatalf("unexpected stdout %q", result.Stdout)
+	}
+}
+
+func TestExecuteWebSearchFallsBackWhenProviderDoesNotSupportIt(t *testing.T) {
+	exec := testExecutor(t)
+	exec.Provider = fakeWebSearchProvider{err: provider.ErrWebSearchUnsupported}
+	exec.Searcher = search.Searcher{HTTPClient: httpClientForTestSearch(t), WebSearchURL: testSearchServer(t)}
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		Type:  core.ActionWebSearch,
+		Query: "example",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(result.Stdout, "https://example.com/doc") {
+		t.Fatalf("unexpected stdout %q", result.Stdout)
+	}
+}
+
+func TestExecuteWebSearchFallsBackWhenProviderTimesOut(t *testing.T) {
+	exec := testExecutor(t)
+	exec.Provider = fakeWebSearchProvider{err: fmt.Errorf("provider request failed: %w (Client.Timeout exceeded while awaiting headers)", context.DeadlineExceeded)}
+	exec.Searcher = search.Searcher{HTTPClient: httpClientForTestSearch(t), WebSearchURL: testSearchServer(t)}
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		Type:  core.ActionWebSearch,
+		Query: "example",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(result.Stdout, "https://example.com/doc") {
+		t.Fatalf("unexpected stdout %q", result.Stdout)
+	}
+}
+
 func testExecutor(t *testing.T) *Executor {
 	t.Helper()
 	root := t.TempDir()
@@ -136,6 +215,32 @@ func testExecutor(t *testing.T) *Executor {
 		Classifier:     classifier,
 		Searcher:       search.Searcher{UserAgent: "lark-term/test"},
 	}
+}
+
+type fakeWebSearchProvider struct {
+	results []string
+	err     error
+}
+
+func (f fakeWebSearchProvider) WebSearch(ctx context.Context, req provider.SearchRequest) ([]string, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return append([]string(nil), f.results...), nil
+}
+
+func testSearchServer(t *testing.T) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html><body><a class="result__a" href="https://example.com/doc">Example Doc</a><div class="result__snippet">Search snippet</div></body></html>`))
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
+}
+
+func httpClientForTestSearch(t *testing.T) *http.Client {
+	t.Helper()
+	return http.DefaultClient
 }
 
 func containsStream(streams []core.ActionOutputStream, target core.ActionOutputStream) bool {

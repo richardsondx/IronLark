@@ -38,7 +38,7 @@ func newConfigInitCommand(flags *rootFlags) *cobra.Command {
 func newInitCommand(flags *rootFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
-		Short: "Set up OpenAI auth, defaults, and shell PATH",
+		Short: "Set up OpenAI auth, Responses API defaults, and shell PATH",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runInteractiveInit(flags)
 		},

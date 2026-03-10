@@ -92,12 +92,27 @@ type CrawlerConfig struct {
 }
 
 type ToolConfig struct {
-	MaxTurns               int     `yaml:"max_turns,omitempty"`
-	MaxConsecutiveFailures int     `yaml:"max_consecutive_failures,omitempty"`
-	ConfidenceThreshold    float64 `yaml:"confidence_threshold,omitempty"`
-	SemanticMaxFiles       int     `yaml:"semantic_max_files,omitempty"`
-	SemanticChunkLines     int     `yaml:"semantic_chunk_lines,omitempty"`
-	WebSearchResults       int     `yaml:"web_search_results,omitempty"`
+	SoftTurns                   int     `yaml:"soft_turns,omitempty"`
+	MaxTurns                    int     `yaml:"max_turns,omitempty"`
+	MaxConsecutiveFailures      int     `yaml:"max_consecutive_failures,omitempty"`
+	ConfidenceThreshold         float64 `yaml:"confidence_threshold,omitempty"`
+	SemanticMaxFiles            int     `yaml:"semantic_max_files,omitempty"`
+	SemanticChunkLines          int     `yaml:"semantic_chunk_lines,omitempty"`
+	WebSearchResults            int     `yaml:"web_search_results,omitempty"`
+	InlineShellTimeoutSec       int     `yaml:"inline_shell_timeout_sec,omitempty"`
+	ShellStallWindowSec         int     `yaml:"shell_stall_window_sec,omitempty"`
+	AutoBackgroundLongRuns      *bool   `yaml:"auto_background_long_runs,omitempty"`
+	LongRunHeuristics           *bool   `yaml:"long_run_heuristics_enabled,omitempty"`
+	DurableShellMaxRuntimeSec   int     `yaml:"durable_shell_max_runtime_sec,omitempty"`
+	DurableShellLogPreviewBytes int     `yaml:"durable_shell_log_preview_bytes,omitempty"`
+}
+
+func (c ToolConfig) AutoBackgroundLongRunsValue() bool {
+	return c.AutoBackgroundLongRuns == nil || *c.AutoBackgroundLongRuns
+}
+
+func (c ToolConfig) LongRunHeuristicsEnabledValue() bool {
+	return c.LongRunHeuristics == nil || *c.LongRunHeuristics
 }
 
 type RulesConfig struct {
@@ -132,6 +147,12 @@ type Paths struct {
 	ThreadsDir        string
 	AgentDir          string
 	GraphDir          string
+	OpsDir            string
+	WatchersDir       string
+	RunsDir           string
+	IncidentsDir      string
+	ProcessesDir      string
+	ShellRunsDir      string
 	PolicyPath        string
 	PatchesDir        string
 	CheckpointsDir    string
@@ -200,12 +221,19 @@ func DefaultConfig() Config {
 			},
 		},
 		Tools: ToolConfig{
-			MaxTurns:               5,
-			MaxConsecutiveFailures: 2,
-			ConfidenceThreshold:    0.85,
-			SemanticMaxFiles:       250,
-			SemanticChunkLines:     24,
-			WebSearchResults:       5,
+			SoftTurns:                   5,
+			MaxTurns:                    12,
+			MaxConsecutiveFailures:      2,
+			ConfidenceThreshold:         0.85,
+			SemanticMaxFiles:            250,
+			SemanticChunkLines:          24,
+			WebSearchResults:            5,
+			InlineShellTimeoutSec:       30,
+			ShellStallWindowSec:         45,
+			AutoBackgroundLongRuns:      boolPtr(true),
+			LongRunHeuristics:           boolPtr(true),
+			DurableShellMaxRuntimeSec:   3600,
+			DurableShellLogPreviewBytes: 8192,
 		},
 		Security: SecurityConfig{
 			ProtectedPaths: []string{".env", "/root/.ssh", "/home/*/.ssh"},
@@ -278,6 +306,12 @@ func ResolvePaths(cwd string) (Paths, error) {
 		ThreadsDir:        filepath.Join(dataHome, "lark", "threads"),
 		AgentDir:          filepath.Join(dataHome, "lark", "agents"),
 		GraphDir:          filepath.Join(dataHome, "lark", "graph"),
+		OpsDir:            filepath.Join(dataHome, "lark", "ops"),
+		WatchersDir:       filepath.Join(dataHome, "lark", "ops", "watchers"),
+		RunsDir:           filepath.Join(dataHome, "lark", "ops", "runs"),
+		IncidentsDir:      filepath.Join(dataHome, "lark", "ops", "incidents"),
+		ProcessesDir:      filepath.Join(dataHome, "lark", "ops", "processes"),
+		ShellRunsDir:      filepath.Join(dataHome, "lark", "ops", "shell-runs"),
 		PolicyPath:        filepath.Join(dataHome, "lark", "policy.json"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
@@ -291,6 +325,12 @@ func EnsureDirs(paths Paths) error {
 		paths.ThreadsDir,
 		paths.AgentDir,
 		paths.GraphDir,
+		paths.OpsDir,
+		paths.WatchersDir,
+		paths.RunsDir,
+		paths.IncidentsDir,
+		paths.ProcessesDir,
+		paths.ShellRunsDir,
 		paths.PatchesDir,
 		paths.CheckpointsDir,
 	}
@@ -477,6 +517,9 @@ func mergeConfig(base Config, override Config) Config {
 	if override.Tools.MaxTurns != 0 {
 		out.Tools.MaxTurns = override.Tools.MaxTurns
 	}
+	if override.Tools.SoftTurns != 0 {
+		out.Tools.SoftTurns = override.Tools.SoftTurns
+	}
 	if override.Tools.MaxConsecutiveFailures != 0 {
 		out.Tools.MaxConsecutiveFailures = override.Tools.MaxConsecutiveFailures
 	}
@@ -491,6 +534,24 @@ func mergeConfig(base Config, override Config) Config {
 	}
 	if override.Tools.WebSearchResults != 0 {
 		out.Tools.WebSearchResults = override.Tools.WebSearchResults
+	}
+	if override.Tools.InlineShellTimeoutSec != 0 {
+		out.Tools.InlineShellTimeoutSec = override.Tools.InlineShellTimeoutSec
+	}
+	if override.Tools.ShellStallWindowSec != 0 {
+		out.Tools.ShellStallWindowSec = override.Tools.ShellStallWindowSec
+	}
+	if override.Tools.AutoBackgroundLongRuns != nil {
+		out.Tools.AutoBackgroundLongRuns = boolPtr(*override.Tools.AutoBackgroundLongRuns)
+	}
+	if override.Tools.LongRunHeuristics != nil {
+		out.Tools.LongRunHeuristics = boolPtr(*override.Tools.LongRunHeuristics)
+	}
+	if override.Tools.DurableShellMaxRuntimeSec != 0 {
+		out.Tools.DurableShellMaxRuntimeSec = override.Tools.DurableShellMaxRuntimeSec
+	}
+	if override.Tools.DurableShellLogPreviewBytes != 0 {
+		out.Tools.DurableShellLogPreviewBytes = override.Tools.DurableShellLogPreviewBytes
 	}
 	if override.Security.AutoApproveReadTools {
 		out.Security.AutoApproveReadTools = true
@@ -584,6 +645,10 @@ func SetValue(cfg *Config, key, value string) error {
 		cfg.Graph.Watch.Enabled = boolPtr(parseBool(value))
 	case "graph.watch.interval":
 		cfg.Graph.Watch.Interval = value
+	case "tools.soft_turns":
+		cfg.Tools.SoftTurns = parseInt(value)
+	case "tools.max_turns":
+		cfg.Tools.MaxTurns = parseInt(value)
 	default:
 		if strings.HasPrefix(key, "graph.crawlers.") {
 			return setCrawlerValue(cfg, key, value)

@@ -107,7 +107,7 @@ func TestPromptMessagesAndCompaction(t *testing.T) {
 		}, []core.ActionResult{{
 			Action:  core.Action{Title: "inspect"},
 			Summary: strings.Repeat("result output ", 10),
-		}}, AppendOptions{
+		}}, core.CompletionFinished, AppendOptions{
 			ResultCharLimit: 80,
 			ThreadConfig:    cfg.Thread,
 		})
@@ -129,6 +129,27 @@ func TestPromptMessagesAndCompaction(t *testing.T) {
 	}
 	if messages[0].Role != "assistant" || !strings.Contains(messages[0].Content, "Thread recap") {
 		t.Fatalf("expected thread recap assistant message, got %#v", messages[0])
+	}
+}
+
+func TestPromptMessagesIncludeIncompleteCompletionStatus(t *testing.T) {
+	thread := Thread{
+		ID: "thread-1",
+		Turns: []ThreadTurn{{
+			UserPrompt:       "inspect docker",
+			AssistantSummary: "Stopped early",
+			ResultSummary:    "docker ok",
+			CompletionStatus: core.CompletionIncompleteMaxTurns,
+			EstimatedTokens:  10,
+			CreatedAt:        time.Now().UTC(),
+		}},
+	}
+	messages := PromptMessages(thread, PromptOptions{RecentTurns: 8})
+	if len(messages) < 2 {
+		t.Fatalf("expected replay messages, got %#v", messages)
+	}
+	if !strings.Contains(messages[1].Content, "Completion status: incomplete_max_turns") {
+		t.Fatalf("expected incomplete completion status in replay, got %#v", messages[1])
 	}
 }
 

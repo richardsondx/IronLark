@@ -80,6 +80,29 @@ func TestSetValueSupportsInteractionMode(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigUsesSoftAndHardTurnBudgets(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.Tools.SoftTurns != 5 {
+		t.Fatalf("expected soft turns default 5, got %d", cfg.Tools.SoftTurns)
+	}
+	if cfg.Tools.MaxTurns != 12 {
+		t.Fatalf("expected hard max turns default 12, got %d", cfg.Tools.MaxTurns)
+	}
+}
+
+func TestSetValueSupportsToolTurnBudgets(t *testing.T) {
+	cfg := Config{}
+	if err := SetValue(&cfg, "tools.soft_turns", "6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetValue(&cfg, "tools.max_turns", "14"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Tools.SoftTurns != 6 || cfg.Tools.MaxTurns != 14 {
+		t.Fatalf("unexpected tool turn budgets %#v", cfg.Tools)
+	}
+}
+
 func TestSetValueSupportsAgentFields(t *testing.T) {
 	cfg := Config{}
 	if err := SetValue(&cfg, "agent.session_prefix", "remote"); err != nil {
