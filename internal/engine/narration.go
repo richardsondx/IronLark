@@ -258,6 +258,8 @@ func phaseForAction(action core.Action) string {
 		return "Searching"
 	case core.ActionEditFile:
 		return "Updating files"
+	case core.ActionWriteFile:
+		return "Writing files"
 	case core.ActionWebSearch:
 		return "Searching the web"
 	case core.ActionFetchRules:

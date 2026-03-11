@@ -364,6 +364,10 @@ func actionSchema() map[string]any {
 			"pattern":            nullableStringSchema(),
 			"glob":               nullableStringSchema(),
 			"patch_unified_diff": nullableStringSchema(),
+			"content":            nullableStringSchema(),
+			"file_mode":          nullableStringSchema(),
+			"timeout_sec":        nullableIntegerSchema(),
+			"detach":             nullableBoolSchema(),
 			"input_kind":         nullableStringSchema(),
 			"field_key":          nullableStringSchema(),
 			"prompt":             nullableStringSchema(),
@@ -373,7 +377,7 @@ func actionSchema() map[string]any {
 			"expects_value":      nullableBoolSchema(),
 			"alternatives":       nullableStringArraySchema(),
 		},
-		"required":             []string{"id", "type", "title", "reason", "command", "path", "paths", "query", "pattern", "glob", "patch_unified_diff", "input_kind", "field_key", "prompt", "clarification", "placeholder", "destination_hint", "expects_value", "alternatives"},
+		"required":             []string{"id", "type", "title", "reason", "command", "path", "paths", "query", "pattern", "glob", "patch_unified_diff", "content", "file_mode", "timeout_sec", "detach", "input_kind", "field_key", "prompt", "clarification", "placeholder", "destination_hint", "expects_value", "alternatives"},
 		"additionalProperties": false,
 	}
 }

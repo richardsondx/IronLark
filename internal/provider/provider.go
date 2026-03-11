@@ -105,16 +105,18 @@ Expected JSON Schema:
   "actions": [
     {
       "id": "unique-id",
-      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|web_search|fetch_rules|fetch_ops|ask_user|inspect|checkpoint|finish",
+      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|write_file|web_search|fetch_rules|fetch_ops|ask_user|inspect|checkpoint|finish",
       "title": "Short title",
       "reason": "Why this is needed",
       "command": "command to run (for run_shell)",
-      "path": "path root or file (for read_files, list_dir, edit_file)",
+      "path": "path root or file (for read_files, list_dir, edit_file, write_file)",
       "paths": ["optional list of target files"],
       "query": "search or fetch query",
       "pattern": "exact or regex search text for search_files",
       "glob": "optional file glob filter for search_files",
       "patch_unified_diff": "diff (for edit_file)",
+      "content": "full file contents (for write_file)",
+      "file_mode": "optional file mode like 0644 or 0755 (for write_file)",
       "input_kind": "text|secret|confirm|manual_wait (for ask_user)",
       "field_key": "stable key for the missing value (for ask_user)",
       "prompt": "short question shown to the user (for ask_user)",
@@ -122,7 +124,9 @@ Expected JSON Schema:
       "placeholder": "optional example value if helpful",
       "destination_hint": "optional note about what IronLark will do with the value next",
       "expects_value": true,
-      "alternatives": ["submit","skip","follow_up"]
+      "alternatives": ["submit","skip","follow_up"],
+      "timeout_sec": "optional shell timeout in seconds (for run_shell)",
+      "detach": "true to run shell command in a durable background run"
     }
   ],
   "verification": [
@@ -153,11 +157,11 @@ Use fetch_ops when recent watcher, recovery, or incident history is directly rel
 Create a checkpoint before risky multi-step edits or when a rollback would matter.
 Do not use ask_user for ordinary clarification, ambiguous requests, preference questions, or anything the user can simply answer in the next chat turn.
 For ordinary clarification, ask the question in summary/findings, return no actions, and let the user reply in chat.
-Use ask_user only for structured blocker input that must be captured explicitly, such as secrets, API keys, passwords, confirmation gates, or manual off-terminal steps.
+Use ask_user only for structured blocker input that must be captured explicitly, such as secrets, API keys, passwords, or manual off-terminal steps.
 When using ask_user, ask for exactly one blocker at a time.
 For tokens, passwords, API keys, or secrets, set input_kind to "secret".
 For off-terminal tasks such as visiting a dashboard, talking to BotFather, or copying a returned token, set input_kind to "manual_wait".
-For input_kind "text", only use ask_user when you need one concrete value to be used immediately by the next step and destination_hint explains what happens next.
+Do not use input_kind "text" or "confirm" for ask_user.
 Keep clarification to one short sentence only when needed.
 Always include field_key, prompt, and alternatives for ask_user actions.
 If the user skipped a blocker in the prior action results, adapt or explain the consequence instead of asking the same blocker again without new context.
@@ -166,6 +170,10 @@ Never suggest destructive actions unless absolutely necessary.
 For file edits, patch_unified_diff must be a standard unified diff only.
 Do not use Codex apply_patch format such as "*** Begin Patch", "*** Update File:", or "*** End Patch".
 Each file edit must include ---/+++ file headers and at least one @@ -old,+new @@ hunk with valid line ranges.
+Prefer write_file when creating new files or rewriting a file from scratch. Use edit_file only for small, targeted diffs.
+For exact-output tasks, verify the output precisely (e.g., cat -A, wc -l, stat) and fix newline/permissions if needed.
+For services that must keep running, daemonize with nohup/setsid, capture the PID if helpful, and verify the listening port.
+Only set detach=true for run_shell when the user explicitly asks for background execution; otherwise run inline.
 When enough information exists, summarize the issue and either finish or propose the smallest safe action set.
 Never emit more than %d actions in a single response.
 If confidence is high and no more tools are required, return no actions and set confidence above 0.85.

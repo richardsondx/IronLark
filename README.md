@@ -210,6 +210,61 @@ lk model gpt-4.1-mini
 lk edit ./README.md "rewrite the first sentence to be clearer"
 ```
 
+## Terminal-Bench
+
+This repo includes a local terminal-bench smoke task and a wrapper script for running IronLark benchmarks without relying on the broken `terminal-bench-core=head` registry entry.
+
+Quick smoke test from the repo root:
+
+```bash
+./scripts/run_tb_ironlark.sh smoke
+```
+
+That uses the local task at `tasks/ironlark-smoke` and validates the adapter plus IronLark execution path.
+
+To run against the published core dataset, use the pinned dataset version instead of `head`:
+
+```bash
+./scripts/run_tb_ironlark.sh core
+```
+
+The wrapper expands to terminal-bench with:
+
+- `--agent-import-path python_adapter.ironlark_adapter:IronLarkAgent`
+- `--model openai/gpt-4.1-mini`
+- `--agent-kwarg install_mode=source`
+- `--agent-kwarg approval=agent`
+
+You can override those with environment variables:
+
+```bash
+TB_MODEL=openai/gpt-5-mini TB_INSTALL_MODE=release ./scripts/run_tb_ironlark.sh smoke
+```
+
+If you call `tb run` directly, prefer:
+
+```bash
+tb run \
+  --dataset terminal-bench-core==0.1.1 \
+  --agent-import-path python_adapter.ironlark_adapter:IronLarkAgent \
+  --model openai/gpt-4.1-mini \
+  --agent-kwarg install_mode=source \
+  --agent-kwarg approval=agent
+```
+
+`terminal-bench-core=head` currently resolves to a registry entry whose `dataset_path` points to `./tasks`, but that path is missing in the upstream checkout terminal-bench downloads, so `head` fails with `FileNotFoundError`.
+
+## General-Use Reliability Defaults
+
+These defaults are tuned for task completion over background concurrency.
+
+- `run_shell` stays inline unless the action explicitly sets `detach=true`.
+- `ask_user` is reserved for secrets or manual-wait steps; ordinary clarifications should be handled in chat.
+- `write_file` is available for full-file writes (prefer it for new files or rewrites).
+- Inline execution tolerates longer operations (`inline_shell_timeout_sec=300`, `shell_stall_window_sec=120`).
+- For exact-output tasks, verify with `cat -A`, `stat`, or `wc -l` and fix newline/permissions if needed.
+- For services that must persist, daemonize (e.g., `nohup`/`setsid`) and verify the listening port.
+
 ## Commands
 
 - `lk "task"`: execute-first one-shot flow with persistent thread context by default

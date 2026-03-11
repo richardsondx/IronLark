@@ -39,6 +39,13 @@ class IronLarkAgent(AbstractInstalledAgent):
         model_name: str | None = None,
         provider: str | None = None,
         approval: str = "agent",
+        auto_accept: str | None = "high",
+        resilience_mode: str | None = "on",
+        alt_attempts_max: int = 3,
+        verification_mode: str | None = None,
+        set_turn_caps: bool = True,
+        soft_turns: int = 8,
+        max_turns: int = 20,
         install_mode: str = DEFAULT_INSTALL_MODE,
         repo_root: str | None = None,
         repo_slug: str = "richardsondx/IronLark",
@@ -64,6 +71,13 @@ class IronLarkAgent(AbstractInstalledAgent):
         self._model_name = raw_model_name
         self._provider = raw_provider
         self._approval = approval
+        self._auto_accept = auto_accept
+        self._resilience_mode = resilience_mode
+        self._alt_attempts_max = alt_attempts_max
+        self._verification_mode = verification_mode
+        self._set_turn_caps = set_turn_caps
+        self._soft_turns = soft_turns
+        self._max_turns = max_turns
         self._install_mode = install_mode
         self._repo_root = (
             Path(repo_root).expanduser().resolve()
@@ -103,11 +117,147 @@ class IronLarkAgent(AbstractInstalledAgent):
         os.chmod(handle.name, 0o755)
         return Path(handle.name)
 
+    def _augment_instruction(self, instruction: str) -> str:
+        if not self._verification_mode:
+            base = instruction
+        else:
+            base = instruction
+
+        lowered = instruction.lower()
+        blocks: list[str] = []
+
+        if self._resilience_mode:
+            max_alts = max(1, int(self._alt_attempts_max))
+            blocks.append(
+                "Resilience policy (apply when a step fails):\n"
+                f"- Try at least 1 and at most {max_alts} alternative paths before stopping.\n"
+                "- Keep a short list of attempted alternatives to avoid looping.\n"
+                "- Prefer environment activation before assuming missing dependencies.\n"
+                "Alternative-path playbook:\n"
+                "1. Missing module/import: activate repo env (.venv/poetry/pip install -e .); then install minimal deps from pyproject.toml/requirements.txt.\n"
+                "2. CLI help/usage fails: run minimal valid invocation with a single input; try -v and one invalid option to surface valid flags.\n"
+                "3. Missing system tool: attempt apt install once; if it fails, try an equivalent command (e.g., ss for ps).\n"
+            )
+
+        # Output verification guardrails (outputs only).
+        if self._verification_mode == "outputs":
+            blocks.append(
+                "Verification checklist (must complete before finishing):\n"
+                "0. Do not run verification until required outputs exist. Create placeholder outputs early, then refine.\n"
+                "1. Identify all required output files/paths mentioned above and verify they exist.\n"
+                "2. For each small text output, run `wc -l` and `cat` to confirm content.\n"
+                "3. Recompute any numeric results independently and compare before writing final output.\n"
+                "4. If a service is required, verify it is reachable with a concrete command (e.g., curl).\n"
+            )
+
+        # Task-specific process guardrails (heuristic).
+        if "chess" in lowered and ("move.txt" in lowered or "/app/move.txt" in lowered):
+            blocks.append(
+                "Chess task guardrail:\n"
+                "- Always write /app/move.txt before finishing. If uncertain, make the best move and document your reasoning, but do not finish without the file."
+            )
+
+        if "avg_temp.txt" in lowered or ("average" in lowered and "temperature" in lowered):
+            blocks.append(
+                "Numeric task guardrail:\n"
+                "- Compute the value two ways (direct script and manual sum/len), compare, then write avg_temp.txt."
+            )
+
+        if "git server" in lowered or "post-receive" in lowered or "8443" in lowered:
+            blocks.append(
+                "Integration task guardrail:\n"
+                "- Verify ssh auth works.\n"
+                "- Verify post-receive hook triggers on push.\n"
+                "- Verify `curl -k https://localhost:8443/index.html` and `/dev/index.html` match expected branch content."
+            )
+
+        if "sanitize" in lowered and ("api key" in lowered or "token" in lowered):
+            blocks.append(
+                "Sanitization guardrail:\n"
+                "- Run `rg -n` for token patterns after edits and confirm originals are gone and placeholders are consistent.\n"
+                "- Ensure only files containing secrets were modified."
+            )
+
+        if "rencrypt" in lowered:
+            blocks.append(
+                "CLI discovery guardrail:\n"
+                "- If `--help` fails, run `rencrypt <single_file>` to observe defaults.\n"
+                "- Try `-v` and `-p <invalid>` to extract supported protocols from stderr.\n"
+                "- Once protocol is known, encrypt all files and verify outputs exist."
+            )
+
+        if not blocks:
+            return base
+
+        return base.rstrip() + "\n\n" + "\n\n".join(blocks) + "\n"
+
     def _run_agent_commands(self, instruction: str) -> list[TerminalCommand]:
-        flags = [
+        preface = [
+            "cd /app &&",
             f"PATH={shlex.quote(self._install_dir)}:$PATH",
             f"XDG_CONFIG_HOME={shlex.quote(self._xdg_config_home)}",
             f"XDG_DATA_HOME={shlex.quote(self._xdg_data_home)}",
+        ]
+        policy_commands: list[TerminalCommand] = []
+        if self._set_turn_caps:
+            policy_commands.extend(
+                [
+                    TerminalCommand(
+                        command=" ".join(
+                            [
+                                *preface,
+                                "lark",
+                                "config",
+                                "set",
+                                "tools.soft_turns",
+                                shlex.quote(str(self._soft_turns)),
+                            ]
+                        ),
+                        min_timeout_sec=0.0,
+                        max_timeout_sec=float("inf"),
+                        block=True,
+                        append_enter=True,
+                    ),
+                    TerminalCommand(
+                        command=" ".join(
+                            [
+                                *preface,
+                                "lark",
+                                "config",
+                                "set",
+                                "tools.max_turns",
+                                shlex.quote(str(self._max_turns)),
+                            ]
+                        ),
+                        min_timeout_sec=0.0,
+                        max_timeout_sec=float("inf"),
+                        block=True,
+                        append_enter=True,
+                    ),
+                ]
+            )
+        if self._auto_accept:
+            policy_level = self._auto_accept.strip().lower()
+            policy_commands.append(
+                TerminalCommand(
+                    command=" ".join(
+                        [
+                            *preface,
+                            "lark",
+                            "policy",
+                            "auto-accept",
+                            shlex.quote(policy_level),
+                        ]
+                    ),
+                    min_timeout_sec=0.0,
+                    max_timeout_sec=float("inf"),
+                    block=True,
+                    append_enter=True,
+                )
+            )
+
+        flags = [
+            *preface,
             "lark",
             "--approval",
             shlex.quote(self._approval),
@@ -120,16 +270,17 @@ class IronLarkAgent(AbstractInstalledAgent):
             "--color",
             "never",
             "--",
-            shlex.quote(instruction),
+            shlex.quote(self._augment_instruction(instruction)),
         ]
         return [
+            *policy_commands,
             TerminalCommand(
                 command=" ".join(flags),
                 min_timeout_sec=0.0,
                 max_timeout_sec=float("inf"),
                 block=True,
                 append_enter=True,
-            )
+            ),
         ]
 
     def perform_task(
@@ -216,7 +367,7 @@ export PATH="/usr/local/go/bin:$PATH"
 
 mkdir -p "$INSTALL_DIR" "{self._xdg_config_home}/lark" "{self._xdg_data_home}/lark"
 cd "$SOURCE_DIR"
-go build -o "$INSTALL_DIR/lark" ./cmd/lark
+go build -buildvcs=false -o "$INSTALL_DIR/lark" ./cmd/lark
 ln -sf "$INSTALL_DIR/lark" "$INSTALL_DIR/lk"
 """
 

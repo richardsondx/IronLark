@@ -301,6 +301,8 @@ func actionTimelineTitle(action core.Action) string {
 		return fmt.Sprintf("SemanticSearch(%s)", firstNonEmpty(action.Query, action.Pattern, target))
 	case core.ActionEditFile:
 		return fmt.Sprintf("Update(%s)", target)
+	case core.ActionWriteFile:
+		return fmt.Sprintf("Write(%s)", target)
 	case core.ActionWebSearch:
 		return fmt.Sprintf("WebSearch(%s)", target)
 	case core.ActionFetchRules:

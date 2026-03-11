@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -210,6 +211,43 @@ func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOn
 		result.PatchID = record.ID
 		result.BackupPath = record.BackupPath
 		result.Summary = fmt.Sprintf("patched %s", firstNonEmpty(action.Path, firstPath(paths)))
+		finalize(&result, startedAt)
+		return result, nil
+	case core.ActionWriteFile:
+		paths := actionPaths(action)
+		target := firstNonEmpty(action.Path, firstPath(paths))
+		if target == "" {
+			result.Error = "write_file requires a path"
+			finalize(&result, startedAt)
+			return result, errors.New(result.Error)
+		}
+		checkpoint, err := e.CheckpointStore.Create([]string{target}, firstNonEmpty(action.Reason, action.Title))
+		if err != nil {
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		mode, err := resolveWriteFileMode(target, action.FileMode)
+		if err != nil {
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		if err := os.WriteFile(target, []byte(action.Content), mode); err != nil {
+			result.Error = err.Error()
+			finalize(&result, startedAt)
+			return result, err
+		}
+		if action.FileMode != "" {
+			_ = os.Chmod(target, mode)
+		}
+		result.CheckpointID = checkpoint.ID
+		result.Summary = fmt.Sprintf("wrote %s", target)
 		finalize(&result, startedAt)
 		return result, nil
 	case core.ActionWebSearch:
@@ -608,14 +646,59 @@ func explainEditPatchError(err error) string {
 	message := strings.TrimSpace(err.Error())
 	switch {
 	case strings.Contains(message, "invalid unified diff hunk header"):
-		return "The model generated an invalid unified diff hunk header. edit_file patches must use standard ranged headers like @@ -12,3 +12,4 @@."
+		return "The model generated an invalid unified diff hunk header. edit_file patches must use standard ranged headers like @@ -12,3 +12,4 @@. Consider using write_file for full-file rewrites."
 	case strings.Contains(message, "patch does not contain any unified diff hunks"):
-		return "The model generated an edit patch without any valid unified diff hunks. edit_file patches must include ---/+++ file headers and at least one @@ -old,+new @@ hunk."
+		return "The model generated an edit patch without any valid unified diff hunks. edit_file patches must include ---/+++ file headers and at least one @@ -old,+new @@ hunk. Consider using write_file for full-file rewrites."
 	case strings.Contains(message, "standard unified diff"):
-		return "The model generated an edit patch in the wrong format. edit_file only accepts standard unified diffs with ---/+++ file headers and @@ -old,+new @@ hunks."
+		return "The model generated an edit patch in the wrong format. edit_file only accepts standard unified diffs with ---/+++ file headers and @@ -old,+new @@ hunks. Consider using write_file for full-file rewrites."
 	default:
 		return message
 	}
+}
+
+func resolveWriteFileMode(path, mode string) (os.FileMode, error) {
+	if strings.TrimSpace(mode) != "" {
+		parsed, err := parseFileMode(mode)
+		if err != nil {
+			return 0, err
+		}
+		return parsed, nil
+	}
+	info, err := os.Stat(path)
+	if err == nil {
+		return info.Mode().Perm(), nil
+	}
+	if os.IsNotExist(err) {
+		return 0o644, nil
+	}
+	return 0, err
+}
+
+func parseFileMode(raw string) (os.FileMode, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, fmt.Errorf("file_mode is empty")
+	}
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "0o") {
+		lower = strings.TrimPrefix(lower, "0o")
+	}
+	isOctal := true
+	for _, r := range lower {
+		if r < '0' || r > '7' {
+			isOctal = false
+			break
+		}
+	}
+	base := 10
+	if isOctal {
+		base = 8
+	}
+	parsed, err := strconv.ParseUint(lower, base, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid file_mode %q", raw)
+	}
+	return os.FileMode(parsed), nil
 }
 
 func finalize(result *core.ActionResult, startedAt time.Time) {

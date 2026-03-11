@@ -4,3 +4,6 @@ dist/
 .env
 .env.*
 !.env.example
+runs/
+**/__pycache__/
+*.pyc

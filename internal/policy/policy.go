@@ -93,7 +93,7 @@ func (c *Classifier) Classify(action core.Action, readOnly bool) (core.RiskRepor
 			RollbackAvailable:  false,
 			Reason:             "read-only retrieval tool",
 		}, nil
-	case core.ActionEditFile:
+	case core.ActionEditFile, core.ActionWriteFile:
 		level := c.actionPathRisk(action)
 		if level == core.RiskLow {
 			level = core.RiskMedium
@@ -102,7 +102,7 @@ func (c *Classifier) Classify(action core.Action, readOnly bool) (core.RiskRepor
 			Level:              level,
 			TouchesSystemFiles: c.actionTouchesSystemPath(action),
 			RollbackAvailable:  true,
-			Reason:             "file patch",
+			Reason:             "file write",
 		}, nil
 	case core.ActionCheckpoint:
 		return core.RiskReport{

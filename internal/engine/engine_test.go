@@ -138,11 +138,18 @@ func TestAutoAcceptHighSuppressesHighRiskApproval(t *testing.T) {
 func TestShouldPromoteShellBeforeRunForLongHeuristic(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	engine.Ops = &ops.Manager{}
-	if !engine.shouldPromoteShellBeforeRun(core.Action{
+	if engine.shouldPromoteShellBeforeRun(core.Action{
 		Type:    core.ActionRunShell,
 		Command: "pipx install harbor",
 	}) {
-		t.Fatal("expected install heuristic to promote to background")
+		t.Fatal("expected no auto-promotion without detach")
+	}
+	if !engine.shouldPromoteShellBeforeRun(core.Action{
+		Type:    core.ActionRunShell,
+		Command: "pipx install harbor",
+		Detach:  true,
+	}) {
+		t.Fatal("expected detach to allow background run")
 	}
 }
 
@@ -179,6 +186,47 @@ func TestBuildContinuationMessageRequiresExplicitFinishOrNextAction(t *testing.T
 	}})
 	if !strings.Contains(msg.Content, "Return a finish action only if the task is complete") {
 		t.Fatalf("expected explicit finish guidance, got %q", msg.Content)
+	}
+}
+
+func TestAskUserTextIsBlockedByDefault(t *testing.T) {
+	engine, _ := testEngine(t, core.InteractionExecuteFirst)
+	response := core.LLMResponse{
+		Summary: "Need input",
+		Actions: []core.Action{{
+			ID:        "ask-1",
+			Type:      core.ActionAskUser,
+			Title:     "Ask",
+			Reason:    "Need a value",
+			InputKind: core.InputText,
+			FieldKey:  "name",
+			Prompt:    "Provide name",
+		}},
+		NeedsUserInput: true,
+	}
+	results, stop, err := engine.executeTurn(context.Background(), response)
+	if err != nil {
+		t.Fatalf("executeTurn() error = %v", err)
+	}
+	if stop {
+		t.Fatal("expected ask_user block to allow continuation")
+	}
+	if len(results) != 1 || !results[0].Skipped {
+		t.Fatalf("expected skipped ask_user result, got %#v", results)
+	}
+	if !strings.Contains(results[0].Summary, "ask_user blocked") {
+		t.Fatalf("unexpected summary %q", results[0].Summary)
+	}
+}
+
+func TestBlockedByUserInputAllowsSkipped(t *testing.T) {
+	response := core.LLMResponse{NeedsUserInput: true}
+	results := []core.ActionResult{{
+		InputKind:    core.InputSecret,
+		ResponseMode: core.InputResponseSkipped,
+	}}
+	if blockedByUserInput(response, results, true) {
+		t.Fatal("expected skipped input not to block continuation")
 	}
 }
 
@@ -603,10 +651,11 @@ func TestRunChatPromptResumesAfterStructuredUserInput(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	renderer := &trackingRenderer{
 		inputResults: []core.ActionResult{{
-			InputKind:    core.InputText,
+			InputKind:    core.InputSecret,
 			FieldKey:     "token",
 			ResponseMode: core.InputResponseSubmitted,
 			InputValue:   "123:abc",
+			IsSensitive:  true,
 		}},
 	}
 	engine.Renderer = renderer
@@ -616,7 +665,7 @@ func TestRunChatPromptResumesAfterStructuredUserInput(t *testing.T) {
 			Actions: []core.Action{{
 				ID:           "ask-token",
 				Type:         core.ActionAskUser,
-				InputKind:    core.InputText,
+				InputKind:    core.InputSecret,
 				FieldKey:     "token",
 				Prompt:       "Paste the token",
 				Alternatives: []string{"submit", "skip", "follow_up"},
@@ -910,10 +959,11 @@ func TestExecuteTurnNarratesBlockedInput(t *testing.T) {
 	engine, _ := testEngine(t, core.InteractionExecuteFirst)
 	renderer := &trackingRenderer{
 		inputResults: []core.ActionResult{{
-			InputKind:    core.InputText,
+			InputKind:    core.InputSecret,
 			FieldKey:     "token",
 			ResponseMode: core.InputResponseSubmitted,
 			InputValue:   "abc",
+			IsSensitive:  true,
 		}},
 	}
 	engine.Renderer = renderer
@@ -923,7 +973,7 @@ func TestExecuteTurnNarratesBlockedInput(t *testing.T) {
 		Actions: []core.Action{{
 			ID:           "ask-1",
 			Type:         core.ActionAskUser,
-			InputKind:    core.InputText,
+			InputKind:    core.InputSecret,
 			FieldKey:     "token",
 			Prompt:       "Paste the token",
 			Reason:       "I need your input before I can continue.",
@@ -1289,7 +1339,7 @@ func TestRunTaskResumesAfterStructuredUserInput(t *testing.T) {
 			Actions: []core.Action{{
 				ID:              "ask-1",
 				Type:            core.ActionAskUser,
-				InputKind:       core.InputText,
+				InputKind:       core.InputSecret,
 				FieldKey:        "bot_token",
 				Prompt:          "Paste the bot token",
 				Alternatives:    []string{"submit", "skip", "follow_up"},
@@ -1317,9 +1367,6 @@ func TestRunTaskResumesAfterStructuredUserInput(t *testing.T) {
 	}
 	if len(records) != 1 {
 		t.Fatalf("expected one session record, got %d", len(records))
-	}
-	if len(records[0].Results) == 0 || records[0].Results[0].InputValue != "123:abc" {
-		t.Fatalf("expected non-secret input to persist in record results, got %#v", records[0].Results)
 	}
 }
 
@@ -1394,8 +1441,8 @@ func TestRunTaskUsesStructuredInputForConcreteTextValue(t *testing.T) {
 	if err := engine.RunTask(context.Background(), "inspect a service", nil, "oneshot"); err != nil {
 		t.Fatalf("RunTask() error = %v", err)
 	}
-	if len(renderer.blockerActions) != 1 {
-		t.Fatalf("expected structured text input to open blocker UI, got %d", len(renderer.blockerActions))
+	if len(renderer.blockerActions) != 0 {
+		t.Fatalf("expected text input to stay out of blocker UI, got %d", len(renderer.blockerActions))
 	}
 }
 

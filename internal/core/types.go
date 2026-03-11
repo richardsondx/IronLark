@@ -60,6 +60,7 @@ const (
 	ActionSearchFiles    ActionType = "search_files"
 	ActionSemanticSearch ActionType = "semantic_search"
 	ActionEditFile       ActionType = "edit_file"
+	ActionWriteFile      ActionType = "write_file"
 	ActionWebSearch      ActionType = "web_search"
 	ActionFetchRules     ActionType = "fetch_rules"
 	ActionFetchOps       ActionType = "fetch_ops"
@@ -112,8 +113,11 @@ type Action struct {
 	Pattern          string     `json:"pattern,omitempty"`
 	Glob             string     `json:"glob,omitempty"`
 	PatchUnifiedDiff string     `json:"patch_unified_diff,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	FileMode         string     `json:"file_mode,omitempty"`
 	CWD              string     `json:"cwd,omitempty"`
 	TimeoutSec       int        `json:"timeout_sec,omitempty"`
+	Detach           bool       `json:"detach,omitempty"`
 	InputKind        InputKind  `json:"input_kind,omitempty"`
 	FieldKey         string     `json:"field_key,omitempty"`
 	Prompt           string     `json:"prompt,omitempty"`

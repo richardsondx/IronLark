@@ -159,6 +159,12 @@ func (r *Renderer) PlannedActions(actions []core.Action, previews []core.RiskRep
 				fmt.Fprintf(r.Out, "    %s\n", r.formatDiffLine(line))
 			}
 		}
+		if action.Type == core.ActionWriteFile {
+			fmt.Fprintf(r.Out, "  %s: %d bytes\n", r.label("Content"), len(action.Content))
+			if strings.TrimSpace(action.FileMode) != "" {
+				fmt.Fprintf(r.Out, "  %s: %s\n", r.label("Mode"), action.FileMode)
+			}
+		}
 	}
 }
 
@@ -241,6 +247,12 @@ func (r *Renderer) ApprovalPrompt(action core.Action, report core.RiskReport) {
 		fmt.Fprintf(r.Out, "  %s:\n", r.label("Diff"))
 		for _, line := range strings.Split(strings.TrimSpace(action.PatchUnifiedDiff), "\n") {
 			fmt.Fprintf(r.Out, "    %s\n", r.formatDiffLine(line))
+		}
+	}
+	if action.Type == core.ActionWriteFile {
+		fmt.Fprintf(r.Out, "  %s: %d bytes\n", r.label("Content"), len(action.Content))
+		if strings.TrimSpace(action.FileMode) != "" {
+			fmt.Fprintf(r.Out, "  %s: %s\n", r.label("Mode"), action.FileMode)
 		}
 	}
 }

@@ -202,7 +202,7 @@ func RuleForAction(action core.Action, decision Decision) Rule {
 	case core.ActionRunShell:
 		rule.Kind = RuleCommandPrefix
 		rule.Value = normalizeCommand(action.Command)
-	case core.ActionReadFiles, core.ActionEditFile, core.ActionListDir, core.ActionSearchFiles, core.ActionSemanticSearch:
+	case core.ActionReadFiles, core.ActionEditFile, core.ActionWriteFile, core.ActionListDir, core.ActionSearchFiles, core.ActionSemanticSearch:
 		rule.Kind = RulePathPrefix
 		rule.Value = normalizePath(firstNonEmpty(action.Path, firstPath(action.Paths)))
 	default:

@@ -798,6 +798,17 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 		return nil, true, nil
 	}
 
+	allowedAskUser := false
+	for _, action := range response.Actions {
+		if action.Type == core.ActionAskUser && isAskUserAllowed(action) {
+			allowedAskUser = true
+			break
+		}
+	}
+	if !allowedAskUser {
+		response.NeedsUserInput = false
+	}
+
 	previews := make([]core.RiskReport, 0, len(response.Actions))
 	resolutions := make([]policy.Resolution, 0, len(response.Actions))
 	needApproval := false
@@ -859,6 +870,20 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			continue
 		}
 		if action.Type == core.ActionAskUser {
+			if !isAskUserAllowed(action) {
+				result := core.ActionResult{
+					Action:   action,
+					Risk:     report,
+					Skipped:  true,
+					Summary:  "ask_user blocked: only secret or manual_wait inputs are allowed",
+					Approved: true,
+				}
+				if !e.Runtime.JSONOutput {
+					e.Renderer.Result(result)
+				}
+				results = append(results, result)
+				continue
+			}
 			if !shouldUseStructuredInput(action) {
 				if responseHasVisibleContent(response) {
 					return results, true, nil
@@ -905,6 +930,11 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 			results = append(results, result)
 		}
 		if err != nil {
+			if isEditPatchFailure(result) {
+				if followUp := e.autoReadAfterPatchFailure(ctx, result.Action, narrator); followUp != nil {
+					results = append(results, *followUp)
+				}
+			}
 			return results, false, nil
 		}
 		if stop {
@@ -951,6 +981,52 @@ func (e *Engine) executeTurnWithNarrator(ctx context.Context, response core.LLMR
 	return results, false, nil
 }
 
+func isEditPatchFailure(result core.ActionResult) bool {
+	return result.Action.Type == core.ActionEditFile && strings.TrimSpace(result.Summary) == "the generated edit patch was invalid"
+}
+
+func (e *Engine) autoReadAfterPatchFailure(ctx context.Context, action core.Action, narrator *turnNarrator) *core.ActionResult {
+	target := firstNonEmpty(action.Path, firstPath(action.Paths))
+	if strings.TrimSpace(target) == "" {
+		return nil
+	}
+	readAction := core.Action{
+		ID:     action.ID + "-auto-read",
+		Type:   core.ActionReadFiles,
+		Title:  "Read file after patch failure",
+		Reason: "Capture current file contents to repair the edit.",
+		Path:   target,
+	}
+	report, err := e.Executor.Preview(readAction, e.Runtime.ReadOnly)
+	if err != nil {
+		result := core.ActionResult{Action: readAction, Risk: report, Skipped: true, Summary: err.Error()}
+		return &result
+	}
+	resolution, err := e.PolicyStore.Resolve(readAction)
+	if err != nil {
+		result := core.ActionResult{Action: readAction, Risk: report, Skipped: true, Summary: err.Error()}
+		return &result
+	}
+	if resolution.Match.Matched && resolution.Match.Decision == policy.DecisionDeny {
+		result := core.ActionResult{Action: readAction, Risk: report, Skipped: true, Summary: "auto-read blocked by machine policy"}
+		return &result
+	}
+	if narrator != nil {
+		e.narrate(narrator.actionStarted(readAction))
+	}
+	result, err := e.Executor.Execute(ctx, readAction, e.Runtime.ReadOnly)
+	if err != nil && result.Error == "" {
+		result.Error = err.Error()
+	}
+	if !e.Runtime.JSONOutput {
+		e.Renderer.Result(result)
+	}
+	if narrator != nil {
+		e.narrate(narrator.actionFinished(result))
+	}
+	return &result
+}
+
 func shouldUseStructuredInput(action core.Action) bool {
 	switch action.InputKind {
 	case core.InputSecret, core.InputConfirm, core.InputManualWait:
@@ -986,6 +1062,15 @@ func shouldUseStructuredInput(action core.Action) bool {
 			}
 		}
 		return false
+	default:
+		return false
+	}
+}
+
+func isAskUserAllowed(action core.Action) bool {
+	switch action.InputKind {
+	case core.InputSecret, core.InputManualWait:
+		return true
 	default:
 		return false
 	}
@@ -1343,6 +1428,9 @@ func (e *Engine) maybePromoteShellAction(ctx context.Context, action core.Action
 }
 
 func (e *Engine) promoteShellFailure(ctx context.Context, action core.Action, failed core.ActionResult) (core.ActionResult, bool, error) {
+	if !action.Detach {
+		return core.ActionResult{}, false, nil
+	}
 	var reason ops.ShellPromotionReason
 	switch failed.FailureKind {
 	case core.ShellFailureTimeout:
@@ -1369,6 +1457,10 @@ func (e *Engine) startBackgroundShellRun(ctx context.Context, action core.Action
 	if err != nil {
 		return core.ActionResult{}, false, err
 	}
+	summary := fmt.Sprintf("continuing in background run %s (pid %d)", status.Spec.ID, pid)
+	if action.Detach {
+		summary = fmt.Sprintf("started background run %s (pid %d)", status.Spec.ID, pid)
+	}
 	result := core.ActionResult{
 		Action:                action,
 		Risk:                  report,
@@ -1376,7 +1468,7 @@ func (e *Engine) startBackgroundShellRun(ctx context.Context, action core.Action
 		BackgroundRunID:       status.Spec.ID,
 		BackgroundRecommended: true,
 		Retryable:             true,
-		Summary:               fmt.Sprintf("continuing in background run %s (pid %d)", status.Spec.ID, pid),
+		Summary:               summary,
 	}
 	return result, true, nil
 }
@@ -1385,27 +1477,7 @@ func (e *Engine) shouldPromoteShellBeforeRun(action core.Action) bool {
 	if e.Ops == nil || action.Type != core.ActionRunShell {
 		return false
 	}
-	if !e.Runtime.Config.Tools.AutoBackgroundLongRunsValue() {
-		return false
-	}
-	if action.TimeoutSec > 0 && action.TimeoutSec > e.Runtime.Config.Tools.InlineShellTimeoutSec {
-		return true
-	}
-	if !e.Runtime.Config.Tools.LongRunHeuristicsEnabledValue() {
-		return false
-	}
-	command := strings.ToLower(action.Command)
-	for _, token := range []string{
-		"pip install", "pipx install", "npm install", "pnpm install", "yarn install",
-		"apt-get install", "brew install", "docker build", "docker pull", "go test",
-		"cargo test", "pytest", "make install", "make build", "bundle install",
-		"terraform apply", "kubectl apply", "migrate", "migration", "deploy",
-	} {
-		if strings.Contains(command, token) {
-			return true
-		}
-	}
-	return false
+	return action.Detach
 }
 
 func shouldNudgeForExecutableStep(response core.LLMResponse, results []core.ActionResult) bool {
@@ -1477,7 +1549,7 @@ func shouldSynthesizeOutcome(status core.CompletionStatus, response core.LLMResp
 	if isSyntheticFallbackResponse(response) {
 		return true
 	}
-	return (len(response.Actions) > 0 && !responseHasFinishAction(response)) || len(response.Verification) > 0 || response.NeedsUserInput
+	return (len(response.Actions) > 0 && !responseHasFinishAction(response)) || len(response.Verification) > 0 || responseHasAllowedAskUserAction(response)
 }
 
 func responseHasFinishAction(response core.LLMResponse) bool {
@@ -1498,24 +1570,41 @@ func responseHasAskUserAction(response core.LLMResponse) bool {
 	return false
 }
 
-func blockedByUserInput(response core.LLMResponse, results []core.ActionResult, stop bool) bool {
-	if !stop {
-		return false
-	}
-	if response.NeedsUserInput || responseHasAskUserAction(response) {
-		return true
-	}
-	for _, result := range results {
-		if result.InputKind != "" && result.ResponseMode != core.InputResponseSubmitted && result.ResponseMode != core.InputResponseFollowUp {
+func responseHasAllowedAskUserAction(response core.LLMResponse) bool {
+	for _, action := range response.Actions {
+		if action.Type == core.ActionAskUser && isAskUserAllowed(action) {
 			return true
 		}
 	}
 	return false
 }
 
+func blockedByUserInput(response core.LLMResponse, results []core.ActionResult, stop bool) bool {
+	if !stop {
+		return false
+	}
+	inputSeen := false
+	for _, result := range results {
+		if result.InputKind != "" && result.ResponseMode != core.InputResponseSubmitted && result.ResponseMode != core.InputResponseFollowUp {
+			if result.ResponseMode == core.InputResponseSkipped {
+				inputSeen = true
+				continue
+			}
+			return true
+		}
+		if result.InputKind != "" {
+			inputSeen = true
+		}
+	}
+	if response.NeedsUserInput || responseHasAllowedAskUserAction(response) {
+		return !inputSeen
+	}
+	return false
+}
+
 func hasBackgroundRun(results []core.ActionResult) bool {
 	for _, result := range results {
-		if strings.TrimSpace(result.BackgroundRunID) != "" {
+		if strings.TrimSpace(result.BackgroundRunID) != "" && !result.Action.Detach {
 			return true
 		}
 	}
@@ -1586,7 +1675,7 @@ func findFollowUp(results []core.ActionResult) *core.ActionResult {
 
 func findBackgroundRunContinuation(results []core.ActionResult) (string, string, bool) {
 	for _, result := range results {
-		if strings.TrimSpace(result.BackgroundRunID) == "" {
+		if strings.TrimSpace(result.BackgroundRunID) == "" || result.Action.Detach {
 			continue
 		}
 		return result.BackgroundRunID, firstNonEmpty(result.Summary, "background work is continuing"), true
@@ -1643,6 +1732,9 @@ func redactBackgroundContinuation(content string) string {
 }
 
 func redactActionResult(result core.ActionResult) core.ActionResult {
+	if result.Action.Type == core.ActionWriteFile && result.Action.Content != "" {
+		result.Action.Content = fmt.Sprintf("[omitted %d bytes]", len(result.Action.Content))
+	}
 	if !result.IsSensitive {
 		return result
 	}

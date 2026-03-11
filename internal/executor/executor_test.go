@@ -81,6 +81,40 @@ func TestExecuteEditFileReportsHelpfulUnifiedDiffError(t *testing.T) {
 	}
 }
 
+func TestExecuteWriteFileWritesContentAndMode(t *testing.T) {
+	exec := testExecutor(t)
+	exec.CheckpointStore = checkpoints.Store{Dir: filepath.Join(t.TempDir(), "checkpoints")}
+	target := filepath.Join(exec.WorkingDir, "script.sh")
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		Type:     core.ActionWriteFile,
+		Path:     target,
+		Title:    "Write script",
+		Content:  "echo hello\n",
+		FileMode: "0755",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if result.Summary == "" || result.CheckpointID == "" {
+		t.Fatalf("expected summary and checkpoint, got %#v", result)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "echo hello\n" {
+		t.Fatalf("unexpected file contents %q", string(data))
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("expected mode 0755, got %v", info.Mode().Perm())
+	}
+}
+
 func TestExecuteStreamEmitsShellOutputChunks(t *testing.T) {
 	exec := testExecutor(t)
 	var chunks []core.ActionOutputChunk

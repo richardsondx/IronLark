@@ -240,6 +240,12 @@ func (r *AgentRenderer) PlannedActions(actions []core.Action, previews []core.Ri
 				lines = append(lines, r.formatDiffLine(line))
 			}
 		}
+		if action.Type == core.ActionWriteFile {
+			lines = append(lines, fmt.Sprintf("%s: %d bytes", r.agentLabel("content"), len(action.Content)))
+			if strings.TrimSpace(action.FileMode) != "" {
+				lines = append(lines, r.agentLabel("mode")+": "+action.FileMode)
+			}
+		}
 	}
 	r.writeBlock("Plan", lines)
 }
@@ -335,6 +341,12 @@ func (r *AgentRenderer) ApprovalPrompt(action core.Action, report core.RiskRepor
 	if action.Type == core.ActionEditFile && action.PatchUnifiedDiff != "" {
 		for _, line := range strings.Split(strings.TrimSpace(action.PatchUnifiedDiff), "\n") {
 			lines = append(lines, r.formatDiffLine(line))
+		}
+	}
+	if action.Type == core.ActionWriteFile {
+		lines = append(lines, fmt.Sprintf("%s: %d bytes", r.agentLabel("content"), len(action.Content)))
+		if strings.TrimSpace(action.FileMode) != "" {
+			lines = append(lines, r.agentLabel("mode")+": "+action.FileMode)
 		}
 	}
 	r.setActionStatus("")
