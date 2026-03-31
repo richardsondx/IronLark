@@ -24,6 +24,8 @@ import (
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/redact"
 	"github.com/richardsondx/IronLark/internal/search"
+	"github.com/richardsondx/IronLark/internal/taskruntime"
+	"github.com/richardsondx/IronLark/internal/toolruntime"
 )
 
 type Executor struct {
@@ -47,6 +49,8 @@ type Executor struct {
 	DurableShellMaxRuntimeSec   int
 	DurableShellLogPreviewBytes int
 	ProviderModel               string
+	ToolRuntime                 *toolruntime.Runtime
+	TaskStore                   taskruntime.Store
 	Provider                    interface {
 		WebSearch(ctx context.Context, req provider.SearchRequest) ([]string, error)
 	}
@@ -105,6 +109,10 @@ func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOn
 		Risk:      report,
 		Approved:  true,
 		StartedAt: startedAt,
+	}
+	e.ensureToolRuntime()
+	if e.ToolRuntime != nil && e.ToolRuntime.Handles(action.Type) {
+		return e.executeRuntimeAction(ctx, action, readOnly, onChunk, result, startedAt)
 	}
 	switch action.Type {
 	case core.ActionRunShell:
@@ -308,6 +316,31 @@ func (e *Executor) ExecuteStream(ctx context.Context, action core.Action, readOn
 		finalize(&result, startedAt)
 		return result, nil
 	case core.ActionFinish:
+		if action.OutputContent != "" {
+			err := os.WriteFile("/app/results.txt", []byte(action.OutputContent), 0644)
+			if err != nil {
+				result.Error = fmt.Sprintf("failed to save output content: %v", err)
+				finalize(&result, startedAt)
+				return result, err
+			}
+		}
+
+		gates := os.Getenv("LARK_FINISH_GATE_FILES")
+		if gates != "" {
+			for _, file := range strings.Split(gates, ",") {
+				file = strings.TrimSpace(file)
+				if file == "" {
+					continue
+				}
+				info, err := os.Stat(file)
+				if err != nil || info.Size() == 0 {
+					result.Error = fmt.Sprintf("Tool Execution Failed: Expected output file '%s' is missing or 0 bytes.", file)
+					finalize(&result, startedAt)
+					return result, fmt.Errorf("missing expected output: %s", file)
+				}
+			}
+		}
+
 		result.Summary = "finished"
 		finalize(&result, startedAt)
 		return result, nil
@@ -680,9 +713,7 @@ func parseFileMode(raw string) (os.FileMode, error) {
 		return 0, fmt.Errorf("file_mode is empty")
 	}
 	lower := strings.ToLower(value)
-	if strings.HasPrefix(lower, "0o") {
-		lower = strings.TrimPrefix(lower, "0o")
-	}
+	lower = strings.TrimPrefix(lower, "0o")
 	isOctal := true
 	for _, r := range lower {
 		if r < '0' || r > '7' {

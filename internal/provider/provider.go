@@ -106,6 +106,7 @@ Expected JSON Schema:
     {
       "id": "unique-id",
       "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|write_file|web_search|fetch_rules|fetch_ops|ask_user|inspect|checkpoint|finish",
+      "output_content": "optional structured string to write out on finish",
       "title": "Short title",
       "reason": "Why this is needed",
       "command": "command to run (for run_shell)",
@@ -190,7 +191,13 @@ func ParseResponse(raw string) (core.LLMResponse, error) {
 	if err := json.Unmarshal([]byte(trimmed), &response); err != nil {
 		return core.LLMResponse{}, fmt.Errorf("decode provider response: %w", err)
 	}
-	for _, action := range response.Actions {
+	for idx, action := range response.Actions {
+		normalizedType, ok := core.NormalizeActionType(action.Type)
+		if !ok {
+			return core.LLMResponse{}, fmt.Errorf("decode provider response: unsupported action type %q", action.Type)
+		}
+		action.Type = normalizedType
+		response.Actions[idx] = action
 		if action.Type != core.ActionAskUser {
 			continue
 		}

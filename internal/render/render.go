@@ -61,6 +61,7 @@ type UI interface {
 	SetApproval(mode core.ApprovalMode)
 	SetModelContext(provider, model string, options []string)
 	SetOpsSummary(summary string)
+	SetContextUsage(used, max int)
 	SetSecretVisibility(visible bool)
 	SecretVisibility() string
 	ClearScreen()
@@ -308,6 +309,8 @@ func (r *Renderer) SetModelContext(provider, model string, options []string) {}
 
 func (r *Renderer) SetOpsSummary(summary string) {}
 
+func (r *Renderer) SetContextUsage(used, max int) {}
+
 func (r *Renderer) SetSecretVisibility(visible bool) {}
 
 func (r *Renderer) SecretVisibility() string { return "visible" }
@@ -467,6 +470,12 @@ func (r *Renderer) encode(v any) error {
 }
 
 func (r *Renderer) readLine(prefix string) (string, error) {
+	// If we have a raw terminal, use the interactive line editor so the user
+	// always sees what they are typing even for long inputs.
+	if r.rawIn != nil && term.IsTerminal(int(r.rawIn.Fd())) {
+		return r.readLineRaw(prefix)
+	}
+	// Fallback for piped / non-terminal input.
 	fmt.Fprint(r.Out, prefix)
 	line, err := r.In.ReadString('\n')
 	if err != nil {
@@ -476,6 +485,148 @@ func (r *Renderer) readLine(prefix string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(line), nil
+}
+
+// readLineRaw is a simple raw-mode line editor. It handles:
+//   - Printable characters inserted at the cursor
+//   - Backspace and Delete
+//   - Left/Right arrow keys and Home/End
+//   - Enter to submit, Ctrl-C / Ctrl-D to abort
+//
+// After every key-press it repaints the line and scrolls a terminal-width
+// window right so the cursor is always visible.
+func (r *Renderer) readLineRaw(prefix string) (string, error) {
+	oldState, err := term.MakeRaw(int(r.rawIn.Fd()))
+	if err != nil {
+		// If we can't go raw, fall back to buffered reader.
+		fmt.Fprint(r.Out, prefix)
+		line, rerr := r.In.ReadString('\n')
+		if rerr != nil && rerr != io.EOF {
+			return "", rerr
+		}
+		return strings.TrimSpace(line), nil
+	}
+	defer term.Restore(int(r.rawIn.Fd()), oldState)
+
+	width, _, werr := term.GetSize(int(r.rawIn.Fd()))
+	if werr != nil || width <= 0 {
+		width = 80
+	}
+
+	buf := []rune{}
+	cursor := 0 // logical cursor position inside buf
+
+	// repaint redraws the whole input line, keeping the cursor visible.
+	repaint := func() {
+		prefixRunes := []rune(prefix)
+		availWidth := width - len(prefixRunes) - 1
+		if availWidth < 10 {
+			availWidth = 10
+		}
+
+		// Determine the scroll offset so cursor is always visible.
+		scrollStart := 0
+		if cursor > availWidth {
+			scrollStart = cursor - availWidth
+		}
+		visible := buf
+		if scrollStart < len(visible) {
+			visible = visible[scrollStart:]
+		} else {
+			visible = nil
+		}
+		if len(visible) > availWidth+1 {
+			visible = visible[:availWidth+1]
+		}
+
+		// \r moves to column 0, \033[K clears to end of line.
+		fmt.Fprintf(r.Out, "\r\033[K%s%s", prefix, string(visible))
+
+		// Move cursor to the right position within the visible slice.
+		visibleCursor := cursor - scrollStart
+		if visibleCursor < 0 {
+			visibleCursor = 0
+		}
+		// Position = prefix width + visibleCursor; we are currently at end of
+		// the visible slice, so move left by (len(visible) - visibleCursor).
+		moveLeft := len(visible) - visibleCursor
+		if moveLeft > 0 {
+			fmt.Fprintf(r.Out, "\033[%dD", moveLeft)
+		}
+	}
+
+	repaint()
+
+	for {
+		b := make([]byte, 1)
+		_, readErr := r.rawIn.Read(b)
+		if readErr != nil {
+			fmt.Fprintln(r.Out)
+			return string(buf), readErr
+		}
+
+		switch b[0] {
+		case '\r', '\n':
+			// Submit
+			fmt.Fprintln(r.Out)
+			return strings.TrimSpace(string(buf)), nil
+
+		case 3: // Ctrl-C
+			fmt.Fprintln(r.Out)
+			return "", fmt.Errorf("interrupted")
+
+		case 4: // Ctrl-D (EOF when buffer is empty)
+			if len(buf) == 0 {
+				fmt.Fprintln(r.Out)
+				return "", io.EOF
+			}
+
+		case 127, 8: // Backspace / Ctrl-H
+			if cursor > 0 {
+				buf = append(buf[:cursor-1], buf[cursor:]...)
+				cursor--
+			}
+
+		case 27: // Escape sequence
+			// Try to read two more bytes for arrow-key sequences.
+			esc := make([]byte, 2)
+			r.rawIn.Read(esc) //nolint:errcheck
+			if esc[0] == '[' {
+				switch esc[1] {
+				case 'D': // Left arrow
+					if cursor > 0 {
+						cursor--
+					}
+				case 'C': // Right arrow
+					if cursor < len(buf) {
+						cursor++
+					}
+				case 'H': // Home
+					cursor = 0
+				case 'F': // End
+					cursor = len(buf)
+				case '3': // Delete key (\033[3~)
+					// Consume the trailing '~'
+					tr := make([]byte, 1)
+					r.rawIn.Read(tr) //nolint:errcheck
+					if cursor < len(buf) {
+						buf = append(buf[:cursor], buf[cursor+1:]...)
+					}
+				}
+			}
+
+		default:
+			if b[0] >= 32 { // printable ASCII
+				// Insert at cursor position.
+				buf = append(buf, 0)
+				copy(buf[cursor+1:], buf[cursor:])
+				buf[cursor] = rune(b[0])
+				cursor++
+			}
+		}
+
+		repaint()
+	}
 }
 
 func (r *Renderer) readUserInputAction(action core.Action) (string, core.InputResponseMode, error) {
@@ -873,4 +1024,7 @@ const (
 	ansiCyan    = "\033[36m"
 	ansiBgWhite = "\033[47m"
 	ansiBgGreen = "\033[42m"
+	ansiBgCyan  = "\033[46m"
+	ansiBgGray  = "\033[100m"
+	ansiWhite   = "\033[97m"
 )

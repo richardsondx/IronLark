@@ -1,6 +1,9 @@
 package core
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type ApprovalMode string
 
@@ -76,6 +79,73 @@ const (
 	ActionPatch    = ActionEditFile
 )
 
+func (t ActionType) Valid() bool {
+	switch t {
+	case ActionRunShell, ActionReadFiles, ActionListDir, ActionSearchFiles, ActionSemanticSearch, ActionEditFile,
+		ActionWriteFile, ActionWebSearch, ActionFetchRules, ActionFetchOps, ActionAskUser, ActionInspect,
+		ActionCheckpoint, ActionFinish:
+		return true
+	default:
+		return false
+	}
+}
+
+func NormalizeActionType(raw ActionType) (ActionType, bool) {
+	text := strings.TrimSpace(string(raw))
+	if text == "" {
+		return "", false
+	}
+	candidates := []ActionType{
+		ActionSemanticSearch,
+		ActionSearchFiles,
+		ActionReadFiles,
+		ActionRunShell,
+		ActionListDir,
+		ActionEditFile,
+		ActionWriteFile,
+		ActionWebSearch,
+		ActionFetchRules,
+		ActionFetchOps,
+		ActionAskUser,
+		ActionInspect,
+		ActionCheckpoint,
+		ActionFinish,
+		ActionRun,
+		ActionReadFile,
+		ActionGrep,
+		ActionPatch,
+	}
+	lower := strings.ToLower(text)
+	for _, candidate := range candidates {
+		target := string(candidate)
+		if lower == target {
+			return canonicalActionType(candidate), true
+		}
+		if strings.HasPrefix(lower, target) {
+			remainder := lower[len(target):]
+			if remainder == "" || strings.ContainsAny(remainder, "\",}] \n\r\t:") {
+				return canonicalActionType(candidate), true
+			}
+		}
+	}
+	return ActionType(text), false
+}
+
+func canonicalActionType(actionType ActionType) ActionType {
+	switch actionType {
+	case ActionRun:
+		return ActionRunShell
+	case ActionReadFile:
+		return ActionReadFiles
+	case ActionGrep:
+		return ActionSearchFiles
+	case ActionPatch:
+		return ActionEditFile
+	default:
+		return actionType
+	}
+}
+
 type InputKind string
 
 const (
@@ -126,6 +196,7 @@ type Action struct {
 	DestinationHint  string     `json:"destination_hint,omitempty"`
 	ExpectsValue     bool       `json:"expects_value,omitempty"`
 	Alternatives     []string   `json:"alternatives,omitempty"`
+	OutputContent    string     `json:"output_content,omitempty"`
 }
 
 type Narration struct {
@@ -314,6 +385,8 @@ type ActionResult struct {
 	Retryable             bool              `json:"retryable,omitempty"`
 	BackgroundRecommended bool              `json:"background_recommended,omitempty"`
 	BackgroundRunID       string            `json:"background_run_id,omitempty"`
+	TaskID                string            `json:"task_id,omitempty"`
+	Handler               string            `json:"handler,omitempty"`
 	PatchID               string            `json:"patch_id,omitempty"`
 	BackupPath            string            `json:"backup_path,omitempty"`
 	CheckpointID          string            `json:"checkpoint_id,omitempty"`

@@ -309,6 +309,12 @@ func responseHasVisibleContent(response core.LLMResponse) bool {
 }
 
 func normalizedResponse(response core.LLMResponse) core.LLMResponse {
+	for idx, action := range response.Actions {
+		if normalized, ok := core.NormalizeActionType(action.Type); ok {
+			action.Type = normalized
+			response.Actions[idx] = action
+		}
+	}
 	if strings.TrimSpace(response.Summary) != "" {
 		return response
 	}

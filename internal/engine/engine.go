@@ -18,6 +18,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/core"
 	"github.com/richardsondx/IronLark/internal/executor"
 	"github.com/richardsondx/IronLark/internal/graph"
+	"github.com/richardsondx/IronLark/internal/memory"
 	"github.com/richardsondx/IronLark/internal/models"
 	"github.com/richardsondx/IronLark/internal/ops"
 	"github.com/richardsondx/IronLark/internal/policy"
@@ -223,6 +224,7 @@ func (e *Engine) RunTask(ctx context.Context, prompt string, stdin []byte, mode 
 
 	record.Summary = finalResponse.Summary
 	record.Results = allResults
+	record.Memories = memory.ExtractSessionMemories(prompt, finalResponse, allResults, 16)
 	record.Messages = sanitizeMessages(history)
 	record.CompletionStatus = finalStatus
 	record.FinishedAt = time.Now().UTC()
@@ -720,6 +722,7 @@ func (e *Engine) runChatPrompt(ctx context.Context, prompt string, stdin []byte,
 
 	record.Summary = finalResponse.Summary
 	record.Results = append(record.Results, allResults...)
+	record.Memories = memory.ExtractSessionMemories(prompt, finalResponse, allResults, 16)
 	record.Messages = sanitizeMessages(*history)
 	record.CompletionStatus = finalStatus
 	record.FinishedAt = time.Now().UTC()
@@ -1804,6 +1807,9 @@ func (e *Engine) prepareTaskHistory(prompt string, snapshot ctxpkg.Snapshot, gra
 			RecentTurns: e.Runtime.Config.Thread.RecentTurns,
 		})...)
 		e.warnContextUsage(*threadState, threadRef.Source)
+	} else {
+		// Even for ephemeral threads, register the limit so the UI shows the bar
+		e.Renderer.SetContextUsage(0, e.Runtime.Config.Thread.MaxTokens)
 	}
 	history = append(history, core.ConversationMessage{
 		Role:    "user",
@@ -1916,6 +1922,8 @@ func (e *Engine) warnContextUsage(thread threads.Thread, source string) {
 	if ratio := e.Runtime.Config.Thread.WarnAtRatio; ratio > 0 && ratio < 1 {
 		warnAt = int(float64(maxTokens) * ratio)
 	}
+	// Always keep the renderer's context bar up-to-date.
+	e.Renderer.SetContextUsage(thread.EstimatedTokens, maxTokens)
 	if thread.EstimatedTokens >= warnAt && !e.Runtime.JSONOutput {
 		e.Renderer.Message(fmt.Sprintf("Context warning: thread %s (%s) is using %d/%d estimated tokens.", thread.ID, source, thread.EstimatedTokens, maxTokens))
 	}

@@ -145,3 +145,52 @@ func TestParseResponseKeepsEmptySummaryEmpty(t *testing.T) {
 		t.Fatalf("expected empty summary to remain empty, got %q", response.Summary)
 	}
 }
+
+func TestParseResponseNormalizesMalformedFinishActionType(t *testing.T) {
+	raw := `{
+  "summary": "Summary complete",
+  "findings": [],
+  "actions": [
+    {
+      "id": "finish-1",
+      "type": "finish\",\"output_content\":\"IronLark summary",
+      "title": "Finish",
+      "reason": "done"
+    }
+  ],
+  "verification": [],
+  "needs_user_input": false,
+  "confidence": 0.99
+}`
+
+	response, err := ParseResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseResponse() error = %v", err)
+	}
+	if len(response.Actions) != 1 || response.Actions[0].Type != "finish" {
+		t.Fatalf("expected finish action to be normalized, got %#v", response.Actions)
+	}
+}
+
+func TestParseResponseRejectsUnknownActionType(t *testing.T) {
+	raw := `{
+  "summary": "Unknown action",
+  "findings": [],
+  "actions": [
+    {
+      "id": "bad-1",
+      "type": "totally_unknown",
+      "title": "Unknown",
+      "reason": "bad"
+    }
+  ],
+  "verification": [],
+  "needs_user_input": false,
+  "confidence": 0.1
+}`
+
+	_, err := ParseResponse(raw)
+	if err == nil || !strings.Contains(err.Error(), "unsupported action type") {
+		t.Fatalf("expected unsupported action type error, got %v", err)
+	}
+}

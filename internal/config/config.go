@@ -153,6 +153,7 @@ type Paths struct {
 	IncidentsDir      string
 	ProcessesDir      string
 	ShellRunsDir      string
+	TaskRunsDir       string
 	PolicyPath        string
 	PatchesDir        string
 	CheckpointsDir    string
@@ -312,6 +313,7 @@ func ResolvePaths(cwd string) (Paths, error) {
 		IncidentsDir:      filepath.Join(dataHome, "lark", "ops", "incidents"),
 		ProcessesDir:      filepath.Join(dataHome, "lark", "ops", "processes"),
 		ShellRunsDir:      filepath.Join(dataHome, "lark", "ops", "shell-runs"),
+		TaskRunsDir:       filepath.Join(dataHome, "lark", "tasks"),
 		PolicyPath:        filepath.Join(dataHome, "lark", "policy.json"),
 		PatchesDir:        filepath.Join(dataHome, "lark", "patches"),
 		CheckpointsDir:    filepath.Join(dataHome, "lark", "checkpoints"),
@@ -331,6 +333,7 @@ func EnsureDirs(paths Paths) error {
 		paths.IncidentsDir,
 		paths.ProcessesDir,
 		paths.ShellRunsDir,
+		paths.TaskRunsDir,
 		paths.PatchesDir,
 		paths.CheckpointsDir,
 	}

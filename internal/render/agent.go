@@ -72,6 +72,12 @@ const (
 	keyEscape
 	keyTab
 	keyShiftTab
+	keyInterrupt
+	keyDelete
+	keyLeft
+	keyRight
+	keyHome
+	keyEnd
 )
 
 type keyPress struct {
@@ -151,6 +157,12 @@ type AgentRenderer struct {
 	lastWidth        int
 	cursorHidden     bool
 	approvalDecision *approvalDecisionState
+
+	contextUsed int
+	contextMax  int
+
+	thinkingRawIn    *os.File
+	thinkingRawState *term.State
 }
 
 func NewAgent(in io.Reader, out, err io.Writer, colorMode string, meta AgentMeta) *AgentRenderer {
@@ -431,11 +443,17 @@ func (r *AgentRenderer) BeginThinking(label string) {
 	r.thinking = true
 	r.thinkingLabel = label
 	r.thinkingFrame = 0
-	if r.thinkingStop != nil {
-		close(r.thinkingStop)
-	}
 	stop := make(chan struct{})
 	r.thinkingStop = stop
+
+	if inFile, ok := r.inFile(); ok && term.IsTerminal(int(inFile.Fd())) {
+		if state, err := term.MakeRaw(int(inFile.Fd())); err == nil {
+			r.thinkingRawIn = inFile
+			r.thinkingRawState = state
+			go r.thinkingInputLoop(inFile, stop)
+		}
+	}
+
 	_ = r.drawLocked()
 	r.mu.Unlock()
 
@@ -460,9 +478,36 @@ func (r *AgentRenderer) BeginThinking(label string) {
 	}()
 }
 
+func (r *AgentRenderer) thinkingInputLoop(inFile *os.File, stop chan struct{}) {
+	buf := make([]byte, 1)
+	for {
+		// This read is blocking, but that's okay because term.Restore
+		// in EndThinking will usually break it or its side effects.
+		n, err := inFile.Read(buf)
+		if err != nil || n == 0 {
+			return
+		}
+
+		if buf[0] == 3 { // Ctrl-C
+			_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+		}
+
+		select {
+		case <-stop:
+			return
+		default:
+		}
+	}
+}
+
 func (r *AgentRenderer) EndThinking() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.thinkingRawState != nil {
+		_ = term.Restore(int(r.thinkingRawIn.Fd()), r.thinkingRawState)
+		r.thinkingRawIn = nil
+		r.thinkingRawState = nil
+	}
 	r.stopThinkingLocked()
 	_ = r.drawLocked()
 }
@@ -494,6 +539,14 @@ func (r *AgentRenderer) SetOpsSummary(summary string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.meta.OpsSummary = strings.TrimSpace(summary)
+	_ = r.drawLocked()
+}
+
+func (r *AgentRenderer) SetContextUsage(used, max int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.contextUsed = used
+	r.contextMax = max
 	_ = r.drawLocked()
 }
 
@@ -889,6 +942,13 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 		return r.handleApprovalDecisionKeyLocked(key)
 	}
 
+	if key.Kind == keyInterrupt {
+		// Send SIGINT to the process. This will be caught by the engine's
+		// interrupt handler in generateResponse or elsewhere.
+		_ = syscall.Kill(syscall.Getpid(), syscall.SIGINT)
+		return "", false
+	}
+
 	switch key.Kind {
 	case keyPrintable:
 		r.insertRuneLocked(key.Rune)
@@ -931,6 +991,22 @@ func (r *AgentRenderer) handleKey(key keyPress) (string, bool) {
 			r.moveOverlayLocked(1)
 		default:
 			r.scrollLocked(-1)
+		}
+	case keyLeft:
+		if r.cursor > 0 {
+			r.cursor--
+		}
+	case keyRight:
+		if r.cursor < len(r.composer) {
+			r.cursor++
+		}
+	case keyHome:
+		r.cursor = 0
+	case keyEnd:
+		r.cursor = len(r.composer)
+	case keyDelete:
+		if r.cursor < len(r.composer) {
+			r.composer = append(r.composer[:r.cursor], r.composer[r.cursor+1:]...)
 		}
 	case keyPageUp:
 		r.scrollLocked(1)
@@ -1659,11 +1735,18 @@ func (r *AgentRenderer) drawLocked() error {
 }
 
 func (r *AgentRenderer) headerLines(width, height int) []string {
-	line := " SSH-first ai agent. Tab opens prompt history. Type / for command menu. "
+	left := " IronLark | Tab: history | /: menu "
 	if strings.TrimSpace(r.meta.OpsSummary) != "" {
-		line += " | " + r.meta.OpsSummary + " "
+		left += "| " + r.meta.OpsSummary + " "
 	}
-	return []string{truncateDisplay(line, width)}
+	right := r.contextWindowWidgetLocked()
+	label := joinFooterSides(left, right, width)
+
+	if !r.Color {
+		return []string{truncateDisplay(label, width)}
+	}
+	// Use a dark grey background for the header status bar
+	return []string{ansiBold + ansiWhite + ansiBgGray + truncateDisplay(label, width) + ansiReset}
 }
 
 func (r *AgentRenderer) shouldShowWelcomeLocked() bool {
@@ -1900,6 +1983,54 @@ func sliceRunes(value string, start, end int) string {
 
 func (r *AgentRenderer) inputBorderLineLocked(width int) string {
 	return strings.Repeat("-", clamp(width, 12, width))
+}
+
+// contextWindowWidgetLocked renders a compact context window usage indicator
+// of the form:  ◔ 38%  ████░░░░░░
+// The quadrant fill icon reflects which quarter of the context has been consumed.
+func (r *AgentRenderer) contextWindowWidgetLocked() string {
+	if r.contextMax <= 0 {
+		return ""
+	}
+	pct := float64(r.contextUsed) / float64(r.contextMax)
+	if pct > 1 {
+		pct = 1
+	}
+	pctInt := int(pct * 100)
+
+	// Quadrant icon
+	icon := "░"
+	switch {
+	case pct >= 1.0:
+		icon = "●"
+	case pct >= 0.75:
+		icon = "◕"
+	case pct >= 0.50:
+		icon = "◑"
+	case pct >= 0.25:
+		icon = "◔"
+	}
+
+	// Mini bar (10 chars wide)
+	const barWidth = 10
+	filled := int(pct * barWidth)
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	label := fmt.Sprintf(" %s %d%%  %s ", icon, pctInt, bar)
+
+	// Colour ramp: green → yellow → red based on usage
+	if r.Color {
+		color := ansiGreen
+		switch {
+		case pct >= 0.75:
+			color = ansiRed
+		case pct >= 0.5:
+			color = ansiYellow
+		}
+		label = color + label + ansiReset
+	}
+
+	return label
 }
 
 func (r *AgentRenderer) footerLineLocked(width int) string {
@@ -2320,6 +2451,8 @@ func (r *AgentRenderer) readKey() (keyPress, error) {
 		return keyPress{Kind: keyEnter}, nil
 	case '\t':
 		return keyPress{Kind: keyTab}, nil
+	case 3: // Ctrl-C
+		return keyPress{Kind: keyInterrupt}, nil
 	case 127, 8:
 		return keyPress{Kind: keyBackspace}, nil
 	case 27:
@@ -2337,6 +2470,18 @@ func (r *AgentRenderer) readKey() (keyPress, error) {
 				return keyPress{Kind: keyUp}, nil
 			case 'B':
 				return keyPress{Kind: keyDown}, nil
+			case 'D':
+				return keyPress{Kind: keyLeft}, nil
+			case 'C':
+				return keyPress{Kind: keyRight}, nil
+			case 'H':
+				return keyPress{Kind: keyHome}, nil
+			case 'F':
+				return keyPress{Kind: keyEnd}, nil
+			case '3':
+				if r.readEscapeSequence("~") {
+					return keyPress{Kind: keyDelete}, nil
+				}
 			case '5':
 				if r.readEscapeSequence("~") {
 					return keyPress{Kind: keyPageUp}, nil

@@ -20,6 +20,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/search"
 	"github.com/richardsondx/IronLark/internal/sessions"
 	"github.com/richardsondx/IronLark/internal/state"
+	"github.com/richardsondx/IronLark/internal/taskruntime"
 	"github.com/richardsondx/IronLark/internal/threads"
 )
 
@@ -94,6 +95,9 @@ func New(overrides state.Overrides) (*App, error) {
 			DurableShellMaxRuntimeSec:   runtimeState.Config.Tools.DurableShellMaxRuntimeSec,
 			DurableShellLogPreviewBytes: runtimeState.Config.Tools.DurableShellLogPreviewBytes,
 			ProviderModel:               runtimeState.Model,
+			TaskStore: taskruntime.Store{
+				Dir: loaded.Paths.TaskRunsDir,
+			},
 		},
 		Renderer:    renderer,
 		Agents:      agent.Store{Dir: loaded.Paths.AgentDir},

@@ -20,6 +20,7 @@ import (
 	"github.com/richardsondx/IronLark/internal/provider"
 	"github.com/richardsondx/IronLark/internal/redact"
 	"github.com/richardsondx/IronLark/internal/search"
+	"github.com/richardsondx/IronLark/internal/taskruntime"
 )
 
 func TestRunCommandRetriesPipefailCommandWithBash(t *testing.T) {
@@ -142,6 +143,12 @@ func TestExecuteStreamEmitsShellOutputChunks(t *testing.T) {
 	if !(containsStream(streams, core.ActionOutputStdout) && containsStream(streams, core.ActionOutputStderr)) {
 		t.Fatalf("expected both stdout and stderr streams, got %#v", chunks)
 	}
+	if result.Handler != "shell.inline" {
+		t.Fatalf("expected runtime handler to be recorded, got %#v", result)
+	}
+	if result.TaskID == "" {
+		t.Fatalf("expected task id to be recorded, got %#v", result)
+	}
 }
 
 func TestExecuteClassifiesShellTimeout(t *testing.T) {
@@ -248,6 +255,7 @@ func testExecutor(t *testing.T) *Executor {
 		Redactor:       redact.New(nil),
 		Classifier:     classifier,
 		Searcher:       search.Searcher{UserAgent: "lark-term/test"},
+		TaskStore:      taskruntime.Store{Dir: filepath.Join(root, "tasks")},
 	}
 }
 

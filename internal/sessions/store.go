@@ -24,6 +24,7 @@ type Record struct {
 	Actions          []core.Action              `json:"actions,omitempty"`
 	Results          []core.ActionResult        `json:"results,omitempty"`
 	Summary          string                     `json:"summary,omitempty"`
+	Memories         []string                   `json:"memories,omitempty"`
 	Messages         []core.ConversationMessage `json:"messages,omitempty"`
 	NeedsUserInput   bool                       `json:"needs_user_input,omitempty"`
 	Confidence       float64                    `json:"confidence,omitempty"`

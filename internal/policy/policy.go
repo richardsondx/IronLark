@@ -65,6 +65,13 @@ var (
 		".p12",
 		".pfx",
 	}
+	dangerousShellProfileTargets = []string{
+		".bashrc",
+		".zshrc",
+		".profile",
+		".bash_profile",
+		"config.fish",
+	}
 )
 
 type Classifier struct {
@@ -160,6 +167,11 @@ func (c *Classifier) classifyCommand(command string) (core.RiskReport, error) {
 	report := core.RiskReport{
 		Level:  core.RiskMedium,
 		Reason: "shell command",
+	}
+	if isDangerousCommandPattern(command) {
+		report.Level = core.RiskHigh
+		report.Reason = "command matches dangerous execution pattern"
+		return report, nil
 	}
 	if strings.Contains(command, ">") || strings.Contains(command, ">>") || strings.Contains(command, "| tee") {
 		report.Level = core.RiskMedium
@@ -306,6 +318,31 @@ func (c *Classifier) matchesProtectedPath(value string) bool {
 			continue
 		}
 		if filepath.Base(value) == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+func isDangerousCommandPattern(command string) bool {
+	lower := strings.ToLower(strings.TrimSpace(command))
+	if lower == "" {
+		return false
+	}
+	if (strings.Contains(lower, "curl ") || strings.Contains(lower, "wget ")) &&
+		(strings.Contains(lower, "| sh") || strings.Contains(lower, "| bash")) {
+		return true
+	}
+	if (strings.Contains(lower, ">>") || strings.Contains(lower, "tee") || strings.Contains(lower, "sed -i")) &&
+		targetsShellProfile(lower) {
+		return true
+	}
+	return false
+}
+
+func targetsShellProfile(command string) bool {
+	for _, target := range dangerousShellProfileTargets {
+		if strings.Contains(command, target) {
 			return true
 		}
 	}

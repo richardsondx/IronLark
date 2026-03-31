@@ -1744,6 +1744,7 @@ func (r *trackingRenderer) SetInteraction(mode core.InteractionMode)            
 func (r *trackingRenderer) SetApproval(mode core.ApprovalMode)                       { r.lastApproval = mode }
 func (r *trackingRenderer) SetModelContext(provider, model string, options []string) {}
 func (r *trackingRenderer) SetOpsSummary(summary string)                             {}
+func (r *trackingRenderer) SetContextUsage(used, max int)                            {}
 func (r *trackingRenderer) SetSecretVisibility(visible bool)                         {}
 func (r *trackingRenderer) SecretVisibility() string                                 { return "visible" }
 func (r *trackingRenderer) ClearScreen()                                             { r.clearCalls++ }
