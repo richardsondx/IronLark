@@ -1,4 +1,13 @@
-# IronLark
+# 🦅 IronLark
+
+SSH-first AI terminal operator for live servers, repos, and recovery workflows.
+
+[![Version](https://img.shields.io/badge/version-v1.0.0-2ea44f)](https://github.com/richardsondx/IronLark)
+[![Language](https://img.shields.io/badge/language-Go-00ADD8)](https://go.dev/)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-2F81F7)](https://deepwiki.com/richardsondx/IronLark)
+[![X Follow](https://img.shields.io/badge/X-Follow-111111)](https://x.com/richardsondx)
+
+[English](README.md) | [French](README.fr.md) | [Spanish](README.es.md) | [日本語](README.ja.md) | [中文文档](README.zh-CN.md)
 
 IronLark is an SSH-first AI terminal operator built for the moment when you SSH into a machine, hit a problem, and want an agent that can inspect, fix, watch, and report back without leaving the terminal.
 
@@ -29,6 +38,37 @@ IronLark is built around terminal-native operational workflows, not just prompt-
 - **Outcome-oriented workflows**: ask IronLark to restore a service or keep it healthy, not just suggest the next command
 - **Emergency controls**: `lk ps` shows live IronLark processes so you can stop token bleed or kill a stuck run fast
 - **Readable audit trail**: evidence bundles, progress logs, incident summaries, and command history remain inspectable after the fact
+
+## How IronLark Works
+
+IronLark is designed to feel like a capable operator sitting beside you in the same SSH session.
+
+In practice, that means:
+
+- it looks at the current machine, repo, and recent local context before taking the next step
+- it does simple safe inspection work immediately instead of making you approve every small read
+- it stops at clear approval boundaries for risky commands and file changes
+- it remembers what you just discovered so follow-up prompts do not feel stateless
+- it keeps background work, incidents, and recovery history local to the machine so you can come back later and ask what happened
+- it records enough local history to make troubleshooting easier when a run stalls, fails, or needs to continue later
+
+The goal is not to act like a generic chatbot in a terminal. The goal is to help you move from "something is wrong on this machine" to "I can see what happened, what changed, and what to do next" with less friction.
+
+## When IronLark Fits Best
+
+IronLark is not trying to replace every kind of coding agent. It is most useful when the work is happening on the machine itself and the terminal is the right place to stay.
+
+| Situation | IronLark fit | Claude Code-style fit | Why |
+| --- | --- | --- | --- |
+| Debugging a live server over SSH | Strong | Moderate | IronLark is designed to inspect, act, and keep local operational context on the remote box itself. |
+| Recovering a service and checking back later | Strong | Limited to moderate | IronLark has background watcher and recovery workflows, plus `lk ps` for operator control. |
+| Following incidents across multiple terminal sessions | Strong | Moderate | IronLark keeps machine-local history, graph state, and ops memory that remain useful after the current chat ends. |
+| Making careful terminal edits to config or service files | Strong | Strong | Both can help, but IronLark is optimized for terminal-native review and approval on the box where the change lands. |
+| General repo exploration and one-off coding tasks | Moderate | Strong | Claude Code-style tools usually have a broader and more mature coding-agent runtime for general development work. |
+| Deep IDE-connected software engineering workflows | Limited | Strong | Claude Code-style tools are usually a better fit when the center of gravity is the editor rather than SSH. |
+| Broad tool ecosystems and external integrations | Growing | Strong | IronLark is focused on terminal and operator workflows first, while Claude Code-style tools tend to have broader general-purpose integration surfaces. |
+
+The practical tradeoff is simple: if your main question is "what is happening on this machine and can you help me fix it here?", IronLark is designed for that workflow. If your main question is "help me do broad software engineering work across many coding tasks and integrations", Claude Code-style tools are usually the broader fit.
 ## Quick Start
 
 ### Local machine
@@ -262,6 +302,8 @@ These defaults are tuned for task completion over background concurrency.
 - `ask_user` is reserved for secrets or manual-wait steps; ordinary clarifications should be handled in chat.
 - `write_file` is available for full-file writes (prefer it for new files or rewrites).
 - Inline execution tolerates longer operations (`inline_shell_timeout_sec=300`, `shell_stall_window_sec=120`).
+- Core runtime-backed tools now normalize and validate actions before execution, which reduces weird failures from malformed provider output.
+- Runtime-backed actions write local task records so you can inspect what ran, not just the final summary.
 - For exact-output tasks, verify with `cat -A`, `stat`, or `wc -l` and fix newline/permissions if needed.
 - For services that must persist, daemonize (e.g., `nohup`/`setsid`) and verify the listening port.
 
@@ -333,6 +375,7 @@ By default, one-shot `lk "..."` commands reuse a lightweight local thread so fol
 - thread state is stored locally under the Lark data directory
 - context is scoped to the current shell when possible, with a cwd fallback
 - older turns are compacted into a rolling summary as the context window fills
+- completed sessions now also persist compact learned memories so future turns can reuse useful facts, not just replay raw history
 - IronLark warns when the estimated context window is getting close to full
 
 Useful controls:
@@ -420,6 +463,7 @@ Interactive approval prompts also expose:
 When the auto-accept row is selected in an interactive terminal, `Tab` cycles the threshold. `HIGH` auto-accepts everything, `MEDIUM` auto-accepts low and medium risk actions, and `LOW` auto-accepts only low risk actions.
 
 Read-only actions are generally auto-approved, but sensitive paths such as `.env`, key files, and SSH material still require approval unless your machine auto-accept threshold explicitly covers their risk level.
+IronLark also treats obviously dangerous shell patterns more strictly, including download-and-execute flows like `curl ... | sh` and commands that mutate shell profile files.
 
 ## Review Before File Changes
 
@@ -443,7 +487,9 @@ IronLark can currently use terminal-native tools for:
 - guarded edits
 - inline checkpoints before edits
 - command execution with policy checks
+- typed runtime-backed execution for core tools such as shell, file read, search, and edit
 - persistent short-term thread context across one-shot commands
+- compact learned session memories in addition to thread history
 - persistent graph-backed machine memory
 - background watcher and recovery runtimes
 - incident evidence capture and reporting
@@ -467,6 +513,8 @@ Run the freshly built binary from the repo:
 ./bin/lark model
 ./bin/lark "hello"
 ```
+
+If you are testing unreleased source changes, rebuild `./bin/lark` before assuming the local binary includes your latest fixes.
 
 If you already installed `lk` into `~/.local/bin`, use one command to rebuild and reinstall it:
 
@@ -507,6 +555,6 @@ Created by Richardson Dackam ([`@richardsondx` on X](https://x.com/richardsondx)
 
 ## Open Source
 
-- License: MIT
+- License: GNU Affero General Public License v3.0 (AGPL-3.0)
 - Commands stay `lark` and `lk`
 - Project name: IronLark
