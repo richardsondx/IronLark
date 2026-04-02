@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/richardsondx/IronLark/internal/agent"
+	"github.com/richardsondx/IronLark/internal/app"
 	"github.com/richardsondx/IronLark/internal/models"
 	"github.com/richardsondx/IronLark/internal/render"
 	"github.com/richardsondx/IronLark/internal/sessions"
@@ -143,31 +144,7 @@ func newAgentUICommand(flags *rootFlags) *cobra.Command {
 			if workspace.Key == "" {
 				return fmt.Errorf("agent workspace %q was not found", workspaceKey)
 			}
-			if err := os.Chdir(workspace.CWD); err != nil {
-				return err
-			}
-			recentPrompts := recentAgentPrompts(application.Sessions)
-			application.Renderer = render.NewAgent(os.Stdin, os.Stdout, os.Stderr, flags.color, render.AgentMeta{
-				Host:             workspace.Host,
-				CWD:              workspace.CWD,
-				Provider:         application.Runtime.ProviderName,
-				Model:            application.Runtime.Model,
-				ModelOptions:     models.SuggestedForProvider(application.Runtime.Config, application.Runtime.ProviderName),
-				RecentPrompts:    recentPrompts,
-				WelcomeBack:      welcomeBack,
-				ApprovalMode:     application.Runtime.ApprovalMode,
-				ThreadID:         workspace.ThreadID,
-				CompactAtRows:    application.Runtime.Config.Agent.CompactModeRows,
-				Interaction:      application.Runtime.Interaction,
-				NarratedProgress: application.Runtime.Config.UI.NarratedProgress,
-				PolicyStore:      application.PolicyStore,
-				OpsSummary:       application.Ops.SummaryLine(),
-			})
-			defer fmt.Fprint(os.Stdout, "\033[?25h\033[?2004l\033[?1049l")
-			if err := application.Agents.Save(workspace); err != nil {
-				return err
-			}
-			return application.Engine().RunChat(cmd.Context(), initialPrompt, nil)
+			return runAgentUI(cmd.Context(), application, workspace, initialPrompt, welcomeBack, flags.color, true)
 		},
 	}
 	cmd.Flags().StringVar(&workspaceKey, "workspace", "", "workspace key")
@@ -264,6 +241,11 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 	manager := agent.SessionManager{Store: application.Agents}
 	workspace, err = manager.EnsureWorkspace(ctx, workspace, executable, runnerArgs)
 	if err != nil {
+		if isAgentStartTimeout(err) {
+			application.Renderer.Message("Detached agent session failed to start. Falling back to direct interactive mode.")
+			_ = application.Agents.Delete(workspace.Key)
+			return runAgentUI(ctx, application, workspace, initialPrompt, hadExistingWorkspace, flags.color, false)
+		}
 		return err
 	}
 	if err := manager.AttachWithPrompt(ctx, workspace, initialPrompt); err != nil {
@@ -275,11 +257,59 @@ func runAgentWorkspace(ctx context.Context, flags *rootFlags, initialPrompt stri
 		workspace = agent.BuildWorkspace(application.Runtime.Config.Agent.SessionPrefix, application.Loaded.Paths.AgentDir, userName, host, application.Runtime.WorkingDir, workspace.ThreadID)
 		workspace, err = manager.EnsureWorkspace(ctx, workspace, executable, runnerArgs)
 		if err != nil {
+			if isAgentStartTimeout(err) {
+				application.Renderer.Message("Detached agent session failed to restart. Falling back to direct interactive mode.")
+				_ = application.Agents.Delete(workspace.Key)
+				return runAgentUI(ctx, application, workspace, initialPrompt, hadExistingWorkspace, flags.color, false)
+			}
 			return err
 		}
-		return manager.AttachWithPrompt(ctx, workspace, initialPrompt)
+		if err := manager.AttachWithPrompt(ctx, workspace, initialPrompt); err != nil {
+			if !isRecoverableAgentAttachError(err) {
+				return err
+			}
+			application.Renderer.Message("Detached attach failed again. Falling back to direct interactive mode.")
+			_ = manager.Stop(ctx, workspace)
+			_ = application.Agents.Delete(workspace.Key)
+			return runAgentUI(ctx, application, workspace, initialPrompt, hadExistingWorkspace, flags.color, false)
+		}
+		return nil
 	}
 	return nil
+}
+
+func runAgentUI(ctx context.Context, application *app.App, workspace agent.Workspace, initialPrompt string, welcomeBack bool, color string, persistWorkspace bool) error {
+	if err := os.Chdir(workspace.CWD); err != nil {
+		return err
+	}
+	recentPrompts := recentAgentPrompts(application.Sessions)
+	application.Renderer = render.NewAgent(os.Stdin, os.Stdout, os.Stderr, color, render.AgentMeta{
+		Host:             workspace.Host,
+		CWD:              workspace.CWD,
+		Provider:         application.Runtime.ProviderName,
+		Model:            application.Runtime.Model,
+		ModelOptions:     models.SuggestedForProvider(application.Runtime.Config, application.Runtime.ProviderName),
+		RecentPrompts:    recentPrompts,
+		WelcomeBack:      welcomeBack,
+		ApprovalMode:     application.Runtime.ApprovalMode,
+		ThreadID:         workspace.ThreadID,
+		CompactAtRows:    application.Runtime.Config.Agent.CompactModeRows,
+		Interaction:      application.Runtime.Interaction,
+		NarratedProgress: application.Runtime.Config.UI.NarratedProgress,
+		PolicyStore:      application.PolicyStore,
+		OpsSummary:       application.Ops.SummaryLine(),
+	})
+	defer fmt.Fprint(os.Stdout, "\033[?25h\033[?2004l\033[?1049l")
+	if persistWorkspace {
+		if err := application.Agents.Save(workspace); err != nil {
+			return err
+		}
+	}
+	return application.Engine().RunChat(ctx, initialPrompt, nil)
+}
+
+func isAgentStartTimeout(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "timed out waiting for agent session")
 }
 
 func agentRunnerCommand(flags *rootFlags, workspace agent.Workspace, welcomeBack bool) (string, []string, error) {
