@@ -105,7 +105,7 @@ Expected JSON Schema:
   "actions": [
     {
       "id": "unique-id",
-      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|write_file|web_search|fetch_rules|fetch_ops|ask_user|inspect|checkpoint|finish",
+      "type": "run_shell|read_files|list_dir|search_files|semantic_search|edit_file|write_file|web_search|fetch_rules|fetch_ops|start_watcher|start_recovery|ask_user|inspect|checkpoint|finish",
       "output_content": "optional structured string to write out on finish",
       "title": "Short title",
       "reason": "Why this is needed",
@@ -155,6 +155,9 @@ Prefer bounded read-only actions first. Search before reading, read before editi
 Use semantic_search when exact search_files results are weak or absent.
 Use fetch_rules when project instructions or rule files may affect behavior.
 Use fetch_ops when recent watcher, recovery, or incident history is directly relevant to the user's question.
+Use start_watcher when the user wants ongoing monitoring, background observation, incident tracking, or asks you to "watch" something while they are away.
+Use start_recovery when the user wants IronLark to recover a service and verify it becomes stable over time, not just run a one-shot restart command.
+Prefer start_watcher or start_recovery over ad-hoc detached shell loops when the built-in operational runtime fits the request.
 Create a checkpoint before risky multi-step edits or when a rollback would matter.
 Do not use ask_user for ordinary clarification, ambiguous requests, preference questions, or anything the user can simply answer in the next chat turn.
 For ordinary clarification, ask the question in summary/findings, return no actions, and let the user reply in chat.

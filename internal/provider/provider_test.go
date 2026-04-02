@@ -3,6 +3,8 @@ package provider
 import (
 	"strings"
 	"testing"
+
+	"github.com/richardsondx/IronLark/internal/core"
 )
 
 func TestParseResponseAcceptsStructuredAskUser(t *testing.T) {
@@ -192,5 +194,54 @@ func TestParseResponseRejectsUnknownActionType(t *testing.T) {
 	_, err := ParseResponse(raw)
 	if err == nil || !strings.Contains(err.Error(), "unsupported action type") {
 		t.Fatalf("expected unsupported action type error, got %v", err)
+	}
+}
+
+func TestParseResponseNormalizesOperationalActionAliases(t *testing.T) {
+	raw := `{
+  "summary": "Start monitoring",
+  "findings": [],
+  "actions": [
+    {
+      "id": "watch-1",
+      "type": "watch",
+      "title": "Watch nginx",
+      "reason": "Keep monitoring nginx",
+      "query": "nginx"
+    },
+    {
+      "id": "recover-1",
+      "type": "recover",
+      "title": "Recover nginx",
+      "reason": "Recover nginx until stable",
+      "query": "nginx"
+    }
+  ],
+  "verification": [],
+  "needs_user_input": false,
+  "confidence": 0.9
+}`
+
+	response, err := ParseResponse(raw)
+	if err != nil {
+		t.Fatalf("ParseResponse() error = %v", err)
+	}
+	if len(response.Actions) != 2 {
+		t.Fatalf("expected two actions, got %#v", response.Actions)
+	}
+	if response.Actions[0].Type != core.ActionStartWatcher {
+		t.Fatalf("expected watch alias to normalize, got %#v", response.Actions[0])
+	}
+	if response.Actions[1].Type != core.ActionStartRecovery {
+		t.Fatalf("expected recover alias to normalize, got %#v", response.Actions[1])
+	}
+}
+
+func TestBuildSystemPromptIncludesOperationalActions(t *testing.T) {
+	prompt := BuildSystemPrompt(3, core.InteractionExecuteFirst)
+	for _, token := range []string{"start_watcher", "start_recovery", "Use start_watcher", "Use start_recovery"} {
+		if !strings.Contains(prompt, token) {
+			t.Fatalf("expected prompt to mention %q, got %q", token, prompt)
+		}
 	}
 }

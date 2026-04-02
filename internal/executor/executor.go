@@ -57,6 +57,16 @@ type Executor struct {
 	OpsFetcher interface {
 		Fetch(query string, since time.Time, limit int) (string, error)
 	}
+	StartWatcher func(ctx context.Context, query, executable string) (OpsLaunchResult, error)
+	StartRecovery func(ctx context.Context, goal, executable string) (OpsLaunchResult, error)
+}
+
+type OpsLaunchResult struct {
+	ID          string
+	Target      string
+	PID         int
+	ObserveOnly bool
+	Summary     string
 }
 
 type shellRunResult struct {

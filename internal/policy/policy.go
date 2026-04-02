@@ -100,6 +100,12 @@ func (c *Classifier) Classify(action core.Action, readOnly bool) (core.RiskRepor
 			RollbackAvailable:  false,
 			Reason:             "read-only retrieval tool",
 		}, nil
+	case core.ActionStartWatcher, core.ActionStartRecovery:
+		return core.RiskReport{
+			Level:             core.RiskMedium,
+			RollbackAvailable: false,
+			Reason:            "background operational automation",
+		}, nil
 	case core.ActionEditFile, core.ActionWriteFile:
 		level := c.actionPathRisk(action)
 		if level == core.RiskLow {

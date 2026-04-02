@@ -266,6 +266,10 @@ func phaseForAction(action core.Action) string {
 		return "Checking project rules"
 	case core.ActionFetchOps:
 		return "Checking operational memory"
+	case core.ActionStartWatcher:
+		return "Starting a watcher"
+	case core.ActionStartRecovery:
+		return "Starting recovery"
 	case core.ActionCheckpoint:
 		return "Saving a checkpoint"
 	case core.ActionAskUser:

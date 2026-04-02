@@ -24,6 +24,8 @@ func (e *Executor) ensureToolRuntime() {
 		toolHandler{name: "files.read", actionType: core.ActionReadFiles, execute: e.executeReadFiles},
 		toolHandler{name: "files.search", actionType: core.ActionSearchFiles, execute: e.executeSearchFiles},
 		toolHandler{name: "files.patch", actionType: core.ActionEditFile, execute: e.executeEditFile},
+		toolHandler{name: "ops.watch", actionType: core.ActionStartWatcher, execute: e.executeStartWatcher},
+		toolHandler{name: "ops.recover", actionType: core.ActionStartRecovery, execute: e.executeStartRecovery},
 	}
 	for _, handler := range handlers {
 		_ = runtime.Register(handler)
@@ -126,6 +128,61 @@ func (e *Executor) executeEditFile(_ context.Context, action core.Action, _ bool
 		PatchID:      record.ID,
 		BackupPath:   record.BackupPath,
 		Summary:      fmt.Sprintf("patched %s", firstNonEmpty(normalized.Path, firstPath(paths))),
+	}, nil
+}
+
+func (e *Executor) executeStartWatcher(ctx context.Context, action core.Action, _ bool, _ func(core.ActionOutputChunk)) (core.ActionResult, error) {
+	if e.StartWatcher == nil {
+		err := fmt.Errorf("watcher runtime is unavailable")
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	query := firstNonEmpty(action.Query, action.Pattern, action.Reason, action.Title)
+	started, err := e.StartWatcher(ctx, query, executable)
+	if err != nil {
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	summary := started.Summary
+	if strings.TrimSpace(summary) == "" {
+		summary = fmt.Sprintf("started watcher %s for %s", started.ID, firstNonEmpty(started.Target, query))
+		if started.ObserveOnly {
+			summary += " in observe-only mode"
+		}
+	}
+	return core.ActionResult{
+		Action:          action,
+		Summary:         summary,
+		BackgroundRunID: started.ID,
+		Stdout:          firstNonEmpty(started.Target, query),
+	}, nil
+}
+
+func (e *Executor) executeStartRecovery(ctx context.Context, action core.Action, _ bool, _ func(core.ActionOutputChunk)) (core.ActionResult, error) {
+	if e.StartRecovery == nil {
+		err := fmt.Errorf("recovery runtime is unavailable")
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	goal := firstNonEmpty(action.Query, action.Pattern, action.Reason, action.Title)
+	started, err := e.StartRecovery(ctx, goal, executable)
+	if err != nil {
+		return core.ActionResult{Action: action, Error: err.Error()}, err
+	}
+	summary := started.Summary
+	if strings.TrimSpace(summary) == "" {
+		summary = fmt.Sprintf("started recovery %s for %s", started.ID, firstNonEmpty(started.Target, goal))
+	}
+	return core.ActionResult{
+		Action:          action,
+		Summary:         summary,
+		BackgroundRunID: started.ID,
+		Stdout:          firstNonEmpty(started.Target, goal),
 	}, nil
 }
 

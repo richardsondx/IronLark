@@ -67,6 +67,8 @@ const (
 	ActionWebSearch      ActionType = "web_search"
 	ActionFetchRules     ActionType = "fetch_rules"
 	ActionFetchOps       ActionType = "fetch_ops"
+	ActionStartWatcher   ActionType = "start_watcher"
+	ActionStartRecovery  ActionType = "start_recovery"
 	ActionAskUser        ActionType = "ask_user"
 	ActionInspect        ActionType = "inspect"
 	ActionCheckpoint     ActionType = "checkpoint"
@@ -77,12 +79,15 @@ const (
 	ActionReadFile = ActionReadFiles
 	ActionGrep     = ActionSearchFiles
 	ActionPatch    = ActionEditFile
+	ActionWatch    ActionType = "watch"
+	ActionRecover  ActionType = "recover"
 )
 
 func (t ActionType) Valid() bool {
 	switch t {
 	case ActionRunShell, ActionReadFiles, ActionListDir, ActionSearchFiles, ActionSemanticSearch, ActionEditFile,
-		ActionWriteFile, ActionWebSearch, ActionFetchRules, ActionFetchOps, ActionAskUser, ActionInspect,
+		ActionWriteFile, ActionWebSearch, ActionFetchRules, ActionFetchOps, ActionStartWatcher, ActionStartRecovery,
+		ActionAskUser, ActionInspect,
 		ActionCheckpoint, ActionFinish:
 		return true
 	default:
@@ -106,6 +111,8 @@ func NormalizeActionType(raw ActionType) (ActionType, bool) {
 		ActionWebSearch,
 		ActionFetchRules,
 		ActionFetchOps,
+		ActionStartWatcher,
+		ActionStartRecovery,
 		ActionAskUser,
 		ActionInspect,
 		ActionCheckpoint,
@@ -114,6 +121,8 @@ func NormalizeActionType(raw ActionType) (ActionType, bool) {
 		ActionReadFile,
 		ActionGrep,
 		ActionPatch,
+		ActionWatch,
+		ActionRecover,
 	}
 	lower := strings.ToLower(text)
 	for _, candidate := range candidates {
@@ -140,6 +149,18 @@ func canonicalActionType(actionType ActionType) ActionType {
 	case ActionGrep:
 		return ActionSearchFiles
 	case ActionPatch:
+		return ActionEditFile
+	case ActionWatch:
+		return ActionStartWatcher
+	case ActionRecover:
+		return ActionStartRecovery
+	case ActionType("run"):
+		return ActionRunShell
+	case ActionType("read_file"):
+		return ActionReadFiles
+	case ActionType("grep"):
+		return ActionSearchFiles
+	case ActionType("patch"):
 		return ActionEditFile
 	default:
 		return actionType

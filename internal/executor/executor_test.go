@@ -264,11 +264,37 @@ type fakeWebSearchProvider struct {
 	err     error
 }
 
+type fakeOpsStarter struct {
+	watcherQuery  string
+	recoveryGoal  string
+	executable    string
+	watcherResult OpsLaunchResult
+	recoveryResult OpsLaunchResult
+}
+
 func (f fakeWebSearchProvider) WebSearch(ctx context.Context, req provider.SearchRequest) ([]string, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
 	return append([]string(nil), f.results...), nil
+}
+
+func (f *fakeOpsStarter) startWatcher(_ context.Context, query, executable string) (OpsLaunchResult, error) {
+	f.watcherQuery = query
+	f.executable = executable
+	if f.watcherResult.ID == "" {
+		f.watcherResult = OpsLaunchResult{ID: "watch-1", Target: "nginx", PID: 123}
+	}
+	return f.watcherResult, nil
+}
+
+func (f *fakeOpsStarter) startRecovery(_ context.Context, goal, executable string) (OpsLaunchResult, error) {
+	f.recoveryGoal = goal
+	f.executable = executable
+	if f.recoveryResult.ID == "" {
+		f.recoveryResult = OpsLaunchResult{ID: "run-1", Target: "nginx", PID: 456}
+	}
+	return f.recoveryResult, nil
 }
 
 func testSearchServer(t *testing.T) string {
@@ -292,4 +318,58 @@ func containsStream(streams []core.ActionOutputStream, target core.ActionOutputS
 		}
 	}
 	return false
+}
+
+func TestExecuteStartWatcherUsesOpsRuntime(t *testing.T) {
+	exec := testExecutor(t)
+	starter := &fakeOpsStarter{
+		watcherResult: OpsLaunchResult{ID: "watch-1", Target: "nginx", PID: 321, ObserveOnly: true},
+	}
+	exec.StartWatcher = starter.startWatcher
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		ID:     "watch-nginx",
+		Type:   core.ActionStartWatcher,
+		Query:  "nginx",
+		Reason: "Watch nginx while I am away",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if starter.watcherQuery != "nginx" {
+		t.Fatalf("expected watcher query to reach runtime, got %q", starter.watcherQuery)
+	}
+	if result.BackgroundRunID != "watch-1" || result.Handler != "ops.watch" {
+		t.Fatalf("expected ops watcher runtime metadata, got %#v", result)
+	}
+	if !strings.Contains(result.Summary, "observe-only mode") {
+		t.Fatalf("expected observe-only summary, got %#v", result)
+	}
+}
+
+func TestExecuteStartRecoveryUsesOpsRuntime(t *testing.T) {
+	exec := testExecutor(t)
+	starter := &fakeOpsStarter{
+		recoveryResult: OpsLaunchResult{ID: "run-1", Target: "nginx", PID: 654},
+	}
+	exec.StartRecovery = starter.startRecovery
+
+	result, err := exec.Execute(context.Background(), core.Action{
+		ID:     "recover-nginx",
+		Type:   core.ActionStartRecovery,
+		Query:  "nginx",
+		Reason: "Recover nginx until stable",
+	}, false)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if starter.recoveryGoal != "nginx" {
+		t.Fatalf("expected recovery goal to reach runtime, got %q", starter.recoveryGoal)
+	}
+	if result.BackgroundRunID != "run-1" || result.Handler != "ops.recover" {
+		t.Fatalf("expected ops recovery runtime metadata, got %#v", result)
+	}
+	if !strings.Contains(result.Summary, "started recovery") {
+		t.Fatalf("expected recovery summary, got %#v", result)
+	}
 }

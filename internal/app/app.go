@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 
@@ -110,6 +111,45 @@ func New(overrides state.Overrides) (*App, error) {
 		Ops:         ops.NewManager(loaded.Paths),
 	}
 	app.Executor.OpsFetcher = app.Ops
+	app.Executor.StartWatcher = func(ctx context.Context, query, executable string) (executor.OpsLaunchResult, error) {
+		watcher, pid, err := app.Ops.StartWatcher(ctx, ops.RuntimeDeps{
+			Runtime:    app.Runtime,
+			Graph:      app.Graph,
+			Executor:   app.Executor,
+			Policy:     app.PolicyStore,
+			Host:       appRuntimeHost(app.Runtime),
+			WorkingDir: app.Runtime.WorkingDir,
+		}, query, executable)
+		if err != nil {
+			return executor.OpsLaunchResult{}, err
+		}
+		return executor.OpsLaunchResult{
+			ID:          watcher.ID,
+			Target:      watcher.Entity.DisplayName,
+			PID:         pid,
+			ObserveOnly: watcher.ObserveOnly,
+			Summary:     watcher.LastSummary,
+		}, nil
+	}
+	app.Executor.StartRecovery = func(ctx context.Context, goal, executable string) (executor.OpsLaunchResult, error) {
+		spec, pid, err := app.Ops.StartRecovery(ctx, ops.RuntimeDeps{
+			Runtime:    app.Runtime,
+			Graph:      app.Graph,
+			Executor:   app.Executor,
+			Policy:     app.PolicyStore,
+			Host:       appRuntimeHost(app.Runtime),
+			WorkingDir: app.Runtime.WorkingDir,
+		}, goal, executable)
+		if err != nil {
+			return executor.OpsLaunchResult{}, err
+		}
+		return executor.OpsLaunchResult{
+			ID:      spec.ID,
+			Target:  spec.Entity.DisplayName,
+			PID:     pid,
+			Summary: fmt.Sprintf("started recovery %s for %s (pid %d)", spec.ID, spec.Entity.DisplayName, pid),
+		}, nil
+	}
 
 	if providerCfg, err := runtimeState.ProviderConfig(); err == nil {
 		apiKey, keyErr := runtimeState.APIKey()
@@ -124,6 +164,12 @@ func New(overrides state.Overrides) (*App, error) {
 	}
 
 	return app, nil
+}
+
+func appRuntimeHost(runtime state.Runtime) string {
+	userName, rawHost := agent.CurrentIdentity()
+	_ = runtime
+	return userName + "@" + rawHost
 }
 
 func (a *App) Engine() *engine.Engine {
